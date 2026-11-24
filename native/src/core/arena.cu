@@ -109,7 +109,10 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
         if (freed) err = try_malloc(&ptr, bytes);
     }
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+        int device = -1;
+        (void)cudaGetDevice(&device);
+        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err) + " device=" +
+                                 std::to_string(device) + " bytes=" + std::to_string(bytes));
     }
     p = ptr;
 }
