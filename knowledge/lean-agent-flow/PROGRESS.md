@@ -11,15 +11,15 @@ get here".
 
 ## In flight
 
-- (none) Waiting on Isaak: go on EP-then-KV-head-split (DSpark on, NVFP4 kept).
+- Isaak A is GO. DeepSeek: step 1 (second DeviceContext + `--second-gpu`), then step 2 (expert residency). CBM index `ingine`. Maya stays loaded.
 
 ## Last completed
 
-- 2026-11-24: single-GPU on supra is a wontdo. DSpark required. NVFP4 stays. `nvidia-smi` on supra: 5070 Ti + 5060 Ti, 16 GB each.
+- 2026-11-24: single-GPU on supra is a wontdo. DSpark required. NVFP4 stays.
 
 ## Needs a decision
 
-- Implement EP then KV-head split, or hold.
+- (none) Implementing steps 1–2.
 
 ## Needs a decision
 

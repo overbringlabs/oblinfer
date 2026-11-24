@@ -167,7 +167,9 @@ struct UploadStats {
 // staging_buffers) and the reader threads for its lifetime: create one for a whole model load.
 class DeviceUploader {
 public:
-    explicit DeviceUploader(UploadOptions options = {});
+    // `device`: the CUDA device every copy targets; negative: the calling thread's current device. A
+    // non-negative device is made current for construction (the events belong to it) and stays current.
+    explicit DeviceUploader(UploadOptions options = {}, int device = -1);
     ~DeviceUploader();
 
     DeviceUploader(const DeviceUploader&)            = delete;

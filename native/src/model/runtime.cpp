@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <stdexcept>
+#include <string>
 
 namespace ingine::model {
 namespace {
@@ -63,6 +64,7 @@ void GraphExec::launch(cudaStream_t stream) const {
 
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
+  open_second_device();
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   weights_ = load_weights(options.model_dir, options.dense_fp8, stream_);
   ablation_ = load_ablation(options.ablation);
@@ -72,8 +74,24 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
 Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablation)
     : options_(options), weights_(std::move(weights)), ablation_(std::move(ablation)) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
+  open_second_device();
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   init();
+}
+
+void Runtime::open_second_device() {
+  if (options_.second_gpu < 0) return;
+  CUDA_CHECK(cudaGetDevice(&device_));
+  if (options_.second_gpu == device_) {
+    throw std::invalid_argument("second_gpu must differ from the device the runtime runs on");
+  }
+  try {
+    second_device_ = std::make_unique<DeviceContext>(options_.second_gpu);
+  } catch (const std::runtime_error& e) {
+    cudaSetDevice(device_);  // the context bound its device before throwing
+    throw std::runtime_error("second GPU " + std::to_string(options_.second_gpu) + ": " + e.what());
+  }
+  CUDA_CHECK(cudaSetDevice(device_));  // a DeviceContext binds its own device; the runtime stays on ours
 }
 
 void Runtime::init() {
@@ -127,6 +145,10 @@ Runtime::~Runtime() {
     if (e) cudaEventDestroy(e);
   if (capture_stream_) cudaStreamDestroy(capture_stream_);
   if (stream_) cudaStreamDestroy(stream_);
+  if (second_device_) {
+    second_device_.reset();  // destroys its streams on its own device
+    cudaSetDevice(device_);  // the member frees after this body are ours
+  }
 }
 
 bool Runtime::has_width(int m) const { return buffers_.count(m) != 0; }

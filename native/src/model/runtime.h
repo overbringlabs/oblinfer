@@ -19,6 +19,7 @@
 #include "model/model_data.h"
 #include "model/model_kernels.h"
 
+#include "core/device.h"
 #include "core/host_memory.h"
 
 #include "ingine/generator.h"
@@ -104,6 +105,8 @@ class Runtime {
   Runtime& operator=(const Runtime&) = delete;
 
   const RuntimeOptions& options() const { return options_; }
+  // The second device opened for options.second_gpu (expert parallelism), or null with one device.
+  const DeviceContext* second_device() const { return second_device_.get(); }
   cudaStream_t stream() const { return stream_; }
   const Weights& weights() const { return weights_; }
   const Ablation& ablation() const { return ablation_; }
@@ -180,11 +183,16 @@ class Runtime {
   std::int64_t* tokens() { return static_cast<std::int64_t*>(token_.p); }  // the shared int64 [8] input tokens
 
  private:
+  void open_second_device();
   void init();
   void capture(int m, bool history);
   StatePtrs state_ptrs() const;
 
+  // Declared first: destroying a DeviceContext leaves its own device current, so it must outlive every
+  // device-0 allocation below.
+  std::unique_ptr<DeviceContext> second_device_;  // options_.second_gpu; null with one device
   RuntimeOptions options_;
+  int device_ = 0;  // the device this runtime runs on; set when options_.second_gpu is opened
   cudaStream_t stream_ = nullptr;
   Weights weights_;
   Ablation ablation_;

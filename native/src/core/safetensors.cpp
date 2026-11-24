@@ -373,12 +373,17 @@ UploadRequest upload_request(SafetensorsRef ref, void* dst) {
     return upload_request(*ref.file, *ref.tensor, dst);
 }
 
-DeviceUploader::DeviceUploader(UploadOptions options) : options_(options) {
+DeviceUploader::DeviceUploader(UploadOptions options, int device) : options_(options) {
     if (options_.chunk_bytes == 0 || options_.staging_buffers <= 0 || options_.reader_threads <= 0) {
         throw std::invalid_argument("DeviceUploader: chunk_bytes, staging_buffers and "
                                     "reader_threads must be positive");
     }
-    cuda_throw(cudaGetDevice(&device_), "cudaGetDevice");
+    if (device < 0) {
+        cuda_throw(cudaGetDevice(&device_), "cudaGetDevice");
+    } else {
+        cuda_throw(cudaSetDevice(device), "DeviceUploader: cudaSetDevice");
+        device_ = device;
+    }
     const std::size_t n = static_cast<std::size_t>(options_.staging_buffers);
     if (options_.chunk_bytes > std::numeric_limits<std::size_t>::max() / n) {
         throw std::invalid_argument("DeviceUploader: staging size overflows");

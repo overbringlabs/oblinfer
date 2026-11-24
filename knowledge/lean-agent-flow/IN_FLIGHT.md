@@ -7,6 +7,7 @@ This file is a whiteboard, not a ledger.
 ```
 ## agent: grok-parent   since: 2026-11-24T01:47Z
 writing: (none)
-next:    (idle — DeepSeek synthesized; waiting on Isaak go)
-released: AGENTS.md knowledge/lean-agent-flow/ ledgers and plans/20261124_ingine-vs-maya-ds.md
+next:    DeepSeek step 2 expert residency (one-device decode)
+released: step 1 --second-gpu + DeviceUploader target device
 ```
+

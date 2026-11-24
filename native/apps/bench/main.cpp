@@ -138,6 +138,7 @@ std::string default_model_dir() {
 int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
   int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
+  int second_gpu = -1;
   bool dense_fp8 = false, kv_fp8 = false, spec = false;
   double spec_threshold = 0.8, temperature = 0.0;
 
@@ -147,6 +148,8 @@ int main(int argc, char** argv) {
   ap.option("--backend", "{fast}", "", &backend, {"fast"});
   ap.option("--ablation", "", "", &ablation);
   ap.option("--max-ctx", "", "", &max_ctx);
+  ap.option("--second-gpu", "",
+            "second CUDA device the runtime opens (expert parallelism); default: one device", &second_gpu);
   ap.option("--tokens", "", "", &tokens);
   ap.option("--runs", "", "", &runs);
   ap.option("--effort", "", "", &effort);
@@ -164,6 +167,10 @@ int main(int argc, char** argv) {
   ap.option("--forced-trace", "", "append every replayed item and round to FILE (JSON lines)", &forced_trace);
   ap.option("--forced-free", "", "with --forced: sample freely from each item's prompt with this seed (no replay)", &forced_free);
   ap.parse(argc, argv);
+  if (second_gpu < -1) {
+    std::fprintf(stderr, "ingine-bench: error: --second-gpu takes a CUDA device id (default -1: one device)\n");
+    return 2;
+  }
 
   try {
     using Clock = std::chrono::steady_clock;
@@ -179,6 +186,7 @@ int main(int argc, char** argv) {
     options.kv_fp8 = kv_fp8;
     options.spec = spec;
     options.spec_threshold = float(spec_threshold);
+    options.second_gpu = second_gpu;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;

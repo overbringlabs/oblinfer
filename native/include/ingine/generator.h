@@ -97,6 +97,9 @@ struct RuntimeOptions {
   int park_mb = -1;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
+  // Expert parallelism: the CUDA device opened as the second device (expert weights stay on the first one
+  // for now). Negative: one device.
+  int second_gpu = -1;
 };
 
 class Generator {
