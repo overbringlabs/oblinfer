@@ -40,7 +40,7 @@ struct DecodeArgs {
 // stream-ordered decode step.
 std::size_t workspace_bytes(int max_m);
 
-// How many of the kernel's 16-block clusters (one per KV head, 8 per call) fit on the GPU at once.
+// How many of the kernel's per-head clusters (8 per call) fit on the GPU at once.
 int max_active_clusters(int M, int window);
 
 void attn_decode(const DecodeArgs& a, cudaStream_t stream);

@@ -1,9 +1,10 @@
 // message_gates: loop-pass message gates (rank-64 down projection, tanh forget/gain, gated mix, RMS norm).
 //
 // Design. Per gate the work is a chain of all-to-all dependencies (row norms -> 64 down outputs -> 2304
-// gated channels -> their RMS norm), so each gate is one cluster of CL = 16 CTAs (non-portable size; with
-// 8 the FP32 forget/gain slices would not fit in shared memory) and the dependencies are crossed with
-// distributed shared memory instead of extra launches. Per-SM DRAM concurrency is the limit for such a
+// gated channels -> their RMS norm), so each gate is one cluster of CL CTAs and the dependencies are
+// crossed with distributed shared memory instead of extra launches. CL = 16 (non-portable) where the GPU
+// can co-schedule 16 CTAs; 8 otherwise (FP32 forget/gain would need 2 * 288 * 272 B of slices, above the
+// per-block shared-memory cap, so that path stays on 16). Per-SM DRAM concurrency is the limit for such a
 // small grid (~110 KB per SM at G = 3), so every weight byte is requested before the PDL wait. CTA r of
 // gate g:
 // * issues cp.async copies of its forget/gain row slices (rows [r * 144, +144), padded rows in shared
@@ -76,19 +77,21 @@ struct GateCfg {
   static constexpr int ROW = RANK * FGB;          // bytes of one forget/gain row
   static constexpr int RS = ROW + 16;             // padded row stride in shared memory (no bank conflicts)
   static constexpr int SLICE = CPC * RS;          // bytes of one padded matrix slice
-  static_assert(CPC <= NT && ROW % 16 == 0 && RPC == 4, "uneven split");
+  static_assert(CPC <= NT && ROW % 16 == 0 && RPC % 4 == 0, "uneven split");
   static constexpr int SMEM = 2 * SLICE;
-  static constexpr int XMAX = FG32 ? 1 : 4;       // tokens staged per barrier (one staging buffer each)
+  // tokens staged per barrier (one staging buffer each). CL = 8 leaves ~2 KB under the 99 KB block cap of
+  // sm_120, so it stages one token at a time; CL = 16 has room for four.
+  static constexpr int XMAX = FG32 || CL != 16 ? 1 : 4;
 };
 
 template <int CL, bool FG32, int M>
 __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a) {
   using C = GateCfg<CL, FG32>;
   constexpr int DCH = H / (8 * 32);  // 9 chunks of 8 down weights per lane
-  constexpr int XPT = H / C::NT;     // inputs per thread per half when staging x
+  constexpr int XPT = (H + C::NT - 1) / C::NT;  // inputs per thread per half when staging x
+  constexpr bool XEVEN = H % C::NT == 0;         // CL = 16; CL = 8 (512 threads) leaves a partial round
   constexpr int MQ = (M + 3) / 4;    // 16-byte stores holding M values
   constexpr int XG = M < C::XMAX ? M : C::XMAX;  // tokens per staging group
-  static_assert(H % C::NT == 0, "x staging split");
   extern __shared__ __align__(16) uint8_t fg[];  // forget slice, then gain slice (padded rows)
   __shared__ __align__(16) float gall[M][RANK];  // full down output (BF16 values), received
   // bf16([n(h), n(msg)]) of the tokens of a group (M = 1 with FP16 slices: two, the shared-memory size the
@@ -111,7 +114,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
     mb_init(mb_g);
     mb_init(mb_s);
     fence_mbarrier_init();
-    mb_expect(mb_g, 16u * CL * M);
+    mb_expect(mb_g, 4u * RANK * M);  // every CTA receives the M x RANK down outputs
     mb_expect(mb_s, 16u * CL * MQ);
   }
   cluster_arrive_relaxed();  // waited for before the first remote store
@@ -155,10 +158,13 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
       if (m < M) {
 #pragma unroll
         for (int k = 0; k < XPT; ++k) {
-          xh[j][k] = hg[size_t(m) * H + k * C::NT + t];
-          xm[j][k] = mg[size_t(m) * H + k * C::NT + t];
-          sh = fmaf(xh[j][k], xh[j][k], sh);
-          sm = fmaf(xm[j][k], xm[j][k], sm);
+          const int i = k * C::NT + t;  // H need not divide NT (CL = 8: 512 threads over 2304 inputs)
+          if (XEVEN || i < H) {
+            xh[j][k] = hg[size_t(m) * H + i];
+            xm[j][k] = mg[size_t(m) * H + i];
+            sh = fmaf(xh[j][k], xh[j][k], sh);
+            sm = fmaf(xm[j][k], xm[j][k], sm);
+          }
         }
       }
       ss[2 * j] = sh;
@@ -172,8 +178,11 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
         __nv_bfloat16* xb = xs[j];
 #pragma unroll
         for (int k = 0; k < XPT; ++k) {
-          xb[k * C::NT + t] = __float2bfloat16_rn(xh[j][k] * rh);
-          xb[H + k * C::NT + t] = __float2bfloat16_rn(xm[j][k] * rm);
+          const int i = k * C::NT + t;
+          if (XEVEN || i < H) {
+            xb[i] = __float2bfloat16_rn(xh[j][k] * rh);
+            xb[H + i] = __float2bfloat16_rn(xm[j][k] * rm);
+          }
         }
       }
     }
@@ -200,13 +209,16 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   __syncthreads();
 
   cluster_wait();  // all CTAs resident, barriers initialised: remote stores may start
-  if (t < M * CL) {  // thread (token m, destination d): the token's 4 rows as one 16-byte store
-    const int m = t % M, d = t / M;
-    const float4 p0 = *reinterpret_cast<const float4*>(&part[m][0][0]);
-    const float4 p1 = *reinterpret_cast<const float4*>(&part[m][1][0]);
+  // thread (token m, destination d, row group q): the group's 4 rows as one 16-byte store (CL = 16 sends
+  // one group per destination, CL = 8 two)
+  constexpr int G4 = C::RPC / 4;
+  if (t < M * CL * G4) {
+    const int m = t % M, d = (t / M) % CL, q = t / (M * CL);
+    const float4 p0 = *reinterpret_cast<const float4*>(&part[m][0][4 * q]);
+    const float4 p1 = *reinterpret_cast<const float4*>(&part[m][1][4 * q]);
     const float4 v = make_float4(round_bf16(p0.x + p1.x), round_bf16(p0.y + p1.y), round_bf16(p0.z + p1.z),
                                  round_bf16(p0.w + p1.w));
-    st_async4(remote(smem_u32(&gall[m][rank * C::RPC]), d), v, remote(mb_g, d));
+    st_async4(remote(smem_u32(&gall[m][rank * C::RPC + 4 * q]), d), v, remote(mb_g, d));
   }
   // this thread's channel inputs fly during the exchange
   const int c = rank * C::CPC + t;
@@ -312,6 +324,40 @@ void launch_gates(int G, int M, const GateArgs& a, bool pdl, cudaStream_t stream
   }
 }
 
+// 16-CTA clusters need the non-portable opt-in and a GPC that holds 16 blocks at once: the 5090 has one,
+// the 70-SM 5070 Ti and 36-SM 5060 Ti reject such a launch with cudaErrorInvalidClusterSize. Probe with
+// the largest variant (M = 8) at the launch's shared-memory footprint: 16, or 8 when 16 does not schedule.
+template <bool FG32>
+int gates_cluster_size() {
+  static const int n = [] {
+    using C = GateCfg<16, FG32>;
+    auto k = gates_kernel<16, FG32, 8>;
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(16);
+    cfg.blockDim = dim3(C::NT);
+    cfg.dynamicSmemBytes = C::SMEM;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeClusterDimension;
+    attr[0].val.clusterDim.x = 16; attr[0].val.clusterDim.y = 1; attr[0].val.clusterDim.z = 1;
+    cfg.attrs = attr;
+    int n = 0;
+    // widest cluster the kernel can run at all, then that one such cluster is resident
+    if (cudaFuncSetAttribute(k, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess ||
+        cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM) != cudaSuccess ||
+        cudaOccupancyMaxPotentialClusterSize(&n, k, &cfg) != cudaSuccess || n < 16) {
+      (void)cudaGetLastError();
+      return 8;
+    }
+    cfg.numAttrs = 1;
+    if (cudaOccupancyMaxActiveClusters(&n, k, &cfg) != cudaSuccess || n <= 0) {
+      (void)cudaGetLastError();
+      return 8;
+    }
+    return 16;
+  }();
+  return n;
+}
+
 }  // namespace
 
 void message_gates(const float* h, bool h_shared, const float* msg, int G, int M, const __nv_bfloat16* w_down,
@@ -330,10 +376,19 @@ void message_gates(const float* h, bool h_shared, const float* msg, int G, int M
   a.out_bf16 = out_bf16;
   a.out_f32 = out_f32;
   a.zero = 0;
-  // 16-CTA clusters (non-portable, verified schedulable on the RTX 5090): the FP32 forget/gain slices of
-  // an 8-CTA split would not fit in shared memory.
-  if (fg_fp32) launch_gates<16, true>(G, M, a, pdl, stream);
-  else launch_gates<16, false>(G, M, a, pdl, stream);
+  // 16-CTA clusters (non-portable) where the device can schedule them. Only the bf16 forget/gain path has
+  // an 8-CTA variant: the FP32 slices of that split (2 * 288 * 272 B) exceed the per-block shared-memory
+  // cap of sm_120, so FP32 weights stay on 16 and need a device that can co-schedule them.
+  if (fg_fp32) {
+    require(gates_cluster_size<true>() == 16,
+            "message_gates: FP32 forget/gain needs 16-CTA clusters, which this device cannot schedule "
+            "(bf16 forget/gain weights run on 8)");
+    launch_gates<16, true>(G, M, a, pdl, stream);
+  } else if (gates_cluster_size<false>() == 16) {
+    launch_gates<16, false>(G, M, a, pdl, stream);
+  } else {
+    launch_gates<8, false>(G, M, a, pdl, stream);
+  }
 }
 
 }  // namespace ingine::kernels::dense

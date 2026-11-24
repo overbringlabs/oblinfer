@@ -3,9 +3,10 @@
 //
 // Design
 // ------
-// * Work: one thread-block cluster of CS = 16 blocks per KV head (grid 16 x 8 = 128 blocks). The cached
-//   keys [0, L_old) (full layer: positions 0..p0-1 of the linear cache; sliding layer: the 1024 ring slots
-//   with their kpos) are dealt to the 16 blocks in tiles, round robin, so every block gets an equal share
+// * Work: one thread-block cluster of CS blocks per KV head (grid CS x 8; CS = 16 where the GPU can hold a
+//   16-block cluster, else 8 - see attn_cluster_size). The cached keys [0, L_old) (full layer: positions
+//   0..p0-1 of the linear cache; sliding layer: the 1024 ring slots with their kpos) are dealt to the CS
+//   blocks in tiles, round robin, so every block gets an equal share
 //   of the expensive relative-bias tail (distance < 1024). Block 0 (the "owner") also takes the call's M
 //   new keys. Everything is sized from `pos` on the device, so the launch shape is fixed for a CUDA graph.
 // * At short contexts the kernel is bound by dependent round trips, not bytes, so it has few of them:
@@ -20,10 +21,11 @@
 //   (3) q / rel post-processing (scale, L2 clip, BF16, log scaling) is done once per block by a few
 //   warps, branch-free, and shared through shared memory. (4) Split partials (max, sum, unnormalised o)
 //   go to the workspace (L2); one cluster barrier;
-//   block r then produces output dims 8r..8r+7 of every row (sink logit, sigmoid gate, BF16) from the 16
-//   partials. (Distributed shared memory was measured slower here: ~1 GB/s per SM on this GPU.)
+//   block r then produces output dims (D/CS)r..(D/CS)r + D/CS - 1 of every row (sink logit, sigmoid gate,
+//   BF16) from the CS partials. (Distributed shared memory was measured slower here: ~1 GB/s per SM on
+//   this GPU.)
 //   (5) Programmatic dependent launch: weights are staged before griddepcontrol.wait, and dependents are
-//   released as soon as the block's first K/V loads are issued (all 128 blocks are resident by then, so
+//   released as soon as the block's first K/V loads are issued (all blocks are resident by then, so
 //   the next kernel, proj_conv, only takes free SM resources and streams its weights while this kernel
 //   is latency-bound, its requests queued behind ours; it still waits for this grid's completion before
 //   reading our output). What the kernel right before (proj) writes, and what this kernel writes for its
@@ -87,6 +89,7 @@
 #include <cuda_fp8.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -98,8 +101,7 @@ constexpr int HQ = 24, HKV = 8, D = 128, DREL = 16, EXT = 1024, WIN = 1024, GQA 
 constexpr int OFF_GATE = 3072, OFF_REL = 6144, OFF_SINK = 6528, OFF_K = 6552, OFF_V = 7576, OFF_KDYN = 8600,
               OFF_VDYN = 8632;
 constexpr int R_SLIDING = 8600, R_FULL = 8664;
-constexpr int CS = 16;  // blocks per KV head = cluster size; block r outputs dims [8r, 8r + 8)
-constexpr int OD = D / CS;
+constexpr int MAX_CS = 16;  // widest cluster: blocks per KV head; block r outputs dims [D/CS r, D/CS r + D/CS)
 constexpr int MAXM = 8;
 constexpr int U = 2;  // key pairs per warp per register buffer
 constexpr int MAXWARPS = 8;
@@ -110,17 +112,19 @@ constexpr float NEG_INIT = -1e30f;
 constexpr float INV_SQRT5 = 1.f / 2.2360679774997896f;  // torch: x / scalar == x * (1 / float(scalar))
 constexpr float INV_3 = 1.f / 3.f;
 // workspace: int32 counter (kpos ordering for M > 1, zeroed once at allocation) then the split partials
-// fp32 [HKV][CS][3M][PSTR]: o (D) then (max, sum)
+// fp32 [HKV][CS][3M][PSTR]: o (D) then (max, sum); sized for the widest cluster so the size is device
+// independent (a CS = 8 kernel only touches the first half of each head's slots)
 constexpr size_t WS_PART = 256;
 constexpr int PSTR = D + 4;
-constexpr size_t ws_bytes(int M) { return WS_PART + size_t(HKV) * CS * GQA * M * PSTR * 4; }
+constexpr size_t ws_bytes(int M) { return WS_PART + size_t(HKV) * MAX_CS * GQA * M * PSTR * 4; }
 
 constexpr int NT = 256;  // threads per block (8 warps) for every M
 
-// dynamic shared memory layout (floats), per M
-template <int M, bool F8 = false>
+// dynamic shared memory layout (floats), per M and cluster size
+template <int M, bool F8, int CS>
 struct Smem {
     static constexpr int ROWS = GQA * M;
+    static constexpr int OD = D / CS;                    // output dims this block owns
     // staged inputs (dead once the main loop starts)
     static constexpr int Q = 0;                          // proj q rows [M][3][D]
     static constexpr int QS = Q + M * GQA * D;           // q_scale [3][D]
@@ -352,17 +356,17 @@ struct Buf {
     float rp[U];  // rel_proj[c][dp] (0 if dp >= 1024)
 };
 
-template <int M, bool FULL, bool F8>
+template <int M, bool FULL, bool F8, int CS>
 __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Params p) {
     static_assert(FULL || !F8, "FP8 caches are full-layer only");
     using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;  // cache element
     using KV = std::conditional_t<F8, uint2, uint4>;                        // 8 dims of a cache row
-    constexpr int KW = 8, ROWS = GQA * M;  // KW: key-slice warps of the M = 1 path
-    using L = Smem<M, F8>;
+    constexpr int KW = 8, ROWS = GQA * M, OD = D / CS;  // KW: key-slice warps of the M = 1 path
+    using L = Smem<M, F8, CS>;
     extern __shared__ __align__(16) float sm[];
     __nv_bfloat16(*s_nkv)[M][D] = reinterpret_cast<__nv_bfloat16(*)[M][D]>(sm + L::NKV);
 
-    const int g = blockIdx.y, rank = blockIdx.x;  // cluster = the 16 blocks of KV head g; rank = blockIdx.x
+    const int g = blockIdx.y, rank = blockIdx.x;  // cluster = the CS blocks of KV head g; rank = blockIdx.x
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, half = lane >> 4, c = lane & 15;
     const int tok = warp / KW, kw = warp % KW;
     const bool owner = rank == 0;
@@ -1112,9 +1116,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
     }
 
-    // block `rank` outputs dims 8 rank .. 8 rank + 7 of every row: thread (row, dim) = (tid / 8, tid % 8)
-    if (tid < ROWS * OD) {
-        const int row = tid / OD, dim = rank * OD + tid % OD;
+    // block `rank` outputs dims OD rank .. OD rank + OD - 1 of every row: item i = (row, dim) = (i / OD, i % OD)
+    for (int i = tid; i < ROWS * OD; i += NT) {
+        const int row = i / OD, dim = rank * OD + i % OD;
         const float* src = p.part + size_t(g * CS) * ROWS * PSTR + row * PSTR;
         float2 ml[CS];
         float o[CS];
@@ -1134,7 +1138,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             l += ml[q].y * f;
             a += o[q] * f;
         }
-        const float gate = 1.f / (1.f + expf(-sm[L::GATE + tid]));
+        const float gate = 1.f / (1.f + expf(-sm[L::GATE + i]));
         p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
     }
 
@@ -1175,46 +1179,88 @@ struct Kernel {
     size_t smem;
 };
 
-template <int M, bool FULL, bool F8>
+template <int M, bool FULL, bool F8, int CS>
 Kernel kernel_of() {
     static const Kernel k = [] {
-        const KernelFn f = attn_decode_kernel<M, FULL, F8>;
-        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
-        return Kernel{f, M, Smem<M, F8>::BYTES};
+        const KernelFn f = attn_decode_kernel<M, FULL, F8, CS>;
+        if constexpr (CS > 8) CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8, CS>::BYTES)));
+        return Kernel{f, M, Smem<M, F8, CS>::BYTES};
     }();
     return k;
 }
 
-template <bool FULL, bool F8 = false>
-Kernel select(int M) {
+template <int CS, bool FULL, bool F8>
+Kernel select_m(int M) {
     switch (M) {
-        case 1: return kernel_of<1, FULL, F8>();
-        case 2: return kernel_of<2, FULL, F8>();
-        case 3: return kernel_of<3, FULL, F8>();
-        case 4: return kernel_of<4, FULL, F8>();
-        case 5: return kernel_of<5, FULL, F8>();
-        case 6: return kernel_of<6, FULL, F8>();
-        case 7: return kernel_of<7, FULL, F8>();
-        default: return kernel_of<8, FULL, F8>();
+        case 1: return kernel_of<1, FULL, F8, CS>();
+        case 2: return kernel_of<2, FULL, F8, CS>();
+        case 3: return kernel_of<3, FULL, F8, CS>();
+        case 4: return kernel_of<4, FULL, F8, CS>();
+        case 5: return kernel_of<5, FULL, F8, CS>();
+        case 6: return kernel_of<6, FULL, F8, CS>();
+        case 7: return kernel_of<7, FULL, F8, CS>();
+        default: return kernel_of<8, FULL, F8, CS>();
     }
 }
 
-// attrs[0]: cluster of CS blocks; attrs[1]: programmatic dependent launch (the kernel waits with
+template <bool FULL, bool F8 = false>
+Kernel select(int M, int cs) {
+    return cs == 8 ? select_m<8, FULL, F8>(M) : select_m<MAX_CS, FULL, F8>(M);
+}
+
+// attrs[0]: cluster of cs blocks; attrs[1]: programmatic dependent launch (the kernel waits with
 // griddepcontrol.wait before touching anything an earlier kernel may write; a no-op without PDL)
-cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunchAttribute* attrs) {
+cudaLaunchConfig_t launch_config(const Kernel& k, int cs, cudaStream_t stream, cudaLaunchAttribute* attrs) {
     cudaLaunchConfig_t cfg{};
-    cfg.gridDim = dim3(CS, HKV);
+    cfg.gridDim = dim3(cs, HKV);
     cfg.blockDim = dim3(NT);
     cfg.dynamicSmemBytes = k.smem;
     cfg.stream = stream;
     attrs[0].id = cudaLaunchAttributeClusterDimension;
-    attrs[0].val.clusterDim.x = CS, attrs[0].val.clusterDim.y = 1, attrs[0].val.clusterDim.z = 1;
+    attrs[0].val.clusterDim.x = cs, attrs[0].val.clusterDim.y = 1, attrs[0].val.clusterDim.z = 1;
     attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[1].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attrs;
     cfg.numAttrs = 2;
     return cfg;
+}
+
+// A 16-block cluster needs the non-portable opt-in and a GPC that holds 16 blocks at once: the 5090 has
+// it, the 70-SM 5070 Ti and 36-SM 5060 Ti reject such a launch with cudaErrorInvalidClusterSize. Same
+// numbers either way: the CS blocks split the head's keys round robin and D / CS output dims each.
+// `INGINE_ATTN_CS=8|16` forces a size (to exercise both paths on one device).
+int attn_cluster_size() {
+    static const int cs = [] {
+        if (const char* e = std::getenv("INGINE_ATTN_CS")) {
+            const int v = std::atoi(e);
+            if (v == 8 || v == MAX_CS) return v;
+        }
+        // probe with the largest variant (M = 8, BF16): every other M needs no more. Widest cluster the
+        // kernel can run at all ...
+        const KernelFn f = attn_decode_kernel<MAXM, true, false, MAX_CS>;
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3(MAX_CS, HKV);
+        cfg.blockDim = dim3(NT);
+        cfg.dynamicSmemBytes = Smem<MAXM, false, MAX_CS>::BYTES;
+        int n = 0;
+        if (cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess ||
+            cudaOccupancyMaxPotentialClusterSize(&n, f, &cfg) != cudaSuccess || n < MAX_CS) {
+            (void)cudaGetLastError();
+            return 8;
+        }
+        cudaLaunchAttribute attr[1];  // ... and that at least one such cluster is resident
+        cudaLaunchConfig_t q = cfg;
+        attr[0].id = cudaLaunchAttributeClusterDimension;
+        attr[0].val.clusterDim.x = MAX_CS, attr[0].val.clusterDim.y = 1, attr[0].val.clusterDim.z = 1;
+        q.attrs = attr, q.numAttrs = 1;
+        if (cudaOccupancyMaxActiveClusters(&n, f, &q) != cudaSuccess || n <= 0) {
+            (void)cudaGetLastError();
+            return 8;
+        }
+        return MAX_CS;
+    }();
+    return cs;
 }
 
 }  // namespace
@@ -1227,9 +1273,10 @@ std::size_t workspace_bytes(int max_m) {
 int max_active_clusters(int M, int window) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     // the FP8 variants have the same launch shape, shared memory and register cap (launch bounds)
-    const Kernel k = window == 0 ? select<true>(M) : select<false>(M);
+    const int cs = attn_cluster_size();
+    const Kernel k = window == 0 ? select<true>(M, cs) : select<false>(M, cs);
     cudaLaunchAttribute attrs[2];
-    cudaLaunchConfig_t cfg = launch_config(k, nullptr, attrs);
+    cudaLaunchConfig_t cfg = launch_config(k, cs, nullptr, attrs);
     cfg.numAttrs = 1;  // occupancy: the cluster shape only
     int n = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveClusters(&n, k.fn, &cfg));
@@ -1272,9 +1319,10 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.counter = static_cast<int*>(a.workspace);
     p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
     p.out = a.out;
-    const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
+    const int cs = attn_cluster_size();
+    const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M, cs) : select<true>(M, cs)) : select<false>(M, cs);
     cudaLaunchAttribute attrs[2];
-    const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs);
+    const cudaLaunchConfig_t cfg = launch_config(k, cs, stream, attrs);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));
 }
 
