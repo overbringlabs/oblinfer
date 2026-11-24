@@ -267,7 +267,8 @@ int main(int argc, char** argv) {
       std::ifstream in(__FILE__, std::ios::binary);
       std::stringstream source;
       source << in.rdbuf();
-      const std::vector<int32_t> once = tok.encode(source.str(), /*special=*/true);
+      std::vector<int32_t> once = tok.encode(source.str(), /*special=*/true);
+      if (once.empty()) once.assign(256, 1);  // __FILE__ is missing when the binary is copied to another host
       std::vector<int32_t> ids;
       for (int i = 0; i < 1000 && int(ids.size()) < long_prompt; ++i) ids.insert(ids.end(), once.begin(), once.end());
       ids.resize(std::min<size_t>(ids.size(), size_t(long_prompt)));
