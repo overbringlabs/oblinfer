@@ -369,7 +369,9 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
 
 template <bool FP8, bool EXPLICIT>
 void launch(const AttnParams& p, cudaStream_t stream) {
-  static const cudaError_t attr =
+  // The dynamic shared memory opt-in is a per-device attribute of the function: a split visit runs this kernel
+  // on the second device too, so it is set on every launch, not once per process (dense::launch_ex).
+  const cudaError_t attr =
       cudaFuncSetAttribute(attn_kernel<FP8, EXPLICIT>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem)));
   if (attr != cudaSuccess) throw std::runtime_error("prefill attention: shared memory attribute failed");
   const dim3 grid((GQA * p.T + BR - 1) / BR, p.head_count);

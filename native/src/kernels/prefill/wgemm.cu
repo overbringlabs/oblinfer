@@ -281,7 +281,9 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
 template <int FMT, Mode MODE, int K, int TM>
 void launch(const GemmArgs& g, int grid, cudaStream_t stream) {
   constexpr int SMEM = Cfg<FMT, K, TM>::SMEM;
-  static const cudaError_t attr =
+  // The dynamic shared memory opt-in is a per-device attribute of the function: the expert hop runs these
+  // GEMMs on the second device too, so it is set on every launch, not once per process (dense::launch_ex).
+  const cudaError_t attr =
       cudaFuncSetAttribute(wgemm_kernel<FMT, MODE, K, TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
   if (attr != cudaSuccess) throw std::runtime_error("prefill wgemm: shared memory attribute failed");
   wgemm_kernel<FMT, MODE, K, TM><<<grid, NT, SMEM, stream>>>(g);
