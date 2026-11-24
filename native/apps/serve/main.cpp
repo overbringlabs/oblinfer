@@ -68,6 +68,7 @@ int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
   int second_gpu = -1;
+  bool remote_experts = false;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
@@ -87,6 +88,9 @@ int main(int argc, char** argv) {
   ap.option("--second-gpu", "",
             "second CUDA device the runtime opens for expert weights; decode stays on the first one; "
             "default: one device", &second_gpu);
+  ap.flag("--remote-experts",
+          "experts of every layer load on --second-gpu; decode hops; DSpark stays on GPU0; prefill is per-token",
+          &remote_experts);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
@@ -130,6 +134,11 @@ int main(int argc, char** argv) {
     std::cerr << "ingine-serve: error: --second-gpu takes a CUDA device id (default -1: one device)\n";
     return 2;
   }
+  if (remote_experts && (second_gpu < 0 || !engine)) {
+    std::cerr << "ingine-serve: error: --remote-experts needs --engine and --second-gpu (the device its experts "
+                 "load on)\n";
+    return 2;
+  }
   if (second_gpu >= 0 && !engine) {
     std::cerr << "ingine-serve: error: --second-gpu needs --engine\n";
     return 2;
@@ -162,6 +171,7 @@ int main(int argc, char** argv) {
       options.park_mb = park_mb;
       options.vision = !no_vision;
       options.second_gpu = second_gpu;
+      if (remote_experts) options.expert_residency.split.fill(0);
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");

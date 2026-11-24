@@ -11,7 +11,8 @@ get here".
 
 ## In flight
 
-- (none) EP+DSpark committed. Serve/bench still have no residency CLI. `model_ep_spec` needs supra.
+- (none) Serve/bench take `--remote-experts` (working tree, uncommitted): every layer's experts on `--second-gpu`.
+  `model_ep_spec` needs supra.
 
 ## Last completed
 
