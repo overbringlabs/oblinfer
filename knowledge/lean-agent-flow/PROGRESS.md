@@ -11,15 +11,15 @@ get here".
 
 ## In flight
 
-- DeepSeek Flash: rank EP vs PP (and a hybrid if it beats both) for 256k tok/s on 5070 Ti + 5060 Ti. Report: `plans/20261124_ingine-vs-maya-ds.md`.
+- (none) Waiting on Isaak: go on EP-then-KV-head-split, or hold.
 
 ## Last completed
 
-- 2026-11-24: hardware = 5070 Ti + 5060 Ti, no P2P, 16 GB host RAM. Maya at depth ~60. PP back on the table (D-20261124-04).
+- 2026-11-24: DeepSeek report `plans/20261124_ingine-vs-maya-ds.md`. Modelled: hybrid 111, EP 91, PP 61. Parent agrees. PP withdrawn.
 
 ## Needs a decision
 
-- Which topology to implement first, after the DeepSeek ranking.
+- Implement EP then KV-head split (recommended), or wait.
 
 ## Needs a decision
 

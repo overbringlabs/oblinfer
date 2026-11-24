@@ -32,4 +32,4 @@ question: What is pending
 
 ## Active
 
-| **Split topology** | 🟡 | EP vs PP vs hybrid; unparks when `plans/20261124_ingine-vs-maya-ds.md` ranks them by 256k tok/s | `todo/20261124_split-topology.md` |
+| **Split topology** | 🟡 | Ranked: hybrid 111 / EP 91 / PP 61. Waiting on Isaak go to implement EP then KV-head split. | `todo/20261124_split-topology.md` |
