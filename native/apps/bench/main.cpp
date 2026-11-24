@@ -170,7 +170,9 @@ int main(int argc, char** argv) {
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--temperature", "", "", &temperature);
-  ap.option("--long-prompt", "", "also time prefill of a synthetic prompt of N tokens", &long_prompt);
+  ap.option("--long-prompt", "",
+            "fill a synthetic prompt of N tokens, then time --tokens of greedy decode at that depth (skips chat/code)",
+            &long_prompt);
   ap.option("--forced", "", "teacher-forced replay of the outputs in FILE (JSON lines {name, prompt, output})",
             &forced);
   ap.option("--forced-items", "", "replay at most N items of --forced", &forced_items);
@@ -252,6 +254,7 @@ int main(int argc, char** argv) {
 
     std::string json = "{";
     for (const auto& [name, prompt] : kPrompts) {
+      if (long_prompt) break;
       ingine::text::ChatOptions chat;
       chat.reasoning_effort = effort;
       const nlohmann::ordered_json messages = nlohmann::ordered_json::array({{{"role", "user"}, {"content", prompt}}});
@@ -308,15 +311,33 @@ int main(int argc, char** argv) {
       std::vector<int32_t> once = tok.encode(source.str(), /*special=*/true);
       if (once.empty()) once.assign(256, 1);  // __FILE__ is missing when the binary is copied to another host
       std::vector<int32_t> ids;
-      for (int i = 0; i < 1000 && int(ids.size()) < long_prompt; ++i) ids.insert(ids.end(), once.begin(), once.end());
-      ids.resize(std::min<size_t>(ids.size(), size_t(long_prompt)));
+      while (int(ids.size()) < long_prompt) ids.insert(ids.end(), once.begin(), once.end());
+      ids.resize(size_t(long_prompt));
+      if (long_prompt + tokens > max_ctx) {
+        std::fprintf(stderr, "ingine-bench: error: --long-prompt %d + --tokens %d exceeds --max-ctx %d\n",
+                     long_prompt, tokens, max_ctx);
+        return 2;
+      }
       ingine::model::Sampling greedy;
       greedy.temperature = 0.0f;
       const ingine::model::GenerateStats st =
-          gen->generate(ids, 1, greedy, {}, [](std::span<const int32_t>) { return true; });
-      const double tok_s = double(ids.size()) / st.prefill_seconds;
-      json += ", \"prefill\": {\"tokens\": " + std::to_string(ids.size()) + ", \"tok_s\": " + py_float(tok_s) + "}";
-      std::printf("prefill %zu tokens: %.0f tok/s\n", ids.size(), tok_s);
+          gen->generate(ids, tokens, greedy, {}, [](std::span<const int32_t>) { return true; });
+      const double prefill_s = double(ids.size()) / st.prefill_seconds;
+      const double decode_s =
+          st.decode_seconds > 0 && st.generated_tokens > 1 ? (st.generated_tokens - 1) / st.decode_seconds : 0;
+      json += "\"depth\": {\"prompt\": " + std::to_string(ids.size()) + ", \"prefill_tok_s\": " + py_float(prefill_s) +
+              ", \"generated\": " + std::to_string(st.generated_tokens) + ", \"decode_tok_s\": " + py_float(decode_s);
+      if (spec) {
+        json += ", \"spec\": {\"rounds\": " + std::to_string(st.spec_rounds) +
+                ", \"accepted\": " + std::to_string(st.spec_accepted) + "}";
+      }
+      json += "}";
+      std::printf("prefill %zu tokens: %.0f tok/s\n", ids.size(), prefill_s);
+      std::printf("decode at %zu: %.1f tok/s (%d generated", ids.size(), decode_s, st.generated_tokens);
+      if (spec && st.spec_rounds) {
+        std::printf(", %.2f tokens/verify", double(st.spec_accepted + st.spec_rounds) / st.spec_rounds);
+      }
+      std::printf(")\n");
       std::fflush(stdout);
     }
     std::printf("%s}\n", json.c_str());
