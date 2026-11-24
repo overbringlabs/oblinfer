@@ -58,29 +58,41 @@ struct AttnPrepParams {
   int ld = 0;
   int T = 0, pos0 = 0;
   bool full = false;
-  const float* q_scale = nullptr;  // [24, 128]
+  const float* q_scale = nullptr;  // [24, 128], by absolute head
   const float* r_scale = nullptr;  // [24, 16]
-  const float* k_w = nullptr;      // full: k_static [4, 1024] by lag; sliding: k_conv [1024, 4] conv1d order
+  // full: k_static [4, cache_heads * 128] by lag; sliding: k_conv [cache_heads * 128, 4] conv1d order
+  const float* k_w = nullptr;
   const float* v_w = nullptr;
-  const float* conv_k = nullptr;   // [3, 1024] previous conv inputs (read only; see conv_state_update)
+  // [3, cache_heads * 128] previous conv inputs (read only; see conv_state_update)
+  const float* conv_k = nullptr;
   const float* conv_v = nullptr;
-  __nv_bfloat16* q = nullptr;      // out [T, 24, 128]
+  __nv_bfloat16* q = nullptr;      // out [T, 24, 128], by absolute head
   __nv_bfloat16* rel = nullptr;    // out [T, 24, 16]
-  void* k_out = nullptr;           // out [T, 8, 128] rows: bf16, or fp8 e4m3 (out_fp8: full caches with kv_fp8)
+  // out [T, cache_heads, 128] rows: bf16, or fp8 e4m3 (out_fp8: full caches with kv_fp8)
+  void* k_out = nullptr;
   void* v_out = nullptr;
   bool out_fp8 = false;
+  // KV-head split (--kv-split): this call covers KV heads [head_begin, head_begin + head_count) of the 8 and
+  // their query / rel heads (3 per KV head); the cache rows, conv state and k_static/v_static hold
+  // `cache_heads` heads (this device's shard). proj, q, rel and q_scale/r_scale stay full width (absolute
+  // heads). The defaults are the one-device call over all 8 heads.
+  int head_begin = 0;
+  int head_count = kKvHeads;
+  int cache_heads = kKvHeads;
 };
 // model._qkv per token: q (scale, clip, tau, BF16), rel (scale, clip, tau, BF16), keys/values through the
 // static (sliding) or dynamic (full) conv, BF16, key clip / value RMS norm, stored at the cache precision.
 void attn_prep(const AttnPrepParams& p, cudaStream_t stream);
 
 // rel_logits[t, h, d] = bf16(sum_j rel[t, h, j] * bf16(rel_proj[j, d])), rel bf16 [T, 24, 16], rel_proj fp32
-// [16, 1024], out bf16 [T, 24, 1024].
-void rel_logits(const __nv_bfloat16* rel, const float* rel_proj, int T, __nv_bfloat16* out, cudaStream_t stream);
+// [16, 1024], out bf16 [T, 24, 1024]; heads [head0, head0 + heads) of the 24 (the KV-head split fills only
+// its own shard's rows).
+void rel_logits(const __nv_bfloat16* rel, const float* rel_proj, int T, __nv_bfloat16* out, cudaStream_t stream,
+                int head0 = 0, int heads = kHeads);
 
 struct AttnParams {
   const __nv_bfloat16* q = nullptr;  // [T, 24, 128]
-  const void* k = nullptr;           // key rows [L, 8, 128]: bf16, or fp8 e4m3 (kv_fp8)
+  const void* k = nullptr;           // key rows [L, cache_heads, 128]: bf16, or fp8 e4m3 (kv_fp8)
   const void* v = nullptr;
   bool kv_fp8 = false;
   const int* kpos = nullptr;         // positions of the L keys (padded to tiles with -1), or null: key j at j
@@ -92,6 +104,12 @@ struct AttnParams {
   const __nv_bfloat16* proj = nullptr; // [T, ld]: gate (sigmoid input) and sink logits in SEG order
   int ld = 0;
   __nv_bfloat16* out = nullptr;        // [T, 3072] = bf16(bf16(attention * sigmoid(lse - sink)) * sigmoid(gate))
+  // KV-head split (--kv-split): this call covers KV heads [head_begin, head_begin + head_count) of the 8; the
+  // key / value rows hold `cache_heads` heads (this device's shard) and q, rel, proj and out stay full width,
+  // by absolute head. The defaults are the one-device call over all 8 heads.
+  int head_begin = 0;
+  int head_count = kKvHeads;
+  int cache_heads = kKvHeads;
 };
 // flex.attend + the output gate of model._visit: scores (q.k)/sqrt(128) + rel bias (distance < 1024), masked,
 // softmax with the per-head sink folded in through the log-sum-exp. Q.K in BF16 MMA with FP32 accumulation

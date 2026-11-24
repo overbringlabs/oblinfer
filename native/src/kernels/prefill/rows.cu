@@ -14,6 +14,7 @@ namespace {
 
 constexpr int H = kHidden;
 constexpr float kEps = 1e-6f;
+constexpr int NWARPS = 8, GQA = kHeads / kKvHeads;
 constexpr int OFF_Q = 0, OFF_REL = 6144, OFF_SINK = 6528, OFF_K = 6552, OFF_V = 7576,
               OFF_KDYN = 8600, OFF_VDYN = 8632;
 static_assert(OFF_V + kKvDim == OFF_KDYN && OFF_SINK + kHeads == OFF_K);
@@ -48,10 +49,11 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
   const float tau = 1.f + 0.1f * logf(fmaxf(float(pos + 1) * (1.f / 8192.f), 1.f));
   const float qk_clip = 22.627416997969522f, rel_clip = 8.f;
 
-  // q: heads warp, warp + 8, warp + 16; 4 dims per lane
-#pragma unroll
-  for (int i = 0; i < 3; ++i) {
-    const int h = warp + 8 * i, d = lane * 4;
+  // q: this call's query heads (3 per KV head), 4 dims per lane
+  const int q_head0 = p.head_begin * GQA, q_heads = p.head_count * GQA;
+#pragma unroll 1
+  for (int h = q_head0 + warp; h < q_head0 + q_heads; h += NWARPS) {
+    const int d = lane * 4;
     float x[4];
     load_bf16x4(row + OFF_Q + h * kHeadDim + d, x);
     const float4 sc = *reinterpret_cast<const float4*>(p.q_scale + h * kHeadDim + d);
@@ -64,10 +66,10 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
     }
     store_bf16x4(reinterpret_cast<uint16_t*>(p.q) + (size_t(t) * kHeads + h) * kHeadDim + d, x);
   }
-  // rel: heads warp, warp + 8, warp + 16; lanes 0-15 one dim each (16-31 duplicate)
-#pragma unroll
-  for (int i = 0; i < 3; ++i) {
-    const int h = warp + 8 * i, j = lane & 15;
+  // rel: the same heads; lanes 0-15 one dim each (16-31 duplicate)
+#pragma unroll 1
+  for (int h = q_head0 + warp; h < q_head0 + q_heads; h += NWARPS) {
+    const int j = lane & 15;
     float x = bf2f(row[OFF_REL + h * kRel + j]) * p.r_scale[h * kRel + j];
     float ss = x * x;
 #pragma unroll
@@ -76,8 +78,12 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
     if (p.full) x = round_bf16(x * tau);
     if (lane < 16) reinterpret_cast<uint16_t*>(p.rel)[(size_t(t) * kHeads + h) * kRel + j] = f2bf_bits(x);
   }
-  // keys / values of KV head `warp`, 4 channels per lane
+  // keys / values of this device's KV heads: warp w takes head head_begin + w; 4 channels per lane, addressed
+  // compactly in the cache / conv-state rows and k_static / k_conv, and absolutely in the proj row
+  if (warp >= p.head_count) return;
+  const int CC = p.cache_heads * kHeadDim;
   const int c = warp * kHeadDim + lane * 4;
+  const int col = (p.head_begin + warp) * kHeadDim + lane * 4;
 #pragma unroll
   for (int kv = 0; kv < 2; ++kv) {
     const int off = kv == 0 ? OFF_K : OFF_V;
@@ -89,9 +95,9 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
     for (int j = 0; j < 4; ++j) {
       const int src = t - 3 + j;
       if (src >= 0) {
-        load_bf16x4(reinterpret_cast<const uint16_t*>(p.proj) + size_t(src) * p.ld + off + c, ext[j]);
+        load_bf16x4(reinterpret_cast<const uint16_t*>(p.proj) + size_t(src) * p.ld + off + col, ext[j]);
       } else {
-        const float4 s4 = *reinterpret_cast<const float4*>(state + (3 + src) * kKvDim + c);
+        const float4 s4 = *reinterpret_cast<const float4*>(state + (3 + src) * CC + c);
         ext[j][0] = s4.x, ext[j][1] = s4.y, ext[j][2] = s4.z, ext[j][3] = s4.w;
       }
     }
@@ -101,8 +107,8 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
       float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
       for (int lag = 0; lag < 4; ++lag) {
-        const float dyn = bf2f(row[dyn_off + warp * 4 + lag]);
-        const float4 sw = *reinterpret_cast<const float4*>(wt + lag * kKvDim + c);
+        const float dyn = bf2f(row[dyn_off + (p.head_begin + warp) * 4 + lag]);
+        const float4 sw = *reinterpret_cast<const float4*>(wt + lag * CC + c);
         const float swv[4] = {sw.x, sw.y, sw.z, sw.w};
 #pragma unroll
         for (int q = 0; q < 4; ++q)
@@ -137,9 +143,9 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
     if (p.out_fp8) {  // State.full_store: saturate to +-448, E4M3 round to nearest even
       const uint32_t b = uint32_t(f2e4m3(y[0])) | (uint32_t(f2e4m3(y[1])) << 8) | (uint32_t(f2e4m3(y[2])) << 16) |
                          (uint32_t(f2e4m3(y[3])) << 24);
-      *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dst) + size_t(t) * kKvDim + c) = b;
+      *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dst) + size_t(t) * CC + c) = b;
     } else {
-      store_bf16x4(static_cast<uint16_t*>(dst) + size_t(t) * kKvDim + c, y);
+      store_bf16x4(static_cast<uint16_t*>(dst) + size_t(t) * CC + c, y);
     }
   }
 }
@@ -149,7 +155,7 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
 
 __global__ void __launch_bounds__(256) rel_logits_kernel(const uint16_t* __restrict__ rel,
                                                          const float* __restrict__ rel_proj, int T, int tpb,
-                                                         uint16_t* __restrict__ out) {
+                                                         uint16_t* __restrict__ out, int head0, int head1) {
   const int d = threadIdx.x * 4;
   float rp[kRel][4];
 #pragma unroll
@@ -157,9 +163,10 @@ __global__ void __launch_bounds__(256) rel_logits_kernel(const uint16_t* __restr
     const float4 v = *reinterpret_cast<const float4*>(rel_proj + j * kRelExtent + d);
     rp[j][0] = round_bf16(v.x), rp[j][1] = round_bf16(v.y), rp[j][2] = round_bf16(v.z), rp[j][3] = round_bf16(v.w);
   }
+  const int h0 = head0 + blockIdx.y * 8, h1 = min(h0 + 8, head1);
   const int t1 = min(T, (blockIdx.x + 1) * tpb);
   for (int t = blockIdx.x * tpb; t < t1; ++t) {
-    for (int h = blockIdx.y * 8; h < blockIdx.y * 8 + 8; ++h) {
+    for (int h = h0; h < h1; ++h) {
       const uint16_t* r = rel + (size_t(t) * kHeads + h) * kRel;
       float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -330,13 +337,19 @@ __global__ void __launch_bounds__(256) head_kernel(const uint16_t* __restrict__ 
 void attn_prep(const AttnPrepParams& p, cudaStream_t stream) {
   if (p.T <= 0 || !p.proj || !p.q || !p.rel || !p.k_out || !p.v_out || !p.conv_k || !p.conv_v)
     throw std::invalid_argument("attn_prep: missing argument");
+  if (p.head_begin < 0 || p.head_count < 1 || p.head_begin + p.head_count > kKvHeads ||
+      p.cache_heads < p.head_count)
+    throw std::invalid_argument("attn_prep: KV-head range outside the 8 or wider than its cache shard");
   attn_prep_kernel<<<p.T, 256, 0, stream>>>(p);
 }
 
-void rel_logits(const __nv_bfloat16* rel, const float* rel_proj, int T, __nv_bfloat16* out, cudaStream_t stream) {
+void rel_logits(const __nv_bfloat16* rel, const float* rel_proj, int T, __nv_bfloat16* out, cudaStream_t stream,
+                int head0, int heads) {
+  if (heads < 1 || head0 < 0 || head0 + heads > kHeads) throw std::invalid_argument("rel_logits: head range");
   const int tpb = std::min(16, std::max(1, T / 128));
-  rel_logits_kernel<<<dim3((T + tpb - 1) / tpb, kHeads / 8), 256, 0, stream>>>(
-      reinterpret_cast<const uint16_t*>(rel), rel_proj, T, tpb, reinterpret_cast<uint16_t*>(out));
+  rel_logits_kernel<<<dim3((T + tpb - 1) / tpb, (heads + 7) / 8), 256, 0, stream>>>(
+      reinterpret_cast<const uint16_t*>(rel), rel_proj, T, tpb, reinterpret_cast<uint16_t*>(out), head0,
+      head0 + heads);
 }
 
 void static_conv(const __nv_bfloat16* x, int ld, int T, int C, const float* w, const float* state, float* out,

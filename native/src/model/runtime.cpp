@@ -116,13 +116,14 @@ void Runtime::init() {
     throw std::invalid_argument("expert residency: an expert shard needs the second device (options.second_gpu)");
   }
   if (options.kv_split) {
-    // The split caches are written by the decode step (a prompt is processed as decode steps with experts on
-    // the second device); the chunked Prefiller writes one device's cache only, so it is not a valid pairing.
+    // The split caches are written by both the chunked Prefiller and the decode step's split visit; a split
+    // visit crosses devices through pinned host staging, so a step is not capturable and needs the eager step
+    // of expert parallelism.
     if (second_device_ == nullptr)
       throw std::invalid_argument("kv split: needs a second device (options.second_gpu)");
     if (!ep_)
       throw std::invalid_argument("kv split: needs expert layers on the second device (options.expert_residency); "
-                                  "its prompt processing is the decode step, which writes the split caches");
+                                  "a split visit hops, which the captured decode step cannot");
     bool all_remote = true;
     for (const Layer& l : weights_.layers) all_remote = all_remote && l.experts.split == 0;
     if (all_remote)

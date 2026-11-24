@@ -1,8 +1,8 @@
 // Expert parallelism with DSpark: with experts on the second device a verify step spans two devices, so it is
 // no CUDA graph and the speculative loop runs it eagerly (SpecLoop reads the verify width back and steps that
 // width). A greedy speculative generation must still walk the plain decode's tokens: the accept rule only takes
-// drafts equal to the target's argmax. The prompt is processed one token per decode step
-// (EngineGenerator::prefill_steps), so this covers that path too.
+// drafts equal to the target's argmax. The prompt goes through the chunked Prefiller, whose remote layers hop
+// their grouped expert GEMM, so this covers that path too.
 // Two GPUs and the whole checkpoint (~16.5 GB across both cards): skips (77) unless INGINE_RESIDENCY_TEST=1.
 #include "common/test_util.h"
 #include "ingine/generator.h"

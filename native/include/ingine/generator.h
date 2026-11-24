@@ -123,14 +123,15 @@ struct RuntimeOptions {
   int second_gpu = -1;
   // Where each layer's experts live (default: all on this device). Only 0 (the whole layer's experts there) and
   // LAYER_EXPERTS load: the moe kernels take one base pointer per expert tensor, so a split inside a layer needs
-  // per-expert bases (step 3). With any layer moved, a step spans two devices: it runs eagerly (no CUDA graph),
-  // DSpark verifies eagerly at one extra host synchronisation per round, and a prompt is processed one token per
-  // decode step.
+  // per-expert bases (step 3). With any layer moved, a decode step spans two devices: it runs eagerly (no CUDA
+  // graph) and DSpark verifies eagerly at one extra host synchronisation per round. A prompt is prefilled in
+  // chunks, hopping each remote layer's grouped expert GEMM.
   ExpertResidency expert_residency;
   // KV-head split: KV_SPLIT_SECOND_HEADS of the 8 full-attention KV heads are cached and attended on the
-  // second device (5 stay here), so the full-visit KV bytes stream over both DRAM buses. Needs second_gpu and
-  // at least one layer's experts on the second device (its prompt processing is the decode step, which is the
-  // path that writes the split caches); not with every layer's experts there (VRAM: use a layer range).
+  // second device (5 stay here), so the full-visit KV bytes stream over both DRAM buses. Write both shards:
+  // the chunked prefill and the decode step. Needs second_gpu and at least one layer's experts on the second
+  // device (a split visit hops, so it cannot be a captured step); not with every layer's experts there (VRAM:
+  // use a layer range).
   bool kv_split = false;
 };
 

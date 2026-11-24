@@ -1,5 +1,6 @@
 // Prefill attention (flex.attend + model._visit's output gate) as a flash-attention kernel for 24 query /
-// 8 KV heads, head dim 128.
+// 8 KV heads, head dim 128. One launch covers `head_count` of the KV heads against this device's cache shard
+// (a KV-head split runs one launch per device); q, rel, proj and out are addressed by absolute head.
 //
 // Design. A CTA owns one KV head and 128 query rows of the chunk, rows ordered (token, head of the GQA group):
 // row R is token R / 3, head 3 g + R % 3, so all of them read the same keys and values and every key/value
@@ -57,6 +58,7 @@ struct KvRegs {
 template <bool FP8, bool EXPLICIT>
 __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, KvRegs<FP8>& r) {
   const int tid = threadIdx.x;
+  const int CC = p.cache_heads * D;  // channels of a key / value row on this device
   if constexpr (FP8) {
     const uint8_t* K = static_cast<const uint8_t*>(p.k);
     const uint8_t* V = static_cast<const uint8_t*>(p.v);
@@ -65,7 +67,7 @@ __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, Kv
       const int id = tid + i * NT, row = id >> 3, c = id & 7;
       const int j = j0 + row;
       if (j < p.L) {
-        const size_t off = size_t(j) * kKvDim + g * D + c * 16;
+        const size_t off = size_t(j) * CC + g * D + c * 16;
         r.k[i] = __ldg(reinterpret_cast<const uint4*>(K + off));
         r.v[i] = __ldg(reinterpret_cast<const uint4*>(V + off));
       } else {
@@ -80,7 +82,7 @@ __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, Kv
       const int id = tid + i * NT, row = id >> 4, c = id & 15;
       const int j = j0 + row;
       if (j < p.L) {
-        const size_t off = size_t(j) * kKvDim + g * D + c * 8;
+        const size_t off = size_t(j) * CC + g * D + c * 8;
         r.k[i] = __ldg(reinterpret_cast<const uint4*>(K + off));
         r.v[i] = __ldg(reinterpret_cast<const uint4*>(V + off));
       } else {
@@ -146,7 +148,8 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   extern __shared__ __align__(128) unsigned char smem_raw[];
   Smem& s = *reinterpret_cast<Smem*>(smem_raw);
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int g = blockIdx.y;
+  // blockIdx.y is this launch's KV head (g_local); g is its head in the model (q / rel / out indexing)
+  const int g_local = blockIdx.y, g = p.head_begin + g_local;
   const int rows = GQA * p.T;
   const int R0 = (gridDim.x - 1 - blockIdx.x) * BR;  // heaviest (latest) rows first
 
@@ -216,7 +219,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
 
   KvRegs<FP8> regs;
   if (ntiles > 0) {
-    load_tile<FP8, EXPLICIT>(p, g, tile_at(0) * BK, regs);
+    load_tile<FP8, EXPLICIT>(p, g_local, tile_at(0) * BK, regs);
     store_tile<FP8, EXPLICIT>(s, 0, regs);
   }
   __syncthreads();
@@ -224,7 +227,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
 #pragma unroll 1
   for (int i = 0; i < ntiles; ++i) {
     const int kt = tile_at(i), buf = i & 1;
-    if (i + 1 < ntiles) load_tile<FP8, EXPLICIT>(p, g, tile_at(i + 1) * BK, regs);
+    if (i + 1 < ntiles) load_tile<FP8, EXPLICIT>(p, g_local, tile_at(i + 1) * BK, regs);
 
     // tile class (uniform over the CTA)
     int kmin, kmax;
@@ -369,7 +372,7 @@ void launch(const AttnParams& p, cudaStream_t stream) {
   static const cudaError_t attr =
       cudaFuncSetAttribute(attn_kernel<FP8, EXPLICIT>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem)));
   if (attr != cudaSuccess) throw std::runtime_error("prefill attention: shared memory attribute failed");
-  const dim3 grid((GQA * p.T + BR - 1) / BR, kKvHeads);
+  const dim3 grid((GQA * p.T + BR - 1) / BR, p.head_count);
   attn_kernel<FP8, EXPLICIT><<<grid, NT, sizeof(Smem), stream>>>(p);
 }
 
@@ -425,6 +428,9 @@ __global__ void bounds_kernel(const int* __restrict__ kpos, int L, int4* __restr
 void attention(const AttnParams& p, cudaStream_t stream) {
   if (p.T <= 0 || p.L <= 0 || !p.q || !p.k || !p.v || !p.rel || !p.proj || !p.out)
     throw std::invalid_argument("prefill attention: missing argument");
+  if (p.head_begin < 0 || p.head_count < 1 || p.head_begin + p.head_count > kKvHeads ||
+      p.cache_heads < p.head_count)
+    throw std::invalid_argument("prefill attention: KV-head range outside the 8 or wider than its cache shard");
   const bool expl = p.kpos != nullptr;
   if (expl && (!p.bounds || (p.L + BK - 1) / BK > kAttnMaxTiles))
     throw std::invalid_argument("prefill attention: explicit keys need bounds and at most 64 tiles");

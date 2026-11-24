@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
             "second CUDA device the runtime opens for expert weights; decode stays on the first one; "
             "default: one device", &second_gpu);
   ap.flag("--remote-experts",
-          "experts of every layer load on --second-gpu; decode hops; DSpark stays on GPU0; prefill is per-token",
+          "experts of every layer load on --second-gpu; decode and the chunked prefill hop them",
           &remote_experts);
   ap.option("--remote-layers", "LO-HI",
             "layers LO..HI (inclusive) keep their experts on --second-gpu, e.g. 0-19", &remote_layers);
@@ -214,8 +214,8 @@ int main(int argc, char** argv) {
     return 2;
   }
   if (kv_split && remote_layers.empty()) {
-    std::fprintf(stderr, "ingine-bench: error: --kv-split needs --remote-layers (its prompt processing is the decode "
-                         "step, which writes the split caches)\n");
+    std::fprintf(stderr, "ingine-bench: error: --kv-split needs --remote-layers (all experts on the second device "
+                         "leave no room for the KV shard)\n");
     return 2;
   }
 

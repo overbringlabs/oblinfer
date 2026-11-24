@@ -164,13 +164,19 @@ peer access, ordered by one non-timing event pair per visit and never by a host 
 `split == EXPERTS` keep the fused `moe_up`/`moe_down` pair, so the default table copies nothing.
 
 That step spans two devices, and a CUDA graph belongs to one, so an expert split decodes eagerly
-(`Runtime::init` skips capture, `run_step` falls back to `run_step_eager`). The prefill's grouped expert GEMMs
-take one base per expert tensor on this device, so `Prefiller` refuses a table that moves any layer's experts:
-the Generator then processes such a prompt one token per decode step (`EngineGenerator::prefill_steps`: the same
-kernels as generation, the taps committed to the drafter as they are produced, the last token's logits kept). It
-is exact but slow - one hop per remote visit per token - and a hop of the prefill GEMM is the next step; it
-exists so a prompt loads at all. Image prompts need the chunked prefill (their rows replace embeddings it writes)
-and are refused.
+(`Runtime::init` skips capture, `run_step` falls back to `run_step_eager`).
+
+The prompt path hops too (`Prefiller::expert_hop`): a visit whose layer has `split == 0` sends its `xm`
+(bf16 `[T, H]`) and the router's tile and pair lists over the same pinned staging, the second device runs the
+grouped gate/up, down and slot-ordered combine GEMMs, and one bf16 `[T, H]` block of combined rows comes back
+for the post-MLP conv - bit-identical to the one-device chunk, for the same reason. The hop is per visit per
+chunk, not per token, so a split prompt costs 48 round trips per 3072-token chunk instead of one per token.
+
+The KV-head split (`options.kv_split`, 3 of the 8 full-attention heads on the second device) is written by both
+paths: decode runs one launch per device (`Decoder::full_attn_split`), a chunked prefill likewise
+(`Prefiller::full_attn_split`, the shard's proj columns, conv state and per-layer scales over, its 9 query-head
+rows and its conv state back into the full-width conv rows at `here * 128`, where decode keeps that state too).
+Sliding attention always stays whole on the first device.
 
 DSpark runs on that eager step. The verify call is the one part of a round that cannot be a graph there (its
 width is a switch node's condition, set inside a graph), so `SpecLoop` reads back the width the drafts'
@@ -190,7 +196,9 @@ captured graph, the verify call the captured switch, and the prefill chunked.
 // + final normed hidden).
 class Prefiller {
  public:
-  Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream);
+  // `second`: the expert-parallel device, or null; `kv_split`: its State holds 3 of the 8 full-attention heads
+  Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream,
+            const DeviceContext* second = nullptr, bool kv_split = false);
   // rows: embedding rows computed elsewhere (image tokens) for rows of the chunk
   void run(State& state, const int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
            std::span<const EmbedRows> rows = {});
