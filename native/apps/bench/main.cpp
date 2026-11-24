@@ -149,7 +149,8 @@ int main(int argc, char** argv) {
   ap.option("--ablation", "", "", &ablation);
   ap.option("--max-ctx", "", "", &max_ctx);
   ap.option("--second-gpu", "",
-            "second CUDA device the runtime opens (expert parallelism); default: one device", &second_gpu);
+            "second CUDA device the runtime opens for expert weights; decode stays on the first one; "
+            "default: one device", &second_gpu);
   ap.option("--tokens", "", "", &tokens);
   ap.option("--runs", "", "", &runs);
   ap.option("--effort", "", "", &effort);

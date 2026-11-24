@@ -85,7 +85,8 @@ int main(int argc, char** argv) {
   ap.option("--ablation", "", "ablation file (safetensors) applied at every visit", &ablation);
   ap.option("--max-ctx", "", "positions held by the full-attention caches", &max_ctx);
   ap.option("--second-gpu", "",
-            "second CUDA device the runtime opens (expert parallelism); default: one device", &second_gpu);
+            "second CUDA device the runtime opens for expert weights; decode stays on the first one; "
+            "default: one device", &second_gpu);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);

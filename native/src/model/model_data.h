@@ -10,9 +10,14 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 
+#include "ingine/generator.h"
+
+#include <cuda_runtime.h>
+
 #include <array>
 #include <cstdint>
 #include <initializer_list>
+#include <utility>
 #include <vector>
 
 namespace ingine::model {
@@ -35,6 +40,10 @@ inline constexpr float GATE_SOFTCAP = 4.0f, UP_SOFTCAP = 25.0f, LOGIT_SOFTCAP = 
 inline constexpr float ROUTE_SCALE = 8.0f;
 inline constexpr float FP8_MAX = 448.0f;  // largest finite float8_e4m3fn (model.FP8_MAX)
 inline constexpr int KV_DIM = KV_HEADS * HEAD_DIM;  // 1024
+
+// The residency table of the public options header (CUDA-free) is sized for this model.
+static_assert(EXPERT_RESIDENCY_LAYERS == LAYERS && LAYER_EXPERTS == EXPERTS,
+              "ExpertResidency is sized for a different model");
 
 inline constexpr bool is_full_layer(int l) { return l == 5 || l == 11 || l == 17 || l == 23; }
 inline constexpr bool is_loop_layer(int l) { return LOOP_START <= l && l < LOOP_END; }
@@ -139,8 +148,12 @@ struct Experts {
   //        w2_scale e4m3 [128, 2304, 72], factors fp32 [128] (amax / outer_scale_denominator)
   // MXFP8: w13 e4m3 [128, 2304, 2304], w13_scale u8 (E8M0) [128, 2304, 72], w2 e4m3 [128, 2304, 1152],
   //        w2_scale u8 [128, 2304, 36], factors empty
+  // The plain fields hold experts [0, split) on the primary device, the _hi ones [split, 128) on the second
+  // (ExpertResidency). Rows are addressed as e*R on either device, so a split inside a layer is step 3.
   Tensor w13, w13_scale, w2, w2_scale;
-  Tensor w13_factor, w2_factor;
+  Tensor w13_hi, w13_scale_hi, w2_hi, w2_scale_hi;
+  Tensor w13_factor, w2_factor;  // fp32 [128], on the device holding this layer's experts
+  std::int16_t split = EXPERTS;
 };
 
 // weights.Layer plus the per-layer derived tensors of fast.FastDecoder (_concat_projections,
@@ -191,6 +204,36 @@ struct Layer {
   Experts experts;
 };
 
+// The expert shards of a second device. They free with that device current, whatever is current at teardown
+// (inline: a Weights also dies in tests that do not link the loader).
+struct SecondStorage {
+  int device = -1;
+  std::vector<DeviceBuffer> buffers;
+
+  SecondStorage() = default;
+  SecondStorage(SecondStorage&& other) noexcept : device(other.device), buffers(std::move(other.buffers)) {
+    other.device = -1;
+  }
+  SecondStorage& operator=(SecondStorage&& other) noexcept {
+    if (this == &other) return *this;
+    release();
+    device = other.device;
+    buffers = std::move(other.buffers);
+    other.device = -1;
+    return *this;
+  }
+  ~SecondStorage() { release(); }
+  // Frees every buffer; `device` is made current for it.
+  void release() noexcept {
+    if (buffers.empty()) return;
+    int current = -1;
+    const bool rebind = device >= 0 && cudaGetDevice(&current) == cudaSuccess && current != device;
+    if (rebind) (void)cudaSetDevice(device);
+    buffers.clear();
+    if (rebind) (void)cudaSetDevice(current);
+  }
+};
+
 // weights.Weights (+ fast.FastDecoder.final_norm1 / head_w). Owns its device memory.
 struct Weights {
   std::vector<Layer> layers;  // LAYERS
@@ -203,7 +246,10 @@ struct Weights {
   std::array<ExpertFormat, LAYERS> expert_formats{};
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
 
-  std::vector<DeviceBuffer> storage;  // device allocations behind the views
+  ExpertResidency residency;                        // where the expert bytes were loaded
+  std::size_t bytes_primary = 0, bytes_second = 0;  // requested allocation bytes per device
+  std::vector<DeviceBuffer> storage;                // primary-device allocations behind the views
+  SecondStorage storage_hi;                         // second-device expert shards (empty with one device)
 };
 
 // model.Ablation: per visit y <- y - w * r * max(r . y - offset, floor) on the attention / MLP writes; offset 0

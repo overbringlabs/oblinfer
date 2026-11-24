@@ -38,8 +38,12 @@ namespace ingine::model {
 
 // ---- loading (weights.load + FastDecoder._concat_projections/_stack_layer_params/_fp8_dense,
 // model.Ablation.load/none, model.State)
-Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cudaStream_t stream);
-// One layer as weights.load_layer (+ the decoder's derived tensors), for kernel tests; owns its memory.
+// `second` places layers whose ExpertResidency split is 0 on that device; `residency` decides per layer
+// (default: every expert here). Everything else always loads on this device.
+Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cudaStream_t stream,
+                     const DeviceContext* second = nullptr, const ExpertResidency& residency = {});
+// One layer as weights.load_layer (+ the decoder's derived tensors), for kernel tests; owns its memory and
+// keeps its experts on this device (load_weights is the two-device path).
 Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
                  std::vector<DeviceBuffer>& storage);
 Ablation load_ablation(const std::filesystem::path& path);  // empty path: Ablation.none()

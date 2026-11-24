@@ -11,15 +11,15 @@ get here".
 
 ## In flight
 
-- Isaak A is GO. DeepSeek: step 1 (second DeviceContext + `--second-gpu`), then step 2 (expert residency). CBM index `ingine`. Maya stays loaded.
+- (none) Steps 1–2 in tree. Next is step 3 (stub PCIe hop on supra) — needs Maya unloaded.
 
 ## Last completed
 
-- 2026-11-24: single-GPU on supra is a wontdo. DSpark required. NVFP4 stays.
+- 2026-11-24: step 1 `--second-gpu`. Step 2 expert residency table (default all GPU0; split 0 or 128 only; decode guard if any experts on GPU1).
 
 ## Needs a decision
 
-- (none) Implementing steps 1–2.
+- Go on step 3 hop measurement (unload Maya), or hold.
 
 ## Needs a decision
 

@@ -145,6 +145,17 @@ C++ mirrors of `weights.Weights`/`Layer`/`Experts`, `model.State` and `fast.Buff
 Python names (`t["wq"]` -> `layer.wq`, `state.k_ring`, `buffers.taps`, ...), shapes and dtypes identical, plus
 the visit plan and constants of `weights.py`. The decode step, the prefill and the drafter share this header.
 
+Expert residency across two devices (EP step 2) is load-time only. `ExpertResidency` in
+`include/ingine/generator.h` (CUDA-free, like the rest of `RuntimeOptions`) holds, per layer, how many of that
+layer's 128 experts stay on the primary device; `load_weights(dir, dense_fp8, stream, second, residency)`
+places a layer's four expert tensors and their factors whole on the device the table names (`Experts::split`,
+the `_hi` views, `Weights::storage_hi`, freed with their own device current), one granule of 546.75 MiB NVFP4 /
+1002.4 MiB MXFP8 per layer. The default table is all-primary: no second uploader, no second allocation, the same
+allocations in the same order on the same stream. Only `0` and `EXPERTS` are loadable - the moe kernels take one
+base pointer per expert tensor and address rows as `e*R`, so a split inside a layer is step 3 - and
+`Runtime::init` refuses to decode a table with any expert on the second device (decode, prefill, head and spec
+graphs all capture primary-device pointers).
+
 ### Prefill (`src/model/prefill.{h,cpp}`)
 
 ```cpp

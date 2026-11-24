@@ -66,7 +66,8 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
   open_second_device();
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_);
+  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_, second_device_.get(),
+                          options.expert_residency);
   ablation_ = load_ablation(options.ablation);
   init();
 }
@@ -96,6 +97,14 @@ void Runtime::open_second_device() {
 
 void Runtime::init() {
   const RuntimeOptions& options = options_;
+  // Step 2 places expert bytes, it does not read them across devices: every decode, prefill, head and spec
+  // kernel runs here and captures this device's pointers, and the moe kernels take one base pointer per
+  // expert tensor. Peer access between the two cards is unmeasured; per-expert bases are step 3.
+  if (!weights_.residency.all_primary()) {
+    throw std::invalid_argument(
+        "expert residency: experts loaded on the second device cannot be decoded yet (decode runs on the "
+        "primary device; peer access is unmeasured and per-expert base pointers are step 3)");
+  }
   state_ = make_state(options.max_ctx, options.kv_fp8);
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
   pos_ = DeviceBuffer(sizeof(std::int64_t));
@@ -146,6 +155,9 @@ Runtime::~Runtime() {
   if (capture_stream_) cudaStreamDestroy(capture_stream_);
   if (stream_) cudaStreamDestroy(stream_);
   if (second_device_) {
+    second_device_->bind_to_current_thread();
+    (void)cudaDeviceSynchronize();  // the device-1 expert shards are quiet before their storage is freed
+    weights_.storage_hi.release();
     second_device_.reset();  // destroys its streams on its own device
     cudaSetDevice(device_);  // the member frees after this body are ours
   }

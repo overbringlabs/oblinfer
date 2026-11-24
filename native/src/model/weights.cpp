@@ -6,6 +6,8 @@
 //
 // Large tensors are uploaded straight from the file with the core DeviceUploader; small per-channel
 // parameters are read on the host, widened to FP32 (exact from BF16) and copied.
+// Expert residency (EP step 2): a layer's four expert tensors and their factors go whole onto the second
+// device when its ExpertResidency split is 0, through a second uploader; everything else stays here.
 #include "model/runtime.h"
 
 #include "core/device.h"
@@ -14,12 +16,15 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ingine::model {
 namespace {
@@ -60,18 +65,55 @@ std::vector<float> host_f32(const SafetensorsModel& m, const std::string& name) 
   return out;
 }
 
+// Makes `device` the calling thread's current device for the scope, restoring the previous one on exit.
+class DeviceScope {
+ public:
+  explicit DeviceScope(int device) {
+    CUDA_CHECK(cudaGetDevice(&saved_));
+    if (saved_ != device) CUDA_CHECK(cudaSetDevice(device));
+  }
+  ~DeviceScope() { (void)cudaSetDevice(saved_); }
+  DeviceScope(const DeviceScope&) = delete;
+  DeviceScope& operator=(const DeviceScope&) = delete;
+
+ private:
+  int saved_ = 0;
+};
+
+// Loads checkpoint tensors into this device; with `second`, a layer's experts can be placed on that device
+// instead. Every allocation and every upload runs with its own device current.
 class Loader {
  public:
-  Loader(const SafetensorsModel& m, DeviceUploader& up, cudaStream_t stream, std::vector<DeviceBuffer>& storage)
-      : m_(m), up_(up), stream_(stream), storage_(storage) {}
-
-  void* alloc(std::size_t bytes) {
-    storage_.emplace_back(bytes);
-    return storage_.back().p;
+  Loader(const SafetensorsModel& m, DeviceUploader& up, cudaStream_t stream, std::vector<DeviceBuffer>& storage,
+         const DeviceContext* second = nullptr, SecondStorage* storage_hi = nullptr)
+      : m_(m), up_(up), stream_(stream), storage_(storage), second_(second), storage_hi_(storage_hi) {
+    CUDA_CHECK(cudaGetDevice(&primary_));
+    if (second_ == nullptr) return;
+    if (storage_hi_ == nullptr) throw std::invalid_argument("Loader: a second device needs its own storage");
+    storage_hi_->device = second_->device;
+    // 16 MiB x 4 staging buffers: the primary uploader already pins 384 MiB and this host has 16 GB of RAM.
+    const DeviceScope scope(second_->device);
+    up_hi_.emplace(UploadOptions{std::size_t(16) << 20, 4, 4}, second_->device);
   }
 
-  Tensor upload_f32(const std::vector<float>& host, std::initializer_list<std::int32_t> shape) {
-    void* d = alloc(host.size() * 4);
+  ~Loader() {
+    if (!up_hi_) return;
+    const DeviceScope scope(second_->device);  // the uploader's events belong to that device
+    up_hi_.reset();
+  }
+
+  // Device memory for `bytes` behind the views: this loader's device, or (device 1) the second one.
+  void* alloc(std::size_t bytes, int device = 0) {
+    const DeviceScope scope(device_id(device));
+    std::vector<DeviceBuffer>& s = device == 0 ? storage_ : storage_hi_->buffers;
+    s.emplace_back(bytes);
+    allocated_[device] += bytes;
+    return s.back().p;
+  }
+
+  Tensor upload_f32(const std::vector<float>& host, std::initializer_list<std::int32_t> shape, int device = 0) {
+    const DeviceScope scope(device_id(device));
+    void* d = alloc(host.size() * 4, device);
     CUDA_CHECK(cudaMemcpy(d, host.data(), host.size() * 4, cudaMemcpyHostToDevice));
     return rm(d, DType::FP32, shape);
   }
@@ -89,36 +131,55 @@ class Loader {
     return upload_f32(host_f32(m_, name), shape);
   }
 
-  // Queues the raw bytes of `name` (rows [0, rows) if rows >= 0) for upload to `dst`.
-  void queue(const std::string& name, void* dst, std::int64_t rows = -1) {
+  // Queues the raw bytes of `name` (rows [0, rows) if rows >= 0) for upload to `dst` on `device`.
+  void queue(const std::string& name, void* dst, std::int64_t rows = -1, int device = 0) {
     const SafetensorsRef ref = m_.at(name);
     UploadRequest r = upload_request(ref, dst);
     if (rows >= 0) r.bytes = ref->bytes / std::uint64_t(ref->shape[0]) * std::uint64_t(rows);
-    pending_.push_back(r);
+    pending_[device].push_back(r);
   }
 
   // Raw checkpoint tensor (any dtype) in new device memory, uploaded at flush().
-  Tensor raw(const std::string& name) {
+  Tensor raw(const std::string& name, int device = 0) {
     const SafetensorsRef ref = m_.at(name);
-    void* d = alloc(ref->bytes);
-    queue(name, d);
+    void* d = alloc(ref->bytes, device);
+    queue(name, d, -1, device);
     return ref->view(d);
   }
 
+  // Uploads every queued range: this device's on `stream_`, the second device's on its transfer stream.
   void flush() {
-    if (!pending_.empty()) up_.upload(pending_, stream_);
-    pending_.clear();
+    if (!pending_[0].empty()) up_.upload(pending_[0], stream_);
+    pending_[0].clear();
+    if (!pending_[1].empty()) {
+      const DeviceScope scope(device_id(1));
+      up_hi_->upload(pending_[1], second_->transfer_stream);
+    }
+    pending_[1].clear();
   }
 
   const SafetensorsModel& model() const { return m_; }
   cudaStream_t stream() const { return stream_; }
+  std::size_t bytes(int device) const { return allocated_[device]; }
 
  private:
+  // The CUDA device of a residency slot: 0 is this loader's device, 1 the second one.
+  int device_id(int device) const {
+    if (device == 0) return primary_;
+    if (second_ == nullptr) throw std::logic_error("Loader: no second device for an expert shard");
+    return second_->device;
+  }
+
   const SafetensorsModel& m_;
-  DeviceUploader& up_;
+  DeviceUploader& up_;  // this device's uploads
   cudaStream_t stream_;
   std::vector<DeviceBuffer>& storage_;
-  std::vector<UploadRequest> pending_;
+  const DeviceContext* second_ = nullptr;  // options.second_gpu; null: one device
+  SecondStorage* storage_hi_ = nullptr;
+  std::optional<DeviceUploader> up_hi_;  // the second device's uploads, built only for a second device
+  int primary_ = 0;                      // the device this loader's tensors live on
+  std::array<std::size_t, 2> allocated_{};
+  std::array<std::vector<UploadRequest>, 2> pending_;
 };
 
 std::array<ExpertFormat, LAYERS> expert_formats(const fs::path& model_dir) {
@@ -149,6 +210,21 @@ std::array<ExpertFormat, LAYERS> expert_formats(const fs::path& model_dir) {
   return fmt;
 }
 
+// Step 2 loads a layer's experts whole on one device: moe_up/moe_down take one base pointer per expert
+// tensor and address rows e*R, so a split inside a layer needs per-expert bases (step 3).
+void validate_residency(const ExpertResidency& residency, bool second_open) {
+  for (int l = 0; l < LAYERS; ++l) {
+    const int split = int(residency.split[l]);
+    if (split == EXPERTS) continue;
+    if (split != 0)
+      throw std::invalid_argument("expert residency: split " + std::to_string(split) + " in layer " +
+                                  std::to_string(l) + " needs per-expert base pointers (step 3)");
+    if (!second_open)
+      throw std::invalid_argument("expert residency: layer " + std::to_string(l) +
+                                  " has its experts on the second device, which is not open");
+  }
+}
+
 // FP8 rows + scales of a BF16 matrix (dense fp8_rows), into new storage.
 Dense to_fp8(Loader& ld, const Tensor& bf16, int rows, int cols) {
   void* q = ld.alloc(std::size_t(rows) * cols);
@@ -166,7 +242,7 @@ Dense row_view(const Dense& d, int begin, int end) {
   return v;
 }
 
-Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
+Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, int split) {
   const SafetensorsModel& m = ld.model();
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   Layer layer;
@@ -292,14 +368,23 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
     layer.mlp_gate_gain = at(layer.mlp1_gate_gain, 0, DType::FP32, H, GATE_RANK);
   }
 
-  // routed experts in checkpoint encoding
+  // routed experts in checkpoint encoding, whole on the device the residency table names
   const std::string e = p + "mlp.experts.";
   Experts& ex = layer.experts;
   ex.fmt = fmt;
-  ex.w13 = ld.raw(e + "w13_weight");
-  ex.w13_scale = ld.raw(e + "w13_weight_scale");
-  ex.w2 = ld.raw(e + "w2_weight");
-  ex.w2_scale = ld.raw(e + "w2_weight_scale");
+  ex.split = static_cast<std::int16_t>(split);
+  const int shard = split == EXPERTS ? 0 : 1;  // ExpertResidency: 0 or EXPERTS only
+  if (shard == 0) {
+    ex.w13 = ld.raw(e + "w13_weight");
+    ex.w13_scale = ld.raw(e + "w13_weight_scale");
+    ex.w2 = ld.raw(e + "w2_weight");
+    ex.w2_scale = ld.raw(e + "w2_weight_scale");
+  } else {
+    ex.w13_hi = ld.raw(e + "w13_weight", 1);
+    ex.w13_scale_hi = ld.raw(e + "w13_weight_scale", 1);
+    ex.w2_hi = ld.raw(e + "w2_weight", 1);
+    ex.w2_scale_hi = ld.raw(e + "w2_weight_scale", 1);
+  }
   const bool nv = fmt == ExpertFormat::NVFP4;
   const std::string want_codes = nv ? "U8" : "F8_E4M3", want_scales = nv ? "F8_E4M3" : "U8";
   if (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
@@ -311,7 +396,7 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
       const std::vector<float> den = host_f32(m, e + w + "_weight_outer_scale_denominator");
       std::vector<float> f(EXPERTS);
       for (int i = 0; i < EXPERTS; ++i) f[i] = amax[i] / den[den.size() == 1 ? 0 : i];  // FP32 division
-      (std::string(w) == "w13" ? ex.w13_factor : ex.w2_factor) = ld.upload_f32(f, {EXPERTS});
+      (std::string(w) == "w13" ? ex.w13_factor : ex.w2_factor) = ld.upload_f32(f, {EXPERTS}, shard);
     }
   }
 
@@ -332,16 +417,23 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
 
 }  // namespace
 
-Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream) {
+Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream, const DeviceContext* second,
+                     const ExpertResidency& residency) {
+  validate_residency(residency, second != nullptr);
+  int primary = 0;
+  CUDA_CHECK(cudaGetDevice(&primary));
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;
   w.dense_fp8 = dense_fp8;
+  w.residency = residency;
   w.expert_formats = expert_formats(model_dir);
   w.storage.reserve(4096);
-  Loader ld(m, up, stream, w.storage);
+  w.storage_hi.buffers.reserve(2 * LAYERS);
+  Loader ld(m, up, stream, w.storage, second, &w.storage_hi);
   const int H = HIDDEN;
-  for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8));
+  for (int l = 0; l < LAYERS; ++l)
+    w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8, residency.split[l]));
 
   // message_queries [12, 4, H] = cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1) with queries and
   // kv_queries [24, H] unflattened to [12, 2, H]
@@ -379,6 +471,14 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(stream));
+  w.bytes_primary = ld.bytes(0);
+  w.bytes_second = ld.bytes(1);
+  // the park budget reads cudaMemGetInfo on whatever is current (generator.cpp)
+  int current = 0;
+  CUDA_CHECK(cudaGetDevice(&current));
+  if (current != primary)
+    throw std::logic_error("load_weights: current device " + std::to_string(current) + " is not the load's device " +
+                           std::to_string(primary));
   return w;
 }
 
@@ -388,7 +488,7 @@ Layer load_layer(const fs::path& model_dir, int l, bool dense_fp8, cudaStream_t 
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Loader ld(m, up, stream, storage);
-  Layer layer = load_layer_into(ld, l, expert_formats(model_dir)[l], dense_fp8);
+  Layer layer = load_layer_into(ld, l, expert_formats(model_dir)[l], dense_fp8, EXPERTS);
   CUDA_CHECK(cudaStreamSynchronize(stream));
   return layer;
 }

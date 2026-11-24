@@ -6,6 +6,9 @@ ingine_add_test(NAME model_layer SOURCES test_layer.cpp LIBS ingine_model GPU MO
 ingine_add_test(NAME model_runtime SOURCES test_runtime.cpp LIBS ingine_model GPU TIMEOUT 600)
 # prompt checkpoints with speculative decoding on the full model (~22 GB of GPU memory)
 ingine_add_test(NAME model_reuse SOURCES test_reuse.cpp LIBS ingine_model GPU MODEL TIMEOUT 900)
+# expert residency across two devices: the split table, the shards on the second device, the same bytes as a
+# plain load_layer (~16.5 GB of GPU memory across two cards; opt in with INGINE_RESIDENCY_TEST=1)
+ingine_add_test(NAME model_residency SOURCES test_residency.cpp LIBS ingine_model GPU MODEL TIMEOUT 1200)
 # full-model parity against the Python engine's goldens (tools/goldens_model.py); ~20 GB of GPU memory
 if(TARGET ingine-validate)
   set(_validate ingine-validate --model-dir ${INGINE_TEST_MODEL_DIR} --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)

@@ -2,6 +2,7 @@
 // scheduler, the HTTP layer and their tests build without the model; ingine_model implements make_generator.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -13,6 +14,25 @@
 #include <vector>
 
 namespace ingine::model {
+
+// Expert residency across two devices (EP step 2: load-time placement): split[l] is the number of layer l's
+// LAYER_EXPERTS experts kept on the primary device, the rest live on the second one. Only 0 (the whole layer's
+// experts there) and LAYER_EXPERTS (all here) are loadable: moe_up/moe_down take one base pointer per expert
+// tensor, so a split inside a layer needs per-expert bases (step 3). Default: every expert on the primary.
+inline constexpr int EXPERT_RESIDENCY_LAYERS = 24;  // = model.LAYERS
+inline constexpr int LAYER_EXPERTS = 128;           // = model.EXPERTS
+
+struct ExpertResidency {
+  std::array<std::int16_t, EXPERT_RESIDENCY_LAYERS> split;
+  // Not `= {}`: zero-initialising the array would put every layer's experts on the second device.
+  ExpertResidency() { split.fill(LAYER_EXPERTS); }
+  bool all_primary() const {
+    for (std::int16_t s : split)
+      if (s != LAYER_EXPERTS) return false;
+    return true;
+  }
+  int device_of(int layer, int expert) const { return expert < split[layer] ? 0 : 1; }
+};
 
 struct Sampling {
   float temperature = 1.0f;  // 0 => greedy
@@ -97,9 +117,12 @@ struct RuntimeOptions {
   int park_mb = -1;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
-  // Expert parallelism: the CUDA device opened as the second device (expert weights stay on the first one
-  // for now). Negative: one device.
+  // Expert parallelism: the CUDA device opened as the second device; expert weights can be loaded onto it
+  // (expert_residency). Decode runs on the first device only. Negative: one device.
   int second_gpu = -1;
+  // Where each layer's experts live (default: all on this device). A table with experts on the second device
+  // loads, but the runtime refuses to decode it until the kernels take two base pointers (step 3).
+  ExpertResidency expert_residency;
 };
 
 class Generator {

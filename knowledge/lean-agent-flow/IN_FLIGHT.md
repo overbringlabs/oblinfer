@@ -7,7 +7,7 @@ This file is a whiteboard, not a ledger.
 ```
 ## agent: grok-parent   since: 2026-11-24T01:47Z
 writing: (none)
-next:    DeepSeek step 2 expert residency (one-device decode)
-released: step 1 --second-gpu + DeviceUploader target device
+next:    (idle — steps 1–2 done; waiting on Isaak for hop measurement)
+released: step 1 --second-gpu; step 2 expert residency
 ```
 

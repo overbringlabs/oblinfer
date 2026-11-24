@@ -2,6 +2,7 @@
 // indices, tap visits and the projection layout.
 #include "model/model_data.h"
 
+#include <cstdint>
 #include <cstdio>
 
 using namespace ingine::model;
@@ -34,6 +35,21 @@ int main() {
   const int begin[] = {0, 3072, 6144, 6528, 6552, 7576, 8600, 8632, 8664};
   for (int s = 0; s <= NUM_SEGS; ++s) expect(SEG_BEGIN[s] == begin[s], "projection layout");
   expect(PROJ_ROWS_SLIDING == 8600 && PROJ_ROWS_FULL == 8664, "projection rows");
+  // ExpertResidency: the default keeps every expert on the primary device ({} would put them all on the second)
+  {
+    expect(EXPERT_RESIDENCY_LAYERS == LAYERS && LAYER_EXPERTS == EXPERTS, "residency table sized for this model");
+    const ExpertResidency here;
+    bool all = true;
+    for (std::int16_t s : here.split) all &= s == EXPERTS;
+    expect(all && here.all_primary(), "default residency is all-primary");
+    for (int l = 0; l < LAYERS; ++l) expect(here.device_of(l, 0) == 0 && here.device_of(l, EXPERTS - 1) == 0,
+                                            "every expert on device 0");
+    ExpertResidency split;
+    split.split[23] = 0;
+    expect(!split.all_primary() && split.device_of(23, 0) == 1 && split.device_of(23, EXPERTS - 1) == 1 &&
+               split.device_of(22, EXPERTS - 1) == 0,
+           "device_of follows the split");
+  }
   std::printf("%s model_data constants\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
