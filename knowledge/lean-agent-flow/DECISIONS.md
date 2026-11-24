@@ -33,3 +33,5 @@ question: What this ruling decides
 
 | **Explore first, then split** (2026-11-24, standing) | serving, process | No engine code until the two-GPU explore is in-tree and a split is approved. | `decisions/20261124_explore-first-two-gpu.md` |
 | **Adopt lean-agent-flow** (2026-11-24, standing) | process | Ledgers live under `knowledge/lean-agent-flow/`; AGENTS.md is the kernel only. | `decisions/20261124_lean-agent-flow-adopted.md` |
+| **Try EP and PP** (2026-11-24, standing) | serving, gpu | Both topologies live. Rank by 256k tok/s; 100 beats Maya ~60 at depth. | `decisions/20261124_try-ep-and-pp.md` |
+| **PCIe EP, not PP** (2026-11-24, superseded by D-20261124-04) | serving, gpu | Same-day: PP is back on the table. | `decisions/20261124_pcie-ep-not-pp.md` |

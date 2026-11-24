@@ -32,4 +32,4 @@ question: What is pending
 
 ## Active
 
-| **Split topology** | 🟡 | PP vs TP vs Maya-like; unparks when `plans/20261124_two-gpu-explore.md` lands | `todo/20261124_split-topology.md` |
+| **Split topology** | 🟡 | EP vs PP vs hybrid; unparks when `plans/20261124_ingine-vs-maya-ds.md` ranks them by 256k tok/s | `todo/20261124_split-topology.md` |

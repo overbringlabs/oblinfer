@@ -2,7 +2,7 @@
 id: T-20261124-01
 date: 2026-11-24
 status: open
-trigger: Explore report lands at plans/20261124_two-gpu-explore.md
+trigger: DeepSeek report ranks EP vs PP vs hybrid at 256k on 5070 Ti + 5060 Ti
 areas: [serving, gpu]
 question: Pipeline-parallel, tensor-parallel, or Maya-like split for 256k at 100–120 tok/s on 2×16 GB?
 ---

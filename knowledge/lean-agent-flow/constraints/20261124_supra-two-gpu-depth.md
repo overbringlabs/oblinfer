@@ -1,7 +1,7 @@
 ---
 id: C-20261124-01
 date: 2026-11-24
-status: standing
+status: superseded-by:C-20261124-02
 areas: [serving, gpu]
 rule: "Target host is supra: 2× RTX 5060 Ti 16 GB, PCIe 5.0 x8/x8. Product bar is 256k context at 100–120 tok/s at depth, beating Maya (~80 tok/s)."
 ---

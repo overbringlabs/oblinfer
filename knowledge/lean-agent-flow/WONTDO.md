@@ -6,4 +6,6 @@ decision that supersedes this row and says why.
 
 ## Standing
 
-| **Chase 5090 tok/s** (2026-11-24, standing) | serving | Do not chase 490–560 tok/s on 2× 5060 Ti. Reopen on a 32 GB sm_120a card. | `wontdo/20261124_chase-5090-toks.md` |
+| **Chase 5090 tok/s** (2026-11-24, standing) | serving | Do not chase 490–560 tok/s on this dual-16 GB box. | `wontdo/20261124_chase-5090-toks.md` |
+| **Expert RAM offload** (2026-11-24, standing) | serving, gpu | Do not offload experts to 16 GB DDR5-6000 host RAM. | `wontdo/20261124_ram-expert-offload.md` |
+| **Layer-split relay** (2026-11-24, superseded by D-20261124-04) | serving, gpu | PP is back on the table. | `wontdo/20261124_layer-split-relay.md` |

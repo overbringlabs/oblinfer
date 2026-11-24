@@ -2,7 +2,7 @@
 
 Ingine: C++/CUDA OpenAI-compatible server for Inkling-2-Mini (`native/`). Single `DeviceContext`, kernels built for `sm_120a`. Serving profile in `runtime-manifest.json` (262144 ctx, dense-fp8, kv-fp8, spec).
 
-This checkout's live goal is running that engine on **supra** (2× RTX 5060 Ti 16 GB). Do not implement a multi-GPU split until `knowledge/lean-agent-flow/plans/20261124_two-gpu-explore.md` exists and Isaak picks a topology. Depth bar: 256k context at 100–120 tok/s; Maya on the same box is ~80 tok/s.
+This checkout's live goal is running that engine on **supra**: RTX 5070 Ti 16 GB + RTX 5060 Ti 16 GB, PCIe 5.0 x8/x8, no P2P, 16 GB DDR5-6000 host RAM (no expert RAM offload). Topologies in play: expert-parallel over PCIe **and** pipeline-parallel; pick by modelled 256k tok/s. Bar: 100–120 tok/s at depth; 100 already beats Maya ~60 at depth. Do not implement until `knowledge/lean-agent-flow/plans/20261124_ingine-vs-maya-ds.md` lands and Isaak says go.
 
 ## Knowledge map (lean-agent-flow)
 

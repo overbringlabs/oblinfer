@@ -11,15 +11,15 @@ get here".
 
 ## In flight
 
-- (none) Waiting on Isaak: PP vs Maya-style EP, after parent check of the explore.
+- DeepSeek Flash: rank EP vs PP (and a hybrid if it beats both) for 256k tok/s on 5070 Ti + 5060 Ti. Report: `plans/20261124_ingine-vs-maya-ds.md`.
 
 ## Last completed
 
-- 2026-11-24: Ornith explore landed `plans/20261124_two-gpu-explore.md`. Parent check: PDL/fusion/L2 stand; H1 half-wrong (`cvt.e2m1x2` is real); EP is wrong for 256k (KV stays on GPU0). Recommend PP.
+- 2026-11-24: hardware = 5070 Ti + 5060 Ti, no P2P, 16 GB host RAM. Maya at depth ~60. PP back on the table (D-20261124-04).
 
 ## Needs a decision
 
-- Split: pipeline-parallel (parent) vs Maya `IK2_EP` (Ornith). P2P on supra still unmeasured.
+- Which topology to implement first, after the DeepSeek ranking.
 
 ## Needs a decision
 
