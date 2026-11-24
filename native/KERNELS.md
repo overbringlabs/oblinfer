@@ -72,6 +72,16 @@ Weight layouts and the visit plan are in `src/model/model_data.h` and `src/model
 * Target: ≥ 80% of DRAM bandwidth on the 8 experts' bytes per token (NVFP4 ≈ 4.5 MB per expert, MXFP8 ≈
   8.2 MB) for M = 1.
 
+`moe_down_rows(act, idx, w2, w2_scale, w2_factor, fmt, rows)` + `moe_sum(rows, wts, conv_w, conv_state, out)`
+
+* The same arithmetic as `moe_down`, split at the weighted sum so the experts can run on another device (expert
+  parallelism, `src/model/decoder.cpp`'s `expert_hop`). `moe_down_rows` is `moe_down`'s expert pass alone: it
+  writes `rows[(m * 8 + k) * H + c] = bf16(W2_e · act[m, k])` for every slot, the value `moe_down` sums, and
+  reads no `wts`, conv state or output. `moe_sum` is its epilogue on the device that owns the state:
+  `s[m] = bf16(Σ_k wts[m, k] * rows[(m * 8 + k)])` in slot order, then the post-MLP convolution above.
+* Bit-identical to one `moe_down` on the same `act`/`idx`/weights/state (`tests/kernels/test_bitlock.cpp`
+  compares them for M = 1..8, both formats).
+
 ## Area `attn` (attention core)
 
 `attn_decode(proj, layer params, conv_k_state, conv_v_state, k_cache, v_cache, kpos, pos, window,

@@ -276,6 +276,40 @@ uint64_t lock_attn_sliding(LockGen& g, int M) {
   return f.h;
 }
 
+// EP step 4: the split expert pass (moe_down_rows on the device that holds the experts, moe_sum on the device
+// that holds the conv state and the output) must reproduce the fused moe_down bit for bit — the rows it hands
+// over are exactly the BF16 values the fused epilogue sums. Same weights, act, idx, wts and conv state.
+bool moe_split_matches(LockGen& g, const ExpertWeight& w13, const ExpertWeight& w2, bool nv, int M) {
+  const moe::Format fmt = nv ? moe::Format::NVFP4 : moe::Format::MXFP8;
+  const float* factor13 = nv ? w13.factor.get() : nullptr;
+  const float* factor2 = nv ? w2.factor.get() : nullptr;
+  DeviceArray<int> idx(routing(g, M));
+  DeviceArray<__nv_bfloat16> x(to_bf16(g.vec_bf16(size_t(M) * H, 1.5f))), act(size_t(M) * TOPK * I);
+  DeviceArray<float> wts(g.vec(size_t(M) * TOPK, 0.9f, 1.1f)), cw(g.vec(size_t(H) * 4, 0.5f));
+  const std::vector<float> state0 = g.vec_bf16(size_t(3) * H, 0.3f);
+  DeviceArray<__nv_bfloat16> rows(size_t(M) * TOPK * H);
+  DeviceArray<float> st_fused(state0), out_fused(size_t(M) * H), hist_fused(size_t(M) * H);
+  DeviceArray<float> st_split(state0), out_split(size_t(M) * H), hist_split(size_t(M) * H);
+  moe::moe_up(x.get(), M, idx.get(), w13.codes.get(), w13.scales.get(), factor13, fmt, act.get(), true, g_stream);
+  moe::moe_down(act.get(), M, idx.get(), wts.get(), w2.codes.get(), w2.scales.get(), factor2, fmt, cw.get(),
+                st_fused.get(), out_fused.get(), hist_fused.get(), true, g_stream);
+  moe::moe_down_rows(act.get(), M, idx.get(), w2.codes.get(), w2.scales.get(), factor2, fmt, rows.get(), false,
+                     g_stream);
+  moe::moe_sum(rows.get(), M, wts.get(), cw.get(), st_split.get(), out_split.get(), hist_split.get(), g_stream);
+  sync();
+  const bool same = out_fused.download() == out_split.download() && hist_fused.download() == hist_split.download() &&
+                    st_fused.download() == st_split.download();
+  if (!same) {
+    const std::vector<float> a = out_fused.download(), b = out_split.download();
+    for (size_t i = 0; i < a.size(); ++i)
+      if (a[i] != b[i]) {
+        std::printf("  first difference: out[%zu] fused %.9g split %.9g\n", i, double(a[i]), double(b[i]));
+        break;
+      }
+  }
+  return same;
+}
+
 // [M - 1][proj, proj_conv, head, moe nvfp4, moe mxfp8, sliding attention]
 constexpr int kLocks = 6;
 constexpr const char* kNames[kLocks] = {"proj", "proj_conv", "head", "moe nvfp4", "moe mxfp8", "attn sliding"};
@@ -339,6 +373,20 @@ int main() {
     std::printf("},%s\n", diff.c_str());
     ok = ok && same;
   }
+  // EP step 4 (no hash: a direct comparison): one layer's experts on another device must land on the same bits
+  for (int nv = 1; nv >= 0; --nv) {
+    LockGen gw{0x10c55000ull + uint64_t(nv)};
+    const ExpertWeight w13(gw, 2 * I, H, nv), w2(gw, H, I, nv);
+    for (int M = 1; M <= 8; ++M) {
+      LockGen g{0x10c56000ull + uint64_t(8 * nv + M)};
+      const bool same = moe_split_matches(g, w13, w2, nv != 0, M);
+      if (!same) {
+        std::printf("FAIL EP split moe_down M=%d %s: differs from the fused kernel\n", M, nv ? "nvfp4" : "mxfp8");
+        ok = false;
+      }
+    }
+  }
+  if (ok) std::printf("PASS EP split moe_down_rows + moe_sum == moe_down, M = 1..8, both formats\n");
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;

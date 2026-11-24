@@ -11,24 +11,20 @@ get here".
 
 ## In flight
 
-- (none) Hop PASS. Waiting on Isaak for step 4 (MoE split).
+- (none) Step 4 committed. EP decode is eager; spec and prefill refuse a split. Waiting on Isaak.
 
 ## Last completed
 
-- 2026-11-24: hop on supra. P2P=0, mean 27.1 µs, p99 39.6. sm_120a ran on both cards. Gate 40 µs cleared.
+- 2026-11-24: step 4 `92d1688` — `split==0` hops moe to GPU1 (`moe_down_rows` + `moe_sum`). Default fused path unchanged.
+- 2026-11-24: hop on supra 27.1 µs PASS.
 
 ## Needs a decision
 
-- Go on step 4 MoE split, or hold.
-
-## Needs a decision
-
-- Split topology (PP / TP / Maya-like) after the explore report. `todo/20261124_split-topology.md`.
+- Next: EP+DSpark (standing bar), 64/64 split, or hold.
 
 ## In-flight claims
 
-- grok-parent: knowledge ledger files (this turn).
-- turbo explore: will claim the plan file.
+- (none)
 
 ## Journal
 

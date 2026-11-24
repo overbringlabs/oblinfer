@@ -43,17 +43,65 @@ DeviceBuffer upload_ints(const std::vector<int>& v) {
   return b;
 }
 
+// The expert hop's staging is sized for the widest call width, not per width: the device streams run one hop
+// at a time.
+constexpr int kHopMaxM = 8;
+
+// Makes `device` current for the scope, restoring the caller's on exit (the hop's device-1 copies and
+// launches). Never used inside stream capture: a split visit's step is not capturable.
+struct BindDevice {
+  explicit BindDevice(int device) {
+    CUDA_CHECK(cudaGetDevice(&saved));
+    if (saved != device) CUDA_CHECK(cudaSetDevice(device));
+  }
+  ~BindDevice() { (void)cudaSetDevice(saved); }
+  BindDevice(const BindDevice&) = delete;
+  BindDevice& operator=(const BindDevice&) = delete;
+
+ private:
+  int saved = 0;
+};
+
 }  // namespace
 
-Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl)
-    : w_(w), abl_(abl), st_(st), pdl_(pdl), attn_ws_(attn::workspace_bytes(8)) {
+Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, const DeviceContext* second)
+    : w_(w), abl_(abl), st_(st), pdl_(pdl), attn_ws_(attn::workspace_bytes(8)), second_(second) {
   attn_ws_.fill(0);  // zeroed once; the kernel resets its counter itself
   segments_[0] = upload_ints(proj_layout(false, true));
   segments_[1] = upload_ints(proj_layout(false, false));
   full_segments_ = upload_ints(proj_layout(true, false));
+  if (second_ == nullptr) return;
+  // Nothing is allocated unless some layer really keeps its experts there (`--second-gpu` alone keeps today's
+  // one-device step, and then not even the staging below exists).
+  bool remote = false;
+  for (const Layer& l : w.layers) remote = remote || l.experts.split == 0;
+  if (!remote) return;
+  // The hop (plans/20261124_hop-measure.md): portable pinned staging, one stream and one event pair. Each
+  // event belongs to the device that records it: hop_ready_ to this one, hop_back_ to the second.
+  hop_stream_ = second_->stream;
+  hop_x_ = MappedHostBuffer(std::size_t(kHopMaxM) * HIDDEN * 2);            // bf16 [m, H]
+  hop_idx_ = MappedHostBuffer(std::size_t(kHopMaxM) * TOP_K * 4);           // int32 [m, 8]
+  hop_rows_ = MappedHostBuffer(std::size_t(kHopMaxM) * TOP_K * HIDDEN * 2);  // bf16 [m, 8, H]
+  hop_rows0_ = DeviceBuffer(std::size_t(kHopMaxM) * TOP_K * HIDDEN * 2);
+  CUDA_CHECK(cudaEventCreateWithFlags(&hop_ready_, cudaEventDisableTiming));
+  const BindDevice bind(second_->device);
+  CUDA_CHECK(cudaEventCreateWithFlags(&hop_back_, cudaEventDisableTiming));
+  hop_hi_.device = second_->device;
+  hop_hi_.buffers.emplace_back(std::size_t(kHopMaxM) * HIDDEN * 2);          // xm
+  hop_hi_.buffers.emplace_back(std::size_t(kHopMaxM) * TOP_K * 4);           // idx
+  hop_hi_.buffers.emplace_back(std::size_t(kHopMaxM) * TOP_K * INTER * 2);   // act
+  hop_hi_.buffers.emplace_back(std::size_t(kHopMaxM) * TOP_K * HIDDEN * 2);  // per-slot rows
 }
 
-Decoder::~Decoder() = default;
+Decoder::~Decoder() {
+  if (second_ == nullptr) return;
+  {
+    const BindDevice bind(second_->device);  // the second device's event and storage
+    if (hop_back_) (void)cudaEventDestroy(hop_back_);
+    hop_hi_.release();
+  }
+  if (hop_ready_) (void)cudaEventDestroy(hop_ready_);
+}
 
 const std::int64_t* Decoder::block_table(const std::vector<const float*>& blocks) {
   auto it = tables_.find(blocks);
@@ -231,12 +279,17 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
                   static_cast<int*>(b.idx.data), f32m(b.wts), pdl, stream);
     const Experts& ex = layer.experts;
     const moe::Format fmt = ex.fmt == ExpertFormat::NVFP4 ? moe::Format::NVFP4 : moe::Format::MXFP8;
-    moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), ex.w13.data, ex.w13_scale.data,
-                f32p(ex.w13_factor), fmt, bf16m(b.act), pdl, stream);
-    // with PDL, moe_down prefetches weights before waiting: valid because moe_up always precedes it
-    moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), ex.w2.data, ex.w2_scale.data,
-                  f32p(ex.w2_factor), fmt, f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2),
-                  history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, pdl, stream);
+    float* conv_hist = history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr;
+    if (ex.split == 0) {  // EP: every expert of this layer is on the second device (step 4: whole layers only)
+      expert_hop(ex, b, m, f32p(layer.mlp_conv), st.conv_mlp_at(v), conv_hist, stream);
+    } else {
+      moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), ex.w13.data, ex.w13_scale.data,
+                  f32p(ex.w13_factor), fmt, bf16m(b.act), pdl, stream);
+      // with PDL, moe_down prefetches weights before waiting: valid because moe_up always precedes it
+      moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), ex.w2.data, ex.w2_scale.data,
+                    f32p(ex.w2_factor), fmt, f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2), conv_hist, pdl,
+                    stream);
+    }
     prev_v = v;
   }
   // ---- final read; the same launch writes b.taps[:, 3] = b.xf
@@ -248,6 +301,44 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   fp.out_copy_stride = std::int64_t(NUM_TAPS) * H;
   dense::mix(fp, pdl, stream);
   dense::head(bf16m(b.xf), m, matrix(w.unembed), f32m(b.logits), pdl, stream);
+}
+
+void Decoder::expert_hop(const Experts& ex, Buffers& b, int m, const float* conv_w, float* conv_state,
+                         float* conv_hist, cudaStream_t stream) {
+  // EP step 4 (plans/20261124_ingine-vs-maya-ds.md §4.2/§7.4): the layer's experts are on the second device
+  // and no peer access is enabled, so the visit's expert work goes over pinned host staging, the protocol
+  // apps/hop measured at 27.1 us per round trip. GPU0 sends xm (bf16 [m, 2304], 4.6 KiB at m = 1) and idx;
+  // the second device runs moe_up and moe_down's expert pass; one BF16 row per slot (36 KiB at m = 1) comes
+  // back; GPU0 does the slot-ordered FP32 weighted sum and the post-MLP conv here. Every value GPU1 touches
+  // is a copy of a GPU-0 value, so the result is bit-identical to the one-device path.
+  if (second_ == nullptr) throw std::logic_error("expert_hop: this decoder has no second device");
+  const moe::Format fmt = ex.fmt == ExpertFormat::NVFP4 ? moe::Format::NVFP4 : moe::Format::MXFP8;
+  const std::size_t xb = std::size_t(m) * HIDDEN * 2;
+  const std::size_t ib = std::size_t(m) * TOP_K * 4;
+  const std::size_t rb = std::size_t(m) * TOP_K * HIDDEN * 2;
+  __nv_bfloat16* xm1 = static_cast<__nv_bfloat16*>(hop_hi_.buffers[0].p);
+  int* idx1 = static_cast<int*>(hop_hi_.buffers[1].p);
+  __nv_bfloat16* act1 = static_cast<__nv_bfloat16*>(hop_hi_.buffers[2].p);
+  __nv_bfloat16* rows1 = static_cast<__nv_bfloat16*>(hop_hi_.buffers[3].p);
+  CUDA_CHECK(cudaMemcpyAsync(hop_x_.data(), bf16m(b.xm), xb, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(hop_idx_.data(), b.idx.data, ib, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaEventRecord(hop_ready_, stream));
+  {
+    const BindDevice bind(second_->device);
+    CUDA_CHECK(cudaStreamWaitEvent(hop_stream_, hop_ready_, 0));
+    CUDA_CHECK(cudaMemcpyAsync(xm1, hop_x_.data(), xb, cudaMemcpyHostToDevice, hop_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(idx1, hop_idx_.data(), ib, cudaMemcpyHostToDevice, hop_stream_));
+    moe::moe_up(xm1, m, idx1, ex.w13_hi.data, ex.w13_scale_hi.data, f32p(ex.w13_factor), fmt, act1, false,
+                hop_stream_);
+    moe::moe_down_rows(act1, m, idx1, ex.w2_hi.data, ex.w2_scale_hi.data, f32p(ex.w2_factor), fmt, rows1, false,
+                       hop_stream_);
+    CUDA_CHECK(cudaMemcpyAsync(hop_rows_.data(), rows1, rb, cudaMemcpyDeviceToHost, hop_stream_));
+    CUDA_CHECK(cudaEventRecord(hop_back_, hop_stream_));
+  }
+  CUDA_CHECK(cudaStreamWaitEvent(stream, hop_back_, 0));
+  CUDA_CHECK(cudaMemcpyAsync(hop_rows0_.p, hop_rows_.data(), rb, cudaMemcpyHostToDevice, stream));
+  moe::moe_sum(static_cast<const __nv_bfloat16*>(hop_rows0_.p), m, f32p(b.wts), conv_w, conv_state, f32m(b.y2),
+               conv_hist, stream);
 }
 
 }  // namespace ingine::model

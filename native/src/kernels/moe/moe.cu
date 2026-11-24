@@ -355,12 +355,14 @@ moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, 
 
 // ------------------------------------------------------------------------------------- moe_down
 
-template <int FMT>
+// ROWS: the expert pass of an expert-parallel visit (EP): write one BF16 row per slot and stop, so the
+// device that owns the output sums them with moe_sum_kernel below. The expert math is the same code.
+template <int FMT, bool ROWS>
 __global__ void __launch_bounds__(DOWN_WARPS * 32)
 moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ idx, const float* __restrict__ wts,
                 const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const float* __restrict__ wfactor,
-                int M, const float* __restrict__ conv_w, float* __restrict__ conv_state, float* __restrict__ out,
-                float* __restrict__ conv_hist) {
+                int M, __nv_bfloat16* __restrict__ rows, const float* __restrict__ conv_w,
+                float* __restrict__ conv_state, float* __restrict__ out, float* __restrict__ conv_hist) {
     constexpr int K = I, R = H;
     constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
     __shared__ float part[DOWN_WARPS][32][4];        // per-warp partial dots of the current round
@@ -441,6 +443,17 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
     }
     pdl_trigger();  // only the short epilogue remains; dependents still wait for our completion
 
+    if constexpr (ROWS) {
+        // One row per slot, duplicates included: the BF16-rounded expert output ybuf holds, which is what the
+        // fused epilogue's weighted sum reads. The other device's moe_sum reproduces it bit for bit.
+        for (int i = threadIdx.x; i < TILE * nslots; i += DOWN_WARPS * 32) {
+            const int r = i % TILE, sl = i / TILE;
+            rows[static_cast<std::size_t>(sl) * H + tile * TILE + r] =
+                __float2bfloat16_rn(ybuf[slot_u[sl]][r][sl / TOPK]);
+        }
+        return;
+    }
+
     if (threadIdx.x < TILE * M) {
         const int r = threadIdx.x & (TILE - 1), n = threadIdx.x / TILE;
         float s = 0.f;
@@ -448,6 +461,63 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
         for (int k = 0; k < TOPK; ++k) {
             const int sl = n * TOPK + k;
             s = __fadd_rn(s, __fmul_rn(ld_dep(wts + sl), ybuf[slot_u[sl]][r][n]));
+        }
+        sbuf[n][r] = bf16_round(s);
+    }
+    __syncthreads();
+
+    if (threadIdx.x < TILE) {
+        const int ch = tile * TILE + threadIdx.x;
+        const float4 cw = *reinterpret_cast<const float4*>(conv_w + 4 * ch);
+        float ext[MAXM + 3];
+        ext[0] = ld_dep(conv_state + ch);
+        ext[1] = ld_dep(conv_state + H + ch);
+        ext[2] = ld_dep(conv_state + 2 * H + ch);
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) ext[m + 3] = m < M ? sbuf[m][threadIdx.x] : 0.f;
+        constexpr float inv_sqrt5 = 1.f / 2.2360679774997896f;  // torch divides by a scalar via its reciprocal
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) {
+            if (m < M) {
+                // same op order and roundings as model.static_conv in FP32 (bit-exact)
+                float acc = __fmul_rn(cw.x, ext[m]);
+                acc = __fadd_rn(acc, __fmul_rn(cw.y, ext[m + 1]));
+                acc = __fadd_rn(acc, __fmul_rn(cw.z, ext[m + 2]));
+                acc = __fadd_rn(acc, __fmul_rn(cw.w, ext[m + 3]));
+                out[static_cast<size_t>(m) * H + ch] = __fmul_rn(__fadd_rn(acc, ext[m + 3]), inv_sqrt5);
+                if (conv_hist) conv_hist[static_cast<size_t>(m) * H + ch] = ext[m + 3];  // for rollback
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 3; ++j)
+#pragma unroll
+            for (int m = 1; m <= MAXM; ++m)  // constant indices keep ext[] in registers
+                if (m == M) conv_state[j * H + ch] = ext[m + j];
+    }
+}
+
+// -------------------------------------------------------------------------------------- moe_sum
+
+// moe_down's epilogue, run where the output lives: a block owns the same 16 output channels of the same
+// tile as moe_down_kernel's epilogue and executes it verbatim (slot-ordered FP32 weighted sum, one BF16
+// rounding, then the post-MLP conv and its state update), so the rows moe_down_rows returned on another
+// device land on the bits moe_down would have written. 144 blocks of 128 threads, no PDL: the rows arrive
+// in stream order.
+__global__ void __launch_bounds__(TILE * MAXM)
+moe_sum_kernel(const __nv_bfloat16* __restrict__ rows, const float* __restrict__ wts,
+               const float* __restrict__ conv_w, float* __restrict__ conv_state, float* __restrict__ out,
+               float* __restrict__ conv_hist, int M) {
+    __shared__ float sbuf[MAXM][TILE];
+    const int tile = blockIdx.x;
+
+    if (threadIdx.x < TILE * M) {
+        const int r = threadIdx.x & (TILE - 1), n = threadIdx.x / TILE;
+        float s = 0.f;
+#pragma unroll
+        for (int k = 0; k < TOPK; ++k) {
+            const int sl = n * TOPK + k;
+            const float y = __bfloat162float(rows[static_cast<std::size_t>(sl) * H + tile * TILE + r]);
+            s = __fadd_rn(s, __fmul_rn(wts[sl], y));
         }
         sbuf[n][r] = bf16_round(s);
     }
@@ -524,9 +594,30 @@ void moe_down(const __nv_bfloat16* act, int M, const int* idx, const float* wts,
     require(act && idx && wts && w2 && w2_scale && conv_w && conv_state && out, "moe_down: null argument");
     require(fmt == Format::MXFP8 || w2_factor, "NVFP4 experts need a factor tensor");
     const bool nv = fmt == Format::NVFP4;
-    launch(nv ? moe_down_kernel<0> : moe_down_kernel<1>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx,
-           wts, static_cast<const uint8_t*>(w2), static_cast<const uint8_t*>(w2_scale), nv ? w2_factor : nullptr,
-           M, conv_w, conv_state, out, conv_hist);
+    launch(nv ? moe_down_kernel<0, false> : moe_down_kernel<1, false>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream,
+           act, idx, wts, static_cast<const uint8_t*>(w2), static_cast<const uint8_t*>(w2_scale),
+           nv ? w2_factor : nullptr, M, static_cast<__nv_bfloat16*>(nullptr), conv_w, conv_state, out, conv_hist);
+}
+
+void moe_down_rows(const __nv_bfloat16* act, int M, const int* idx, const void* w2, const void* w2_scale,
+                   const float* w2_factor, Format fmt, __nv_bfloat16* rows, bool pdl, cudaStream_t stream) {
+    require(M >= 1 && M <= MAXM, "M must be in 1..8");
+    require(act && idx && w2 && w2_scale && rows, "moe_down_rows: null argument");
+    require(fmt == Format::MXFP8 || w2_factor, "NVFP4 experts need a factor tensor");
+    const bool nv = fmt == Format::NVFP4;
+    launch(nv ? moe_down_kernel<0, true> : moe_down_kernel<1, true>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream,
+           act, idx, static_cast<const float*>(nullptr), static_cast<const uint8_t*>(w2),
+           static_cast<const uint8_t*>(w2_scale), nv ? w2_factor : nullptr, M, rows,
+           static_cast<const float*>(nullptr), static_cast<float*>(nullptr), static_cast<float*>(nullptr),
+           static_cast<float*>(nullptr));
+}
+
+void moe_sum(const __nv_bfloat16* rows, int M, const float* wts, const float* conv_w, float* conv_state,
+             float* out, float* conv_hist, cudaStream_t stream) {
+    require(M >= 1 && M <= MAXM, "M must be in 1..8");
+    require(rows && wts && conv_w && conv_state && out, "moe_sum: null argument");
+    launch(moe_sum_kernel, dim3(H / TILE), TILE * MAXM, false, stream, rows, wts, conv_w, conv_state, out, conv_hist,
+           M);
 }
 
 }  // namespace ingine::kernels::moe

@@ -97,16 +97,30 @@ void Runtime::open_second_device() {
 
 void Runtime::init() {
   const RuntimeOptions& options = options_;
-  // Step 2 places expert bytes, it does not read them across devices: every decode, prefill, head and spec
-  // kernel runs here and captures this device's pointers, and the moe kernels take one base pointer per
-  // expert tensor. Peer access between the two cards is unmeasured; per-expert bases are step 3.
-  if (!weights_.residency.all_primary()) {
+  // EP step 4: a layer whose experts all live on the second device is decoded there (Decoder::expert_hop) —
+  // one hop per visit of such a layer, no peer access, per-slot BF16 rows summed here. A split inside a layer
+  // still needs per-expert base pointers, which the loader refuses (validate_residency). A step that spans two
+  // devices cannot be captured as one CUDA graph (a graph belongs to one device), so it runs eager: dual
+  // graphs are deferred, and with them the speculative loop, whose verify calls are captured switches.
+  ep_ = false;
+  for (const Layer& l : weights_.layers) {
+    if (l.experts.split == EXPERTS) continue;
+    if (l.experts.split != 0) {
+      throw std::invalid_argument("expert residency: layer " + std::to_string(l.idx) + " splits its experts inside "
+                                  "the layer, which needs per-expert base pointers (step 3 of the EP plan)");
+    }
+    ep_ = true;
+  }
+  if (ep_ && second_device_ == nullptr) {
+    throw std::invalid_argument("expert residency: an expert shard needs the second device (options.second_gpu)");
+  }
+  if (ep_ && options.spec) {
     throw std::invalid_argument(
-        "expert residency: experts loaded on the second device cannot be decoded yet (decode runs on the "
-        "primary device; peer access is unmeasured and per-expert base pointers are step 3)");
+        "expert residency: experts on the second device decode eagerly (a two-device step is not one CUDA graph), "
+        "so DSpark's captured verify switches do not exist yet; run without spec");
   }
   state_ = make_state(options.max_ctx, options.kv_fp8);
-  decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
+  decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true, second_device_.get());
   pos_ = DeviceBuffer(sizeof(std::int64_t));
   pos_.fill(0);
   token_ = DeviceBuffer(kMaxWidth * sizeof(std::int64_t));
@@ -141,7 +155,9 @@ void Runtime::init() {
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
   // write one place)
   for (auto& [m, b] : buffers_) b.token = rm(token_.p, DType::I64, {m});
-  for (const auto& [m, history] : history_) capture(m, history);
+  // An expert split decodes eagerly (run_step): a step that spans two devices is not one CUDA graph.
+  if (!ep_)
+    for (const auto& [m, history] : history_) capture(m, history);
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
@@ -220,7 +236,12 @@ void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
 
 const float* Runtime::run_step(int m) {
   auto it = graphs_.find(m);
-  if (it == graphs_.end()) throw std::invalid_argument("no decode graph for width " + std::to_string(m));
+  if (it == graphs_.end()) {
+    // with experts on the second device there is no captured step (init skips capture), so the eager step is
+    // the step; without one, a missing width is an error as before
+    if (!ep_) throw std::invalid_argument("no decode graph for width " + std::to_string(m));
+    return run_step_eager(m);
+  }
   CUDA_CHECK(cudaGraphLaunch(it->second, stream_));
   return static_cast<const float*>(buffers(m).logits.data);
 }

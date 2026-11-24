@@ -145,16 +145,28 @@ C++ mirrors of `weights.Weights`/`Layer`/`Experts`, `model.State` and `fast.Buff
 Python names (`t["wq"]` -> `layer.wq`, `state.k_ring`, `buffers.taps`, ...), shapes and dtypes identical, plus
 the visit plan and constants of `weights.py`. The decode step, the prefill and the drafter share this header.
 
-Expert residency across two devices (EP step 2) is load-time only. `ExpertResidency` in
+Expert residency across two devices (EP step 2) is a load-time table. `ExpertResidency` in
 `include/ingine/generator.h` (CUDA-free, like the rest of `RuntimeOptions`) holds, per layer, how many of that
 layer's 128 experts stay on the primary device; `load_weights(dir, dense_fp8, stream, second, residency)`
 places a layer's four expert tensors and their factors whole on the device the table names (`Experts::split`,
 the `_hi` views, `Weights::storage_hi`, freed with their own device current), one granule of 546.75 MiB NVFP4 /
 1002.4 MiB MXFP8 per layer. The default table is all-primary: no second uploader, no second allocation, the same
 allocations in the same order on the same stream. Only `0` and `EXPERTS` are loadable - the moe kernels take one
-base pointer per expert tensor and address rows as `e*R`, so a split inside a layer is step 3 - and
-`Runtime::init` refuses to decode a table with any expert on the second device (decode, prefill, head and spec
-graphs all capture primary-device pointers).
+base pointer per expert tensor and address rows as `e*R`, so a split inside a layer is step 3.
+
+Decode then reads the table (EP step 4). A visit whose layer has `split == 0` runs its experts on the second
+device (`Decoder::expert_hop`): GPU0's `xm` (bf16 `[m, H]`, 4.6 KiB at m = 1) and `idx` go to pinned host
+staging, `moe_up` and `moe_down_rows` run there, one BF16 row per slot comes back (36 KiB at m = 1), and this
+device's `moe_sum` does `moe_down`'s slot-ordered FP32 weighted sum and post-MLP conv. The rows are the values
+the fused epilogue sums, so the split is bit-identical to the one-device path (the two kernels are compared in
+`tests/kernels/test_bitlock.cpp`); the hop is the protocol `apps/hop` measured at 27.1 us per round trip with no
+peer access, ordered by one non-timing event pair per visit and never by a host wait. Layers with
+`split == EXPERTS` keep the fused `moe_up`/`moe_down` pair, so the default table copies nothing.
+
+That step spans two devices, and a CUDA graph belongs to one, so an expert split decodes eagerly
+(`Runtime::init` skips capture, `run_step` falls back to `run_step_eager`) and DSpark is refused until dual
+graphs exist; the prefill's grouped expert GEMMs take one base per expert tensor on this device, so `Prefiller`
+refuses a table that moves any layer's experts.
 
 ### Prefill (`src/model/prefill.{h,cpp}`)
 

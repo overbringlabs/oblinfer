@@ -56,18 +56,28 @@ void reset_state(State& state, cudaStream_t stream);
 // ---- fast.FastDecoder
 class Decoder {
  public:
-  Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl = true);
+  // `second`: the device opened for expert parallelism (options.second_gpu), or null. A visit whose layer has
+  // every expert there runs moe_up and moe_down's expert pass on it and hops the per-slot rows back
+  // (expert_hop below).
+  Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl = true,
+          const DeviceContext* second = nullptr);
   ~Decoder();
   Decoder(const Decoder&) = delete;
   Decoder& operator=(const Decoder&) = delete;
 
   // fast.FastDecoder.decode: runs b.m consecutive tokens b.token at positions *pos, *pos + 1, ...;
   // logits in b.logits, taps in b.taps, conv inputs in b.hist_* when `history`. Graph capturable once it
-  // ran eagerly for `b` (pointer tables are built on first use).
+  // ran eagerly for `b` (pointer tables are built on first use) — except across the expert hop, which spans
+  // two devices and so cannot be captured (the runtime then decodes eagerly).
   void decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream);
 
  private:
   const std::int64_t* block_table(const std::vector<const float*>& blocks);
+  // EP: one visit's experts on the second device. GPU0 sends xm (bf16 [m, H]) and idx, GPU1 runs moe_up and
+  // moe_down's expert pass, its per-slot BF16 rows come back and moe_sum does the weighted sum and the conv
+  // here. Enqueues on `stream` and the second device's stream; no host wait.
+  void expert_hop(const Experts& ex, Buffers& b, int m, const float* conv_w, float* conv_state, float* conv_hist,
+                  cudaStream_t stream);
 
   const Weights& w_;
   const Ablation& abl_;
@@ -77,6 +87,14 @@ class Decoder {
   std::map<std::vector<const float*>, DeviceBuffer> tables_;  // device pointer tables for mix
   std::array<DeviceBuffer, 2> segments_;  // proj segment tables: [single-input sliding, three-input]
   DeviceBuffer full_segments_;
+  // expert hop (only with a second device; nothing here is allocated or copied without one)
+  const DeviceContext* second_ = nullptr;
+  cudaStream_t hop_stream_ = nullptr;      // the second device's compute stream
+  cudaEvent_t hop_ready_ = nullptr;        // recorded on `stream` (device 0), waited on hop_stream_
+  cudaEvent_t hop_back_ = nullptr;         // recorded on hop_stream_ (device 1), waited on `stream`
+  MappedHostBuffer hop_x_, hop_idx_, hop_rows_;  // pinned staging: xm, idx out; per-slot rows back
+  SecondStorage hop_hi_;                   // xm, idx, act, rows on the second device
+  DeviceBuffer hop_rows0_;                 // the rows as they land on this device
 };
 
 // An instantiated CUDA graph (move-only).
@@ -197,6 +215,7 @@ class Runtime {
   std::unique_ptr<DeviceContext> second_device_;  // options_.second_gpu; null with one device
   RuntimeOptions options_;
   int device_ = 0;  // the device this runtime runs on; set when options_.second_gpu is opened
+  bool ep_ = false;  // some layer's experts live on the second device: the step hops, and it runs eager
   cudaStream_t stream_ = nullptr;
   Weights weights_;
   Ablation ablation_;
