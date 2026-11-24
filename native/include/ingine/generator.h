@@ -118,10 +118,14 @@ struct RuntimeOptions {
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
   // Expert parallelism: the CUDA device opened as the second device; expert weights can be loaded onto it
-  // (expert_residency). Decode runs on the first device only. Negative: one device.
+  // (expert_residency) and their visits run there. Decode's other kernels stay on the first device. Negative:
+  // one device.
   int second_gpu = -1;
-  // Where each layer's experts live (default: all on this device). A table with experts on the second device
-  // loads, but the runtime refuses to decode it until the kernels take two base pointers (step 3).
+  // Where each layer's experts live (default: all on this device). Only 0 (the whole layer's experts there) and
+  // LAYER_EXPERTS load: the moe kernels take one base pointer per expert tensor, so a split inside a layer needs
+  // per-expert bases (step 3). With any layer moved, a step spans two devices: it runs eagerly (no CUDA graph),
+  // DSpark verifies eagerly at one extra host synchronisation per round, and a prompt is processed one token per
+  // decode step.
   ExpertResidency expert_residency;
 };
 

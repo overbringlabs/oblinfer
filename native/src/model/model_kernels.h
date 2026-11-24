@@ -84,6 +84,11 @@ struct Widths {
 void verify_select(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
                    std::int64_t* token, std::int32_t* m_out, cudaGraphConditionalHandle handle, cudaStream_t stream);
 
+// The same selection and rows without a switch node, for a verify step that runs eagerly (experts on the
+// second device): the host reads *m_out back and calls the step in that width.
+void verify_width(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
+                  std::int64_t* token, std::int32_t* m_out, cudaStream_t stream);
+
 // The switch condition `handle` = index of *m in `widths`. Captured into the graph that owns `handle`.
 void width_select(const std::int32_t* m, const Widths& widths, cudaGraphConditionalHandle handle,
                   cudaStream_t stream);

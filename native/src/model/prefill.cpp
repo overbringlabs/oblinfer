@@ -45,12 +45,14 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
     : w_(w), abl_(abl), max_chunk_(max_chunk), stream_(stream), gemm_(std::make_unique<pk::Gemm>()) {
   if (max_chunk < 1) throw std::invalid_argument("Prefiller: max_chunk must be positive");
   // EP step 4 splits the decode visit only: the grouped prefill GEMMs take one base pointer per expert tensor
-  // on this device, so a layer whose experts live on the second device has no weights to read here.
+  // on this device, so a layer whose experts live on the second device has no weights to read here. The
+  // Generator then processes such a prompt as one-token decode steps instead (EngineGenerator::prefill_steps).
   for (const Layer& l : w.layers)
     if (l.experts.split != EXPERTS)
       throw std::invalid_argument("Prefiller: layer " + std::to_string(l.idx) +
                                   " keeps its experts on the second device (expert parallel decode only, until the "
-                                  "grouped prefill GEMM takes two bases)");
+                                  "grouped prefill GEMM takes two bases; the Generator prefills those prompts as "
+                                  "decode steps)");
   const int L = WINDOW + max_chunk;
   kpos_rows_ = (L + pk::kAttnKeyTile - 1) / pk::kAttnKeyTile * pk::kAttnKeyTile;
   if (kpos_rows_ / pk::kAttnKeyTile > pk::kAttnMaxTiles)

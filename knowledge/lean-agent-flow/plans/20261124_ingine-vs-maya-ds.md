@@ -313,6 +313,9 @@ that phase instead of after it. Every other arrangement either serialises (PP) o
    unchanged (it already early-exits non-first-occurrence slots, `moe.cu:21-22`), and one new `moe_down` variant that
    emits per-slot BF16 rows for the off-card slots so GPU0's slot-ordered FP32 sum stays bit-identical. Graphs: two
    per token (48 segments each), the eager path kept for validation (`runtime.cpp:195-198`).
+   *Landed 2026-11-24 (`1a5a47b`) as whole layers on GPU1 with an eager step, and DSpark on that eager step (the
+   verify width read back, `run_step_eager`, the acceptance graph unchanged) — Isaak's option A: dual graphs buy
+   launch overhead only, so they are an optimisation after the rate is measured, not a prerequisite for spec.*
 5. **KV-head split of the 8 full visits.** Parameterize `attn_decode`'s KV-head range (`attn.cu:1207`,
    `gridDim.y`) and slice `State`'s `k_full`/`v_full` per head range (`state.cpp:48-49`, `model_data.h:236`,
    `k_full_at`). Good news: full attention is **not** in the bit-lock set (`KERNELS.md:46-49` locks proj,

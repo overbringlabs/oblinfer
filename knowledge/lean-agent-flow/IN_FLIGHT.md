@@ -7,6 +7,6 @@ This file is a whiteboard, not a ledger.
 ```
 ## agent: grok-parent   since: 2026-11-24T01:47Z
 writing: (none)
-next:    (idle — step 4 landed; spec still refused on EP)
-released: step 4 moe_down_rows + hop
+next:    (idle — EP+DSpark eager; no serve CLI for residency yet)
+released: spec on eager EP step
 ```

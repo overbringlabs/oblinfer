@@ -9,6 +9,10 @@ ingine_add_test(NAME model_reuse SOURCES test_reuse.cpp LIBS ingine_model GPU MO
 # expert residency across two devices: the split table, the shards on the second device, the same bytes as a
 # plain load_layer (~16.5 GB of GPU memory across two cards; opt in with INGINE_RESIDENCY_TEST=1)
 ingine_add_test(NAME model_residency SOURCES test_residency.cpp LIBS ingine_model GPU MODEL TIMEOUT 1200)
+# DSpark over the eager two-device step: a greedy speculative generation walks the plain decode's tokens, and
+# the prompt is prefilled one token per decode step (two model loads, ~16.5 GB across both cards;
+# INGINE_RESIDENCY_TEST=1)
+ingine_add_test(NAME model_ep_spec SOURCES test_ep_spec.cpp LIBS ingine_model GPU MODEL TIMEOUT 1800)
 # full-model parity against the Python engine's goldens (tools/goldens_model.py); ~20 GB of GPU memory
 if(TARGET ingine-validate)
   set(_validate ingine-validate --model-dir ${INGINE_TEST_MODEL_DIR} --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)

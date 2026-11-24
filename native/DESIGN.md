@@ -164,9 +164,22 @@ peer access, ordered by one non-timing event pair per visit and never by a host 
 `split == EXPERTS` keep the fused `moe_up`/`moe_down` pair, so the default table copies nothing.
 
 That step spans two devices, and a CUDA graph belongs to one, so an expert split decodes eagerly
-(`Runtime::init` skips capture, `run_step` falls back to `run_step_eager`) and DSpark is refused until dual
-graphs exist; the prefill's grouped expert GEMMs take one base per expert tensor on this device, so `Prefiller`
-refuses a table that moves any layer's experts.
+(`Runtime::init` skips capture, `run_step` falls back to `run_step_eager`). The prefill's grouped expert GEMMs
+take one base per expert tensor on this device, so `Prefiller` refuses a table that moves any layer's experts:
+the Generator then processes such a prompt one token per decode step (`EngineGenerator::prefill_steps`: the same
+kernels as generation, the taps committed to the drafter as they are produced, the last token's logits kept). It
+is exact but slow - one hop per remote visit per token - and a hop of the prefill GEMM is the next step; it
+exists so a prompt loads at all. Image prompts need the chunked prefill (their rows replace embeddings it writes)
+and are refused.
+
+DSpark runs on that eager step. The verify call is the one part of a round that cannot be a graph there (its
+width is a switch node's condition, set inside a graph), so `SpecLoop` reads back the width the drafts'
+confidence picks (`verify_width`: the same device rule as `verify_select`, without the switch), runs
+`run_step_eager` in it after `record_save_verify`, and launches the acceptance graph unchanged (its width switch
+reads the same device `width`). The drafter, its commit/advance graphs and the acceptance never leave this
+device. A round costs one extra host synchronisation and loses the overlap of the next draft with the host's
+emission. With one device, or a table that moves nothing, `ep_` is false and nothing changes: every step is a
+captured graph, the verify call the captured switch, and the prefill chunked.
 
 ### Prefill (`src/model/prefill.{h,cpp}`)
 

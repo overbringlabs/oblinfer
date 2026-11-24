@@ -13,6 +13,11 @@
 // over the verify widths), and so do the commit of the accepted rows and the next draft (Drafter::advance,
 // bound to this loop's device buffers), so a round and the next draft are launched as a whole: one host
 // synchronisation per round, after the acceptance, while the next draft already runs.
+//
+// With experts on the second device the verify step spans two devices and cannot be a graph (Runtime: eager
+// steps), so that one step is taken on the host: the width the draft picks is read back (one extra
+// synchronisation), buffers(m) is stepped eagerly and the acceptance graph runs as before. The drafter and its
+// advance graphs stay on this device, so only the verify step differs.
 #pragma once
 
 #include "kernels/head/head.h"
@@ -33,7 +38,8 @@ namespace ingine::model {
 class SpecLoop {
  public:
   // Captures the verify graph (verify_select -> switch { save_verify + decode(m) }) for `rt` and `drafter`
-  // (same stream; rt with the verify widths). Both must outlive the loop.
+  // (same stream; rt with the verify widths). Both must outlive the loop. With experts on the second device
+  // the verify step runs eagerly instead (no switch graph is captured) and generate() reads its width back.
   SpecLoop(Runtime& rt, Drafter& drafter);
   ~SpecLoop();
   SpecLoop(const SpecLoop&) = delete;
@@ -59,6 +65,7 @@ class SpecLoop {
   Drafter& drafter_;
   Drafter::Draft draft_{};             // the drafter's fixed output buffers
   DeviceBuffer width_;                 // int32: the verify width chosen on the device
+  MappedHostBuffer width_host_;        // int32: that width, read back by the eager verify step
   MappedHostBuffer record_;            // VerifyRecord of the last round
   MappedHostBuffer forced_window_;     // forced replay: int32 [8], the forced tokens after the round's anchor
   GraphExec verify_, accept_;

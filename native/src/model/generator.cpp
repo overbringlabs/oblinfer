@@ -3,7 +3,8 @@
 // stays on the device, the host launches the next step before it reads the current token); with
 // options.spec the speculative loop (SpecLoop) drafts with DSpark and verifies with the width-2/4/8 graphs.
 // A prompt that extends the tokens already in the state only prefills the new suffix; any other prompt
-// starts from an empty state.
+// starts from an empty state. With experts on the second device no step is a graph, so there is no Prefiller
+// (the prompt is processed one token per decode step) and the speculative loop verifies eagerly.
 #include "ingine/generator.h"
 
 #include "core/arena.h"
@@ -60,16 +61,20 @@ class EngineGenerator final : public Generator {
       : options_(options),
         runtime_(std::move(runtime)),
         rt_(*runtime_),
-        prefiller_(rt_.weights(), rt_.ablation(), options.prefill_chunk, rt_.stream()),
         chunk_tokens_(std::size_t(options.prefill_chunk) * sizeof(std::int32_t)),
         logits_(std::size_t(UNPADDED_VOCAB) * sizeof(float)),
         token_(sizeof(std::int32_t)),
         host_token_(sizeof(std::int32_t)) {
     if (options.prefill_chunk < 1) throw std::invalid_argument("prefill_chunk must be positive");
+    // Experts on the second device: the chunked prefill's grouped expert GEMMs take one base pointer per
+    // expert tensor on this device, so such a prompt is processed one token per decode step instead
+    // (prefill_steps), which needs none of the Prefiller's chunk scratch.
+    if (!rt_.expert_parallel())
+      prefiller_ = std::make_unique<Prefiller>(rt_.weights(), rt_.ablation(), options.prefill_chunk, rt_.stream());
     if (options.spec) {
       drafter_ = std::make_unique<Drafter>(options.model_dir, rt_.weights(), options.max_ctx, rt_.stream());
       drafter_->capture();
-      taps_ = DeviceBuffer(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
+      if (prefiller_) taps_ = DeviceBuffer(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
       spec_ = std::make_unique<SpecLoop>(rt_, *drafter_);
     }
     // checkpoint layout: target state | drafter context | last prompt logits
@@ -258,6 +263,9 @@ class EngineGenerator final : public Generator {
   // (images inside the reused prefix are not encoded again), and the Prefiller writes its rows over the
   // embeddings of its tokens; an image may span chunks.
   void prefill(std::span<const std::int32_t> ids, std::span<const PromptImage> images, GenerateStats& stats) {
+    if (!prefiller_ && !images.empty())
+      throw std::invalid_argument("an image prompt needs the chunked prefill, which experts on the second device "
+                                  "do not have: its rows replace embeddings that only the Prefiller writes");
     const std::vector<std::int32_t>& prev = tokens_in_state_;
     const std::size_t n = ids.size();
     const bool drafter_in_step = !drafter_ || drafter_->length() == int(prev.size());  // else a row is missing
@@ -293,6 +301,11 @@ class EngineGenerator final : public Generator {
       stats.reuse = Reuse::None;
     }
     st.length = int(start);  // decode steps advance the state without its host-side length
+    if (!prefiller_) {  // experts on the second device: there is no chunked prefill (see the constructor)
+      prefill_steps(ids, start);
+      stats.reused_tokens = int(start);
+      return;
+    }
     const std::size_t chunk = std::size_t(options_.prefill_chunk);
     struct Encoded {
       const PromptImage* image;
@@ -332,8 +345,8 @@ class EngineGenerator final : public Generator {
                                  cudaMemcpyHostToDevice, stream));
       Tensor taps;
       if (drafter_) taps = rm(taps_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
-      prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
-                     drafter_ ? &taps : nullptr, rows);
+      prefiller_->run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
+                      drafter_ ? &taps : nullptr, rows);
       if (drafter_) {
         drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
         drafter_->commit(taps, int(s));
@@ -343,6 +356,27 @@ class EngineGenerator final : public Generator {
     tokens_in_state_.assign(ids.begin(), ids.end());
     if (start < n) save_checkpoint();
     stats.reused_tokens = int(start);
+  }
+
+  // Prompt processing without a Prefiller, for experts on the second device: every prompt token is the width-1
+  // decode step it is during generation (the same kernels, the same hops), its taps are committed to the
+  // drafter as they are produced, and the last token's logits become logits_. One hop per remote visit per
+  // token, so this is slow: hopping the prefill's grouped expert GEMM is the next step, and this path exists
+  // so that a prompt loads at all and a speculative generation can start.
+  void prefill_steps(std::span<const std::int32_t> ids, std::size_t start) {
+    const cudaStream_t stream = rt_.stream();
+    if (drafter_) drafter_->note_tokens(ids.subspan(start));  // the prompt's tokens join the shortlist
+    for (std::size_t i = start; i < ids.size(); ++i) {
+      const std::int32_t token = ids[i];
+      rt_.set_inputs(std::span<const std::int32_t>(&token, 1), int(i));
+      const float* logits = rt_.run_step_eager(1);
+      if (drafter_) drafter_->commit(rt_.buffers(1).taps, int(i));
+      if (i + 1 == ids.size())
+        CUDA_CHECK(cudaMemcpyAsync(logits_.p, logits, logits_.bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+    rt_.state().length = int(ids.size());
+    tokens_in_state_.assign(ids.begin(), ids.end());
+    if (start < ids.size()) save_checkpoint();
   }
 
   // Conversation parking. A parked conversation is a packed copy of a prompt checkpoint (target state |
@@ -508,7 +542,7 @@ class EngineGenerator final : public Generator {
   RuntimeOptions options_;
   std::unique_ptr<Runtime> runtime_;
   Runtime& rt_;
-  Prefiller prefiller_;
+  std::unique_ptr<Prefiller> prefiller_;  // null with experts on the second device (prefill_steps instead)
   std::unique_ptr<Drafter> drafter_;
   std::unique_ptr<SpecLoop> spec_;
   std::unique_ptr<VisionEncoder> vision_;  // image input (RuntimeOptions::vision)

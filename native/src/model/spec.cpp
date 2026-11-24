@@ -37,8 +37,8 @@ Widths verify_widths(const Runtime& rt) {
 }  // namespace
 
 SpecLoop::SpecLoop(Runtime& rt, Drafter& drafter)
-    : rt_(rt), drafter_(drafter), width_(sizeof(std::int32_t)), record_(sizeof(VerifyRecord)),
-      forced_window_(kd::BLOCK * sizeof(std::int32_t)) {
+    : rt_(rt), drafter_(drafter), width_(sizeof(std::int32_t)), width_host_(sizeof(std::int32_t)),
+      record_(sizeof(VerifyRecord)), forced_window_(kd::BLOCK * sizeof(std::int32_t)) {
   if (drafter.stream() != rt.stream()) throw std::invalid_argument("SpecLoop: drafter and runtime streams differ");
   const Widths widths = verify_widths(rt);
   // the draft outputs live at fixed addresses: one draft names them (its scratch rows are reset)
@@ -46,15 +46,16 @@ SpecLoop::SpecLoop(Runtime& rt, Drafter& drafter)
   drafter.reset();
   width_.fill(0);
   const float threshold = rt.options().spec_threshold;
-  verify_ = rt.capture_switch(
-      [&](cudaStream_t s, cudaGraphConditionalHandle h) {
-        verify_select(draft_.conf, draft_.tokens, threshold, widths, rt_.tokens(), static_cast<std::int32_t*>(width_.p),
-                      h, s);
-      },
-      [&](cudaStream_t s, int m) {
-        rt_.record_save_verify(m, s);
-        rt_.record_step(m, s);
-      });
+  if (!rt_.expert_parallel())  // else the verify step itself is eager: generate() reads the width back
+    verify_ = rt.capture_switch(
+        [&](cudaStream_t s, cudaGraphConditionalHandle h) {
+          verify_select(draft_.conf, draft_.tokens, threshold, widths, rt_.tokens(),
+                        static_cast<std::int32_t*>(width_.p), h, s);
+        },
+        [&](cudaStream_t s, int m) {
+          rt_.record_save_verify(m, s);
+          rt_.record_step(m, s);
+        });
   // where a round's outcome lives on the device: after the acceptance the drafter commits the accepted
   // rows and drafts for the next anchor from these (one graph, no host round trip in between)
   {
@@ -127,6 +128,7 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
   const bool greedy = sampling.temperature <= 0.f || forced;  // forced: acceptance by equality
   const int V = drafter_.vocab();
   const Drafter::AcceptScratch& scratch = drafter_.accept_scratch();
+  const Widths widths = verify_widths(rt_);  // the eager verify step's widths
   auto* record_dev = static_cast<VerifyRecord*>(record_.device_ptr());
   const auto* record = static_cast<const VerifyRecord*>(record_.data());
   prepare_accept(sampling);
@@ -190,7 +192,20 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
       record_event(0);
     }
     if (!greedy) kh::uniform(kd::GAMMA, rng, scratch.uniforms, stream);
-    verify_.launch(stream);
+    if (rt_.expert_parallel()) {
+      // the verify step spans two devices, so it is no graph (Runtime: eager steps): the width the draft picks
+      // on the device is read back, and that width runs as a plain step before the acceptance graph
+      verify_width(draft_.conf, draft_.tokens, rt_.options().spec_threshold, widths,
+                   rt_.tokens(), static_cast<std::int32_t*>(width_.p), stream);
+      CUDA_CHECK(cudaMemcpyAsync(width_host_.data(), width_.p, sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaEventRecord(done_, stream));
+      CUDA_CHECK(cudaEventSynchronize(done_));
+      const int m = *static_cast<const std::int32_t*>(width_host_.data());
+      rt_.record_save_verify(m, stream);
+      rt_.run_step_eager(m);
+    } else {
+      verify_.launch(stream);
+    }
     accept_.launch(stream);
     if (!greedy) kh::sample_from_probs(scratch.resid, 1, V, V, rng, &record_dev->next, stream);
     CUDA_CHECK(cudaEventRecord(done_, stream));

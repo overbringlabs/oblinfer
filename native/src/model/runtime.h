@@ -13,7 +13,8 @@
 // the device, so the host launches step N+1 before it reads token N; a step launched past the end of the
 // generation (stop token, cancel) is undone. Device-selected verify widths (capture_switch, record_*): the
 // speculative loop picks the verify width on the device, so the verify call is launched before the draft
-// it depends on has finished.
+// it depends on has finished. With experts on the second device there are no graphs at all: every step is
+// eager (run_step_eager), and the speculative loop reads the width back before its verify step.
 #pragma once
 
 #include "model/model_data.h"
@@ -129,6 +130,9 @@ class Runtime {
   const RuntimeOptions& options() const { return options_; }
   // The second device opened for options.second_gpu (expert parallelism), or null with one device.
   const DeviceContext* second_device() const { return second_device_.get(); }
+  // Some layer keeps its experts on the second device: its visits hop, so a step spans two devices and runs
+  // eagerly (no graph; run_step falls back to run_step_eager).
+  bool expert_parallel() const { return ep_; }
   cudaStream_t stream() const { return stream_; }
   const Weights& weights() const { return weights_; }
   const Ablation& ablation() const { return ablation_; }
@@ -143,7 +147,8 @@ class Runtime {
 
   // Stream-ordered step inputs: buffers(tokens.size()).token = tokens, pos = position (a kernel; no copy).
   void set_inputs(std::span<const std::int32_t> tokens, int position);
-  // Replays width m's graph; returns buffers(m).logits (device). Stream-ordered, no host sync.
+  // Replays width m's graph; returns buffers(m).logits (device). Stream-ordered, no host sync. With experts on
+  // the second device there is no graph: the step runs eagerly (run_step_eager).
   const float* run_step(int m);
   // set_inputs + run_step for one token (engine._decode_logits).
   const float* decode_logits(std::int32_t token, int position);

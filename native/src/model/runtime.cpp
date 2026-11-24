@@ -100,8 +100,9 @@ void Runtime::init() {
   // EP step 4: a layer whose experts all live on the second device is decoded there (Decoder::expert_hop) —
   // one hop per visit of such a layer, no peer access, per-slot BF16 rows summed here. A split inside a layer
   // still needs per-expert base pointers, which the loader refuses (validate_residency). A step that spans two
-  // devices cannot be captured as one CUDA graph (a graph belongs to one device), so it runs eager: dual
-  // graphs are deferred, and with them the speculative loop, whose verify calls are captured switches.
+  // devices cannot be captured as one CUDA graph (a graph belongs to one device), so it runs eager: run_step
+  // falls back to run_step_eager, and the speculative loop verifies eagerly as well (SpecLoop reads the verify
+  // width back and runs the step instead of the captured switch; dual graphs would buy launch overhead only).
   ep_ = false;
   for (const Layer& l : weights_.layers) {
     if (l.experts.split == EXPERTS) continue;
@@ -113,11 +114,6 @@ void Runtime::init() {
   }
   if (ep_ && second_device_ == nullptr) {
     throw std::invalid_argument("expert residency: an expert shard needs the second device (options.second_gpu)");
-  }
-  if (ep_ && options.spec) {
-    throw std::invalid_argument(
-        "expert residency: experts on the second device decode eagerly (a two-device step is not one CUDA graph), "
-        "so DSpark's captured verify switches do not exist yet; run without spec");
   }
   state_ = make_state(options.max_ctx, options.kv_fp8);
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true, second_device_.get());

@@ -190,17 +190,31 @@ __device__ __forceinline__ unsigned width_index(const Widths& widths, int m) {
   return idx;  // widths.n (no body) if m is not a width
 }
 
+// engine._generate_spec's verify width: the smallest width holding the anchor and every leading draft whose
+// confidence is above the threshold (the widest when none holds that many).
+__device__ __forceinline__ int verify_width_of(const float* __restrict__ conf, float threshold, const Widths& widths) {
+  int lead = 0;
+  while (lead < 7 && conf[lead] > threshold) ++lead;
+  int m = widths.w[widths.n - 1];
+  for (int k = widths.n - 1; k >= 0; --k)
+    if (widths.w[k] >= lead + 1) m = widths.w[k];
+  return m;
+}
+
+__global__ void verify_width_kernel(const float* __restrict__ conf, const int* __restrict__ drafts, float threshold,
+                                    Widths widths, long long* __restrict__ token, int* __restrict__ m_out) {
+  const int i = threadIdx.x;
+  if (i < 7) token[1 + i] = drafts[i];
+  if (i == 0) *m_out = verify_width_of(conf, threshold, widths);
+}
+
 __global__ void verify_select_kernel(const float* __restrict__ conf, const int* __restrict__ drafts, float threshold,
                                      Widths widths, long long* __restrict__ token, int* __restrict__ m_out,
                                      cudaGraphConditionalHandle handle) {
   const int i = threadIdx.x;
   if (i < 7) token[1 + i] = drafts[i];
   if (i == 0) {
-    int lead = 0;
-    while (lead < 7 && conf[lead] > threshold) ++lead;
-    int m = widths.w[widths.n - 1];
-    for (int k = widths.n - 1; k >= 0; --k)
-      if (widths.w[k] >= lead + 1) m = widths.w[k];
+    const int m = verify_width_of(conf, threshold, widths);
     *m_out = m;
     cudaGraphSetConditional(handle, width_index(widths, m));
   }
@@ -285,6 +299,14 @@ void verify_rollback(const StatePtrs& st, const VerifyBackup& bk, const float* c
   const Hist h{{hist[0], hist[1], hist[2], hist[3]}};
   verify_rollback_kernel<<<blocks_for(items), kThreads, 0, stream>>>(
       checked(st), bk, h, reinterpret_cast<const long long*>(pos_dev), pos_host, accepted_dev, commit_host, m);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void verify_width(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
+                  std::int64_t* token, std::int32_t* m_out, cudaStream_t stream) {
+  if (widths.n < 1 || widths.n > 3) throw std::invalid_argument("verify_width: 1 to 3 widths");
+  verify_width_kernel<<<1, 32, 0, stream>>>(conf, drafts, threshold, widths, reinterpret_cast<long long*>(token),
+                                            m_out);
   CUDA_CHECK(cudaGetLastError());
 }
 
