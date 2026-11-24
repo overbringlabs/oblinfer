@@ -11,15 +11,15 @@ get here".
 
 ## In flight
 
-- (none) Waiting on Isaak: go on EP-then-KV-head-split, or hold.
+- (none) Waiting on Isaak: go on EP-then-KV-head-split (DSpark on, NVFP4 kept).
 
 ## Last completed
 
-- 2026-11-24: DeepSeek report `plans/20261124_ingine-vs-maya-ds.md`. Modelled: hybrid 111, EP 91, PP 61. Parent agrees. PP withdrawn.
+- 2026-11-24: single-GPU on supra is a wontdo. DSpark required. NVFP4 stays. `nvidia-smi` on supra: 5070 Ti + 5060 Ti, 16 GB each.
 
 ## Needs a decision
 
-- Implement EP then KV-head split (recommended), or wait.
+- Implement EP then KV-head split, or hold.
 
 ## Needs a decision
 
