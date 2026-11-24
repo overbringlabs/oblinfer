@@ -223,4 +223,14 @@ void ArgParser::fail(const std::string& message) const {
   std::exit(2);
 }
 
+bool parse_layer_range(const std::string& text, int layers, int* lo, int* hi) {
+  const std::size_t dash = text.find('-');
+  if (dash == std::string::npos) return false;
+  int a = 0, b = 0;
+  if (!parse_int(text.substr(0, dash), &a) || !parse_int(text.substr(dash + 1), &b)) return false;
+  if (a < 0 || b < a || b >= layers) return false;
+  *lo = a, *hi = b;
+  return true;
+}
+
 }  // namespace ingine::serve

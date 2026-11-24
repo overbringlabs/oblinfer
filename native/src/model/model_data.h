@@ -59,6 +59,11 @@ inline constexpr int NUM_VISITS = 48;
 inline constexpr int NUM_FULL_VISITS = 8;
 inline constexpr int NUM_SLIDING_VISITS = NUM_VISITS - NUM_FULL_VISITS;
 
+// --kv-split: the last KV_SPLIT_SECOND_HEADS of the 8 full-attention KV heads live on the second device,
+// the rest on the primary one (make_state with heads_second = 0 is the one-device layout). Sliding
+// attention always stays on the primary device.
+inline constexpr int KV_SPLIT_SECOND_HEADS = 3;
+
 // weights.visit_plan(): layers 0-5, layers 6-17 three times, layers 18-23
 inline constexpr std::array<Visit, NUM_VISITS> VISITS = [] {
   std::array<Visit, NUM_VISITS> plan{};
@@ -273,9 +278,14 @@ struct Ablation {
 struct State {
   int max_ctx = 0;
   bool kv_fp8 = false;
+  int kv_heads = KV_HEADS;     // full-attention KV heads whose caches live on this device
+  int kv_heads_hi = 0;         // heads whose caches live on the second device (--kv-split; 0: none)
   Tensor k_ring, v_ring;      // bf16 [40, 1024, 8, 128] (sliding visits, RING_INDEX)
   Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
-  Tensor k_full, v_full;      // bf16 or fp8 e4m3 [8, max_ctx, 8, 128] (full visits, FULL_INDEX)
+  Tensor k_full, v_full;      // bf16 or fp8 e4m3 [8, max_ctx, kv_heads, 128] (full visits, FULL_INDEX)
+  // the second device's shard of the full caches: heads [kv_heads, KV_HEADS), allocated on its device
+  Tensor k_full_hi, v_full_hi;  // bf16 or fp8 e4m3 [8, max_ctx, kv_heads_hi, 128]
+  SecondStorage storage_hi;
   Tensor conv_k, conv_v;      // fp32 [48, 3, 1024] previous 3 key/value conv inputs (oldest first)
   Tensor conv_attn, conv_mlp; // fp32 [48, 3, H]
   int length = 0;             // tokens in the context (host copy; decode steps do not advance it)
@@ -288,6 +298,8 @@ struct State {
   std::int64_t* ring_pos_at(int ring) const;
   Tensor k_full_at(int full) const;
   Tensor v_full_at(int full) const;
+  Tensor k_full_hi_at(int full) const;
+  Tensor v_full_hi_at(int full) const;
   float* conv_k_at(int v) const { return ptr<float>(conv_k) + std::size_t(v) * 3 * KV_DIM; }
   float* conv_v_at(int v) const { return ptr<float>(conv_v) + std::size_t(v) * 3 * KV_DIM; }
   float* conv_attn_at(int v) const { return ptr<float>(conv_attn) + std::size_t(v) * 3 * HIDDEN; }

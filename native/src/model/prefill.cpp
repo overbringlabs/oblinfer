@@ -115,6 +115,9 @@ const float* const* Prefiller::block_table(const std::vector<const float*>& bloc
 void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
                     std::span<const EmbedRows> rows) {
   if (T < 1 || T > max_chunk_) throw std::invalid_argument("Prefiller::run: T outside 1..max_chunk");
+  // The chunked attention reads and writes one device's full caches; a KV-head split (decode-step prompts
+  // only) keeps part of them on the second device.
+  if (st.kv_heads_hi != 0) throw std::logic_error("Prefiller::run: the KV-head split has no chunked prefill");
   if (pos0 < 0 || pos0 + T > st.max_ctx)
     throw std::invalid_argument("context " + std::to_string(pos0 + T) + " exceeds max_ctx " +
                                 std::to_string(st.max_ctx));

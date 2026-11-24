@@ -7,6 +7,7 @@ This file is a whiteboard, not a ledger.
 ```
 ## agent: grok-parent   since: 2026-11-24T01:47Z
 writing: (none)
-next:    (idle — --remote-experts landed; supra run not started)
-released: spec on eager EP step
+next:    (idle — kv-split in tree; supra rerun pending)
+released: KV-head 5/3 + --remote-layers
 ```
+

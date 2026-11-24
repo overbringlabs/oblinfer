@@ -47,6 +47,21 @@ DeviceBuffer upload_ints(const std::vector<int>& v) {
 // at a time.
 constexpr int kHopMaxM = 8;
 
+// KV-head split staging (bytes), from the fixed shapes: proj slices mirrored into a full-width row, the conv
+// state of the shard's heads, pos, and the shard's query-head output.
+constexpr int kVkHeads = KV_SPLIT_SECOND_HEADS;
+constexpr int kVkQ = kVkHeads * 3;  // query heads of those KV heads
+constexpr std::size_t kVkProj = std::size_t(kHopMaxM) * PROJ_ROWS_FULL * 4;
+constexpr std::size_t kVkConv = 2 * std::size_t(CONV_K - 1) * kVkHeads * HEAD_DIM * 4;
+constexpr std::size_t kVkOut = std::size_t(kHopMaxM) * kVkQ * HEAD_DIM * 2;
+constexpr std::size_t kVkIn = kVkProj + kVkConv + sizeof(std::int64_t);
+constexpr std::size_t kVkOutHost = kVkOut + kVkConv;
+// q_scale (all 24 heads, absolute indexing), r_scale, rel_proj (distance-addressed), and the compact
+// static-conv rows of the shard's heads, for every full layer
+constexpr std::size_t kVkLayerWeights = std::size_t(HEADS) * HEAD_DIM * 4 + std::size_t(HEADS) * D_REL * 4 +
+                                       std::size_t(D_REL) * REL_EXTENT * 4 +
+                                       2 * std::size_t(CONV_K) * kVkHeads * HEAD_DIM * 4;
+
 // Makes `device` current for the scope, restoring the caller's on exit (the hop's device-1 copies and
 // launches). Never used inside stream capture: a split visit's step is not capturable.
 struct BindDevice {
@@ -70,6 +85,53 @@ Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, con
   segments_[0] = upload_ints(proj_layout(false, true));
   segments_[1] = upload_ints(proj_layout(false, false));
   full_segments_ = upload_ints(proj_layout(true, false));
+  kv_split_ = st_.kv_heads_hi > 0 && second_ != nullptr;
+  if (kv_split_) {
+    int nfull = 0;
+    for (const Layer& l : w.layers) nfull += l.full ? 1 : 0;
+    kv_.stream = second_->stream;
+    kv_.ws_bytes = attn::workspace_bytes(8);
+    kv_.in = MappedHostBuffer(kVkIn);
+    kv_.out_host = MappedHostBuffer(kVkOutHost);
+    kv_.w_host = MappedHostBuffer(std::size_t(nfull) * kVkLayerWeights);
+    CUDA_CHECK(cudaEventCreateWithFlags(&kv_.ready, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&kv_.consumed, cudaEventDisableTiming));
+    {
+      const BindDevice bind(second_->device);
+      kv_hi_.device = second_->device;
+      kv_hi_.buffers.emplace_back(kVkProj);
+      kv_hi_.buffers.emplace_back(kVkConv);
+      kv_hi_.buffers.emplace_back(sizeof(std::int64_t));
+      kv_hi_.buffers.emplace_back(kVkOut);
+      kv_hi_.buffers.emplace_back(kv_.ws_bytes);
+      kv_hi_.buffers.emplace_back(std::size_t(nfull) * kVkLayerWeights);
+      CUDA_CHECK(cudaEventCreateWithFlags(&kv_.loaded, cudaEventDisableTiming));
+      CUDA_CHECK(cudaEventCreateWithFlags(&kv_.back, cudaEventDisableTiming));
+      CUDA_CHECK(cudaMemset(kv_hi_.buffers[4].p, 0, kv_.ws_bytes));  // counters: the kernel resets its own
+    }
+    kv_.proj = kv_hi_.buffers[0].p;
+    kv_.conv = kv_hi_.buffers[1].p;
+    kv_.pos = kv_hi_.buffers[2].p;
+    kv_.out = kv_hi_.buffers[3].p;
+    kv_.ws = kv_hi_.buffers[4].p;
+    kv_.weights = kv_hi_.buffers[5].p;
+    int o = 0;
+    for (const Layer& l : w.layers) {
+      if (!l.full) continue;
+      char* base = static_cast<char*>(kv_.weights) + std::size_t(o++) * kVkLayerWeights;
+      auto take = [&](std::size_t bytes) {
+        const float* p = reinterpret_cast<const float*>(base);
+        base += bytes;
+        return p;
+      };
+      const int l0 = int(l.idx);
+      kv_.layer[l0].q_scale = take(std::size_t(HEADS) * HEAD_DIM * 4);
+      kv_.layer[l0].r_scale = take(std::size_t(HEADS) * D_REL * 4);
+      kv_.layer[l0].rel_proj = take(std::size_t(D_REL) * REL_EXTENT * 4);
+      kv_.layer[l0].k_w = take(std::size_t(CONV_K) * kVkHeads * HEAD_DIM * 4);
+      kv_.layer[l0].v_w = take(std::size_t(CONV_K) * kVkHeads * HEAD_DIM * 4);
+    }
+  }
   if (second_ == nullptr) return;
   // Nothing is allocated unless some layer really keeps its experts there (`--second-gpu` alone keeps today's
   // one-device step, and then not even the staging below exists).
@@ -96,11 +158,16 @@ Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, con
 Decoder::~Decoder() {
   if (second_ == nullptr) return;
   {
-    const BindDevice bind(second_->device);  // the second device's event and storage
+    const BindDevice bind(second_->device);  // the second device's events and storage
     if (hop_back_) (void)cudaEventDestroy(hop_back_);
+    if (kv_.loaded) (void)cudaEventDestroy(kv_.loaded);
+    if (kv_.back) (void)cudaEventDestroy(kv_.back);
     hop_hi_.release();
+    kv_hi_.release();
   }
   if (hop_ready_) (void)cudaEventDestroy(hop_ready_);
+  if (kv_.ready) (void)cudaEventDestroy(kv_.ready);
+  if (kv_.consumed) (void)cudaEventDestroy(kv_.consumed);
 }
 
 const std::int64_t* Decoder::block_table(const std::vector<const float*>& blocks) {
@@ -239,6 +306,11 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.kpos = nullptr;
       a.window = 0;
       a.log_scaling = true;
+      a.head_begin = 0;
+      a.head_count = st.kv_heads;  // 8, or 5 with --kv-split
+      a.cache_heads = st.kv_heads;
+      a.out_head0 = 0;
+      a.out_stride = HEADS * HEAD_DIM;
     } else {
       const int ri = RING_INDEX[v];
       a.k_conv = f32p(layer.k_conv);
@@ -251,7 +323,8 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.window = WINDOW;
       a.log_scaling = false;
     }
-    attn::attn_decode(a, stream);
+    if (layer.full && kv_split_) full_attn_split(layer, b, m, v, a, stream);
+    else attn::attn_decode(a, stream);
     dense::proj_conv(bf16m(b.attn_out), m, matrix(layer.wo), f32p(layer.attn_conv), st.conv_attn_at(v), f32m(b.y),
                      history ? f32m(b.hist_attn) + std::size_t(v) * m * H : nullptr, pdl, stream);
     // ---- MLP read: this visit's attention write, ablated, on top of hid (or a fresh block)
@@ -339,6 +412,143 @@ void Decoder::expert_hop(const Experts& ex, Buffers& b, int m, const float* conv
   CUDA_CHECK(cudaMemcpyAsync(hop_rows0_.p, hop_rows_.data(), rb, cudaMemcpyHostToDevice, stream));
   moe::moe_sum(static_cast<const __nv_bfloat16*>(hop_rows0_.p), m, f32p(b.wts), conv_w, conv_state, f32m(b.y2),
                conv_hist, stream);
+}
+
+void Decoder::full_attn_split(const Layer& layer, Buffers& b, int m, int v, attn::DecodeArgs a0,
+                              cudaStream_t stream) {
+  // One full-attention visit over both devices (plans/20261124_ingine-vs-maya-ds.md §7.5): this device runs
+  // KV heads [0, here) against its cache shard, the second device runs [here, 8) against its own. Each launch
+  // is the unchanged kernel: per KV head it owns Q/K/V completely, so merging is just the disjoint
+  // query-head output rows. Proj rows for the shard's heads, its conv state and pos go over pinned staging;
+  // 9 x 128 fp32 (m = 1) comes back. GPU0's attention runs while the second device's does.
+  if (!kv_split_) throw std::logic_error("full_attn_split: no KV-head split");
+  const int here = st_.kv_heads, there = st_.kv_heads_hi;
+  const int q_begin = here * 3, q_count = there * 3;  // 3 query heads per KV head
+  const int R = PROJ_ROWS_FULL;
+  const int CC = there * HEAD_DIM;
+  const int K = CONV_K - 1;
+  const std::size_t proj_elems = std::size_t(kHopMaxM) * R;
+  const float* proj = a0.proj;
+  float* in = static_cast<float*>(kv_.in.data());
+  __nv_bfloat16* out_host = static_cast<__nv_bfloat16*>(kv_.out_host.data());
+  float* out_conv = reinterpret_cast<float*>(static_cast<char*>(kv_.out_host.data()) + kVkOut);
+  float* conv = in + proj_elems;
+  std::int64_t* pos_host = reinterpret_cast<std::int64_t*>(conv + 2 * std::size_t(K) * CC);
+
+  struct Slice {
+    int col, len;  // proj columns [col, col + len) of this visit's heads, contiguous within a row
+  };
+  const Slice slices[] = {{SEG_BEGIN[SEG_Q] + q_begin * HEAD_DIM, q_count * HEAD_DIM},
+                          {SEG_BEGIN[SEG_GATE] + q_begin * HEAD_DIM, q_count * HEAD_DIM},
+                          {SEG_BEGIN[SEG_REL] + q_begin * D_REL, q_count * D_REL},
+                          {SEG_BEGIN[SEG_SINK] + q_begin, q_count},
+                          {SEG_BEGIN[SEG_K] + here * HEAD_DIM, there * HEAD_DIM},
+                          {SEG_BEGIN[SEG_V] + here * HEAD_DIM, there * HEAD_DIM},
+                          {SEG_BEGIN[SEG_K_DYN] + here * CONV_K, there * CONV_K},
+                          {SEG_BEGIN[SEG_V_DYN] + here * CONV_K, there * CONV_K}};
+  // The packet mirrors a proj row, so the second device can address its slices exactly as it would the whole
+  // row. Its previous reader must be done before it is rewritten.
+  CUDA_CHECK(cudaStreamWaitEvent(stream, kv_.loaded, 0));
+  for (const Slice& s : slices)
+    CUDA_CHECK(cudaMemcpy2DAsync(in + s.col, std::size_t(R) * 4, proj + s.col, std::size_t(R) * 4,
+                                 std::size_t(s.len) * 4, m, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpy2DAsync(conv, std::size_t(CC) * 4, st_.conv_k_at(v) + here * HEAD_DIM,
+                               std::size_t(KV_DIM) * 4, std::size_t(CC) * 4, K, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpy2DAsync(conv + std::size_t(K) * CC, std::size_t(CC) * 4,
+                               st_.conv_v_at(v) + here * HEAD_DIM, std::size_t(KV_DIM) * 4, std::size_t(CC) * 4, K,
+                               cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(pos_host, a0.pos, sizeof(std::int64_t), cudaMemcpyDeviceToHost, stream));
+  if (!kv_.weights_ready) {  // immutable per-layer slices, once: q/r scales, rel_proj, static conv rows
+    char* w = static_cast<char*>(kv_.w_host.data());
+    const std::size_t qb = std::size_t(HEADS) * HEAD_DIM * 4, rb = std::size_t(HEADS) * D_REL * 4,
+                      pb = std::size_t(D_REL) * REL_EXTENT * 4, kb = std::size_t(CONV_K) * CC * 4;
+    int o = 0;
+    for (const Layer& l : w_.layers) {
+      if (!l.full) continue;
+      char* base = w + std::size_t(o++) * kVkLayerWeights;
+      CUDA_CHECK(cudaMemcpyAsync(base, f32p(l.q_scale), qb, cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(base + qb, f32p(l.r_scale), rb, cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(base + qb + rb, f32p(l.rel_proj), pb, cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpy2DAsync(base + qb + rb + pb, std::size_t(CC) * 4,
+                                   f32p(l.k_static) + here * HEAD_DIM, std::size_t(KV_DIM) * 4, std::size_t(CC) * 4,
+                                   CONV_K, cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpy2DAsync(base + qb + rb + pb + kb, std::size_t(CC) * 4,
+                                   f32p(l.v_static) + here * HEAD_DIM, std::size_t(KV_DIM) * 4, std::size_t(CC) * 4,
+                                   CONV_K, cudaMemcpyDeviceToHost, stream));
+    }
+  }
+  CUDA_CHECK(cudaEventRecord(kv_.ready, stream));
+
+  // this device's heads, concurrently with the second device's
+  a0.head_begin = 0;
+  a0.head_count = here;
+  a0.cache_heads = here;
+  a0.out_head0 = 0;
+  a0.out_stride = HEADS * HEAD_DIM;
+  attn::attn_decode(a0, stream);
+
+  {
+    const BindDevice bind(second_->device);
+    CUDA_CHECK(cudaStreamWaitEvent(kv_.stream, kv_.ready, 0));
+    CUDA_CHECK(cudaMemcpyAsync(kv_.proj, in, std::size_t(m) * R * 4, cudaMemcpyHostToDevice, kv_.stream));
+    CUDA_CHECK(cudaMemcpyAsync(kv_.conv, conv, 2 * std::size_t(K) * CC * 4, cudaMemcpyHostToDevice, kv_.stream));
+    CUDA_CHECK(cudaMemcpyAsync(kv_.pos, pos_host, sizeof(std::int64_t), cudaMemcpyHostToDevice, kv_.stream));
+    if (!kv_.weights_ready) {
+      const std::size_t nfull = std::size_t(std::count_if(w_.layers.begin(), w_.layers.end(),
+                                                           [](const Layer& l) { return l.full; }));
+      CUDA_CHECK(cudaMemcpyAsync(kv_.weights, kv_.w_host.data(), nfull * kVkLayerWeights, cudaMemcpyHostToDevice,
+                                 kv_.stream));
+      kv_.weights_ready = true;  // ordered before every later kernel on this stream
+    }
+    CUDA_CHECK(cudaEventRecord(kv_.loaded, kv_.stream));
+
+    const auto& wl = kv_.layer[layer.idx];
+    attn::DecodeArgs a1;
+    a1.proj = static_cast<const float*>(kv_.proj);
+    a1.M = m;
+    a1.q_scale = wl.q_scale;
+    a1.r_scale = wl.r_scale;
+    a1.rel_proj = wl.rel_proj;
+    a1.k_conv = wl.k_w;
+    a1.v_conv = wl.v_w;
+    a1.conv_k_state = static_cast<float*>(kv_.conv);
+    a1.conv_v_state = static_cast<float*>(kv_.conv) + std::size_t(K) * CC;
+    a1.k_cache = st_.k_full_hi_at(FULL_INDEX[v]).data;
+    a1.v_cache = st_.v_full_hi_at(FULL_INDEX[v]).data;
+    a1.cache_fp8 = st_.kv_fp8;
+    a1.cache_rows = st_.max_ctx;
+    a1.kpos = nullptr;
+    a1.pos = static_cast<const std::int64_t*>(kv_.pos);
+    a1.window = 0;
+    a1.log_scaling = true;
+    a1.workspace = kv_.ws;
+    a1.workspace_size = kv_.ws_bytes;
+    a1.out = static_cast<__nv_bfloat16*>(kv_.out);
+    a1.head_begin = here;
+    a1.head_count = there;
+    a1.cache_heads = there;
+    a1.out_head0 = 0;
+    a1.out_stride = q_count * HEAD_DIM;
+    attn::attn_decode(a1, kv_.stream);
+
+    CUDA_CHECK(cudaStreamWaitEvent(kv_.stream, kv_.consumed, 0));  // this device is done with the last result
+    CUDA_CHECK(cudaMemcpy2DAsync(out_host, std::size_t(q_count) * HEAD_DIM * 2, kv_.out,
+                                 std::size_t(q_count) * HEAD_DIM * 2, std::size_t(q_count) * HEAD_DIM * 2, m,
+                                 cudaMemcpyDeviceToHost, kv_.stream));
+    CUDA_CHECK(cudaMemcpyAsync(out_conv, kv_.conv, 2 * std::size_t(K) * CC * 4, cudaMemcpyDeviceToHost,
+                               kv_.stream));
+    CUDA_CHECK(cudaEventRecord(kv_.back, kv_.stream));
+  }
+  CUDA_CHECK(cudaStreamWaitEvent(stream, kv_.back, 0));
+  CUDA_CHECK(cudaMemcpy2DAsync(bf16m(b.attn_out) + q_begin * HEAD_DIM, std::size_t(HEADS) * HEAD_DIM * 2, out_host,
+                               std::size_t(q_count) * HEAD_DIM * 2, std::size_t(q_count) * HEAD_DIM * 2, m,
+                               cudaMemcpyHostToDevice, stream));
+  CUDA_CHECK(cudaMemcpy2DAsync(st_.conv_k_at(v) + here * HEAD_DIM, std::size_t(KV_DIM) * 4, out_conv,
+                               std::size_t(CC) * 4, std::size_t(CC) * 4, K, cudaMemcpyHostToDevice, stream));
+  CUDA_CHECK(cudaMemcpy2DAsync(st_.conv_v_at(v) + here * HEAD_DIM, std::size_t(KV_DIM) * 4,
+                               out_conv + std::size_t(K) * CC, std::size_t(CC) * 4, std::size_t(CC) * 4, K,
+                               cudaMemcpyHostToDevice, stream));
+  CUDA_CHECK(cudaEventRecord(kv_.consumed, stream));
 }
 
 }  // namespace ingine::model

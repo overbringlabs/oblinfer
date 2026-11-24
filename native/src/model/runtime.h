@@ -22,6 +22,7 @@
 
 #include "core/device.h"
 #include "core/host_memory.h"
+#include "kernels/attn/attn.h"
 
 #include "ingine/generator.h"
 
@@ -48,7 +49,9 @@ Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cud
 Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
                  std::vector<DeviceBuffer>& storage);
 Ablation load_ablation(const std::filesystem::path& path);  // empty path: Ablation.none()
-State make_state(int max_ctx, bool kv_fp8);
+// `second`/`heads_second`: the KV-head split (options.kv_split), which keeps heads_second of the 8
+// full-attention KV heads' caches on the second device; no second device or 0: the one-device layout.
+State make_state(int max_ctx, bool kv_fp8, const DeviceContext* second = nullptr, int heads_second = 0);
 Buffers make_buffers(int m);
 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).
@@ -79,6 +82,11 @@ class Decoder {
   // here. Enqueues on `stream` and the second device's stream; no host wait.
   void expert_hop(const Experts& ex, Buffers& b, int m, const float* conv_w, float* conv_state, float* conv_hist,
                   cudaStream_t stream);
+  // KV-head split (options.kv_split): one full-attention visit. GPU0 runs heads [0, kv_heads), the second
+  // device runs [kv_heads, 8) against its own cache shard; the proj slices, conv state and pos hop out
+  // through pinned staging and the second device's query-head output rows hop back. `a0` is the GPU0 launch.
+  void full_attn_split(const Layer& layer, Buffers& b, int m, int v, kernels::attn::DecodeArgs a0,
+                       cudaStream_t stream);
 
   const Weights& w_;
   const Ablation& abl_;
@@ -90,12 +98,39 @@ class Decoder {
   DeviceBuffer full_segments_;
   // expert hop (only with a second device; nothing here is allocated or copied without one)
   const DeviceContext* second_ = nullptr;
+  bool kv_split_ = false;                  // st.kv_heads_hi > 0: full visits run on both devices
   cudaStream_t hop_stream_ = nullptr;      // the second device's compute stream
   cudaEvent_t hop_ready_ = nullptr;        // recorded on `stream` (device 0), waited on hop_stream_
   cudaEvent_t hop_back_ = nullptr;         // recorded on hop_stream_ (device 1), waited on `stream`
   MappedHostBuffer hop_x_, hop_idx_, hop_rows_;  // pinned staging: xm, idx out; per-slot rows back
   SecondStorage hop_hi_;                   // xm, idx, act, rows on the second device
   DeviceBuffer hop_rows0_;                 // the rows as they land on this device
+  // KV-head split (allocated only with options.kv_split; nothing here exists without it)
+  struct SplitLayer {
+    const float* q_scale = nullptr;  // full [24, 128] copy, indexed by the absolute head
+    const float* r_scale = nullptr;  // full [24, 16]
+    const float* rel_proj = nullptr; // full [16, 1024]
+    const float* k_w = nullptr;      // k_static rows [4, KV_SPLIT_SECOND_HEADS * 128], compact heads
+    const float* v_w = nullptr;      // v_static likewise
+  };
+  struct KvSplit {
+    cudaStream_t stream = nullptr;
+    void* proj = nullptr;      // fp32 [8, PROJ_ROWS_FULL] staged for the shard's heads (device 1)
+    void* conv = nullptr;      // fp32 [2, CONV_K - 1, heads * 128] conv state of the shard's heads (device 1)
+    void* pos = nullptr;       // int64 [1] (device 1)
+    void* out = nullptr;       // bf16 [8, q heads * 128] (device 1)
+    void* ws = nullptr;        // attn workspace (device 1)
+    void* weights = nullptr;   // the per-full-layer slices below (device 1)
+    std::size_t ws_bytes = 0;
+    MappedHostBuffer in, out_host, w_host;  // pinned: proj+conv+pos in; out+conv back; weight slices
+    cudaEvent_t ready = nullptr;            // recorded here (device 0), waited on the second device
+    cudaEvent_t consumed = nullptr;         // recorded here, waited on the second device
+    cudaEvent_t loaded = nullptr;           // recorded on the second device, waited here
+    cudaEvent_t back = nullptr;             // recorded on the second device, waited here
+    std::array<SplitLayer, LAYERS> layer{};
+    bool weights_ready = false;
+  } kv_;
+  SecondStorage kv_hi_;  // the split's buffers on the second device
 };
 
 // An instantiated CUDA graph (move-only).
@@ -236,6 +271,7 @@ class Runtime {
   VerifyBackup backup_{};
   std::array<DeviceBuffer, 2> undo_storage_;
   std::array<StepUndo, 2> undo_{};
+  MappedHostBuffer full_rows_host_;  // staging for the second device's full-row shard (checkpoints only)
   MappedHostBuffer chain_host_;  // int32 [2]: tokens published by chain_advance, by position parity
   std::array<cudaEvent_t, 2> chain_done_{};
   cudaStream_t capture_stream_ = nullptr;

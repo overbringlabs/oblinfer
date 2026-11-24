@@ -53,4 +53,8 @@ class ArgParser {
   std::vector<Group> groups_;
 };
 
+// "LO-HI" inclusive layer range with 0 <= LO <= HI < layers (e.g. "0-19"). False when malformed or out of
+// range (the caller turns that into its own exit-2 usage error).
+bool parse_layer_range(const std::string& text, int layers, int* lo, int* hi);
+
 }  // namespace ingine::serve

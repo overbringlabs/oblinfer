@@ -139,7 +139,8 @@ int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
   int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
   int second_gpu = -1;
-  bool remote_experts = false;
+  bool remote_experts = false, kv_split = false;
+  std::string remote_layers;
   bool dense_fp8 = false, kv_fp8 = false, spec = false;
   double spec_threshold = 0.8, temperature = 0.0;
 
@@ -155,6 +156,11 @@ int main(int argc, char** argv) {
   ap.flag("--remote-experts",
           "experts of every layer load on --second-gpu; decode hops; DSpark stays on GPU0; prefill is per-token",
           &remote_experts);
+  ap.option("--remote-layers", "LO-HI",
+            "layers LO..HI (inclusive) keep their experts on --second-gpu, e.g. 0-19", &remote_layers);
+  ap.flag("--kv-split",
+          "3 of the 8 full-attention KV heads live on --second-gpu (needs --second-gpu and --remote-layers)",
+          &kv_split);
   ap.option("--tokens", "", "", &tokens);
   ap.option("--runs", "", "", &runs);
   ap.option("--effort", "", "", &effort);
@@ -180,6 +186,36 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "ingine-bench: error: --remote-experts needs --second-gpu (the device its experts load on)\n");
     return 2;
   }
+  if (remote_experts && !remote_layers.empty()) {
+    std::fprintf(stderr, "ingine-bench: error: --remote-experts and --remote-layers are exclusive\n");
+    return 2;
+  }
+  int remote_lo = -1, remote_hi = -1;
+  if (!remote_layers.empty()) {
+    if (!ingine::serve::parse_layer_range(remote_layers, ingine::model::EXPERT_RESIDENCY_LAYERS, &remote_lo, &remote_hi)) {
+      std::fprintf(stderr, "ingine-bench: error: --remote-layers takes LO-HI inside 0-%d, e.g. 0-19\n",
+                   ingine::model::EXPERT_RESIDENCY_LAYERS - 1);
+      return 2;
+    }
+    if (second_gpu < 0) {
+      std::fprintf(stderr, "ingine-bench: error: --remote-layers needs --second-gpu\n");
+      return 2;
+    }
+  }
+  if (kv_split && second_gpu < 0) {
+    std::fprintf(stderr, "ingine-bench: error: --kv-split needs --second-gpu (the device the 3 heads run on)\n");
+    return 2;
+  }
+  if (kv_split && remote_experts) {
+    std::fprintf(stderr, "ingine-bench: error: --kv-split with --remote-experts leaves no room for the KV shard; "
+                         "use --remote-layers 0-19\n");
+    return 2;
+  }
+  if (kv_split && remote_layers.empty()) {
+    std::fprintf(stderr, "ingine-bench: error: --kv-split needs --remote-layers (its prompt processing is the decode "
+                         "step, which writes the split caches)\n");
+    return 2;
+  }
 
   try {
     using Clock = std::chrono::steady_clock;
@@ -197,6 +233,8 @@ int main(int argc, char** argv) {
     options.spec_threshold = float(spec_threshold);
     options.second_gpu = second_gpu;
     if (remote_experts) options.expert_residency.split.fill(0);
+    for (int l = remote_lo; l >= 0 && l <= remote_hi; ++l) options.expert_residency.split[l] = 0;
+    options.kv_split = kv_split;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;

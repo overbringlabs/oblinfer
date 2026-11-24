@@ -1,7 +1,8 @@
 // Attention core of one layer visit for M = 1..8 consecutive decode tokens (the PyTorch extension's kernel ported
 // to a raw-pointer launcher; contract in native/KERNELS.md, area `attn`): q/rel post-processing, key/value convs +
 // state update, KV cache write, split-K attention with relative bias, sink and output gate, in one kernel.
-// Always launched with programmatic dependent launch (as the Python binding does); graph capturable.
+// Launched with programmatic dependent launch (as the Python binding does); graph capturable. One launch covers
+// `head_count` KV heads of the 8 (a KV-head split runs one launch per device).
 #pragma once
 
 #include <cuda_bf16.h>
@@ -32,7 +33,15 @@ struct DecodeArgs {
   bool log_scaling = false;         // full layers: q, rel *= tau(p)
   void* workspace = nullptr;        // workspace_bytes(M) bytes, zeroed once at allocation
   std::size_t workspace_size = 0;
-  __nv_bfloat16* out = nullptr;     // bf16 [M, 3072]
+  __nv_bfloat16* out = nullptr;     // bf16 [M, out_stride / D * D] rows, head-major from out_head0
+  // KV-head split (--kv-split): this launch covers KV heads [head_begin, head_begin + head_count) of the 8;
+  // the cache/conv-state rows hold `cache_heads` heads (its own shard) and `out` starts at query head
+  // out_head0 with `out_stride` elements per row. The defaults are the one-device launch over all 8 heads.
+  int head_begin = 0;
+  int head_count = 8;
+  int cache_heads = 8;   // heads per cache row and conv-state row on this device
+  int out_head0 = 0;     // first query head written to `out` (3 per KV head, from head_begin)
+  int out_stride = 3072; // elements between `out` rows
 };
 
 // Bytes of workspace attn_decode needs for up to max_m tokens: a counter (zero the workspace once; the

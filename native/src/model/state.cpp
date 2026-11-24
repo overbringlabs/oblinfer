@@ -27,30 +27,61 @@ Tensor State::v_ring_at(int ring) const {
 std::int64_t* State::ring_pos_at(int ring) const { return ptr<std::int64_t>(ring_pos) + std::size_t(ring) * WINDOW; }
 Tensor State::k_full_at(int full) const {
   const std::size_t es = kv_fp8 ? 1 : 2;
-  return rm(ptr<char>(k_full) + std::size_t(full) * max_ctx * KV_DIM * es, k_full.dtype, {max_ctx, KV_HEADS, HEAD_DIM});
+  return rm(ptr<char>(k_full) + std::size_t(full) * max_ctx * kv_heads * HEAD_DIM * es, k_full.dtype,
+            {max_ctx, kv_heads, HEAD_DIM});
 }
 Tensor State::v_full_at(int full) const {
   const std::size_t es = kv_fp8 ? 1 : 2;
-  return rm(ptr<char>(v_full) + std::size_t(full) * max_ctx * KV_DIM * es, v_full.dtype, {max_ctx, KV_HEADS, HEAD_DIM});
+  return rm(ptr<char>(v_full) + std::size_t(full) * max_ctx * kv_heads * HEAD_DIM * es, v_full.dtype,
+            {max_ctx, kv_heads, HEAD_DIM});
+}
+Tensor State::k_full_hi_at(int full) const {
+  const std::size_t es = kv_fp8 ? 1 : 2;
+  return rm(ptr<char>(k_full_hi) + std::size_t(full) * max_ctx * kv_heads_hi * HEAD_DIM * es, k_full_hi.dtype,
+            {max_ctx, kv_heads_hi, HEAD_DIM});
+}
+Tensor State::v_full_hi_at(int full) const {
+  const std::size_t es = kv_fp8 ? 1 : 2;
+  return rm(ptr<char>(v_full_hi) + std::size_t(full) * max_ctx * kv_heads_hi * HEAD_DIM * es, v_full_hi.dtype,
+            {max_ctx, kv_heads_hi, HEAD_DIM});
 }
 
-State make_state(int max_ctx, bool kv_fp8) {
+State make_state(int max_ctx, bool kv_fp8, const DeviceContext* second, int heads_second) {
   // the attention kernel keeps positions in int32 and caps full caches at 2^30 rows
   if (max_ctx < 1 || max_ctx > (1 << 30)) throw std::invalid_argument("max_ctx must be in 1..2^30");
+  if (heads_second < 0 || heads_second >= KV_HEADS) throw std::invalid_argument("heads_second must be in 0..7");
+  if (heads_second > 0 && second == nullptr) throw std::invalid_argument("the second KV shard needs the second device");
   State st;
   st.max_ctx = max_ctx;
   st.kv_fp8 = kv_fp8;
+  st.kv_heads = KV_HEADS - heads_second;
+  st.kv_heads_hi = heads_second;
   const DType full = kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
   st.k_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
   st.v_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
   st.ring_pos = zeros(st.storage, DType::I64, {NUM_SLIDING_VISITS, WINDOW});
   CUDA_CHECK(cudaMemset(st.ring_pos.data, 0xff, st.storage.back().bytes));  // -1
-  st.k_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
-  st.v_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
+  st.k_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, st.kv_heads, HEAD_DIM});
+  st.v_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, st.kv_heads, HEAD_DIM});
   st.conv_k = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, KV_DIM});
   st.conv_v = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, KV_DIM});
   st.conv_attn = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, HIDDEN});
   st.conv_mlp = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, HIDDEN});
+  if (heads_second > 0) {
+    // the shard is allocated (and freed, SecondStorage::release) on the second device
+    int saved = 0;
+    CUDA_CHECK(cudaGetDevice(&saved));
+    try {
+      second->bind_to_current_thread();
+    } catch (...) {
+      (void)cudaSetDevice(saved);
+      throw;
+    }
+    st.storage_hi.device = second->device;
+    st.k_full_hi = zeros(st.storage_hi.buffers, full, {NUM_FULL_VISITS, max_ctx, heads_second, HEAD_DIM});
+    st.v_full_hi = zeros(st.storage_hi.buffers, full, {NUM_FULL_VISITS, max_ctx, heads_second, HEAD_DIM});
+    CUDA_CHECK(cudaSetDevice(saved));
+  }
   st.length = 0;
   return st;
 }

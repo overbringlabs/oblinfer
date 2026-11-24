@@ -68,7 +68,8 @@ int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
   int second_gpu = -1;
-  bool remote_experts = false;
+  bool remote_experts = false, kv_split = false;
+  std::string remote_layers;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
@@ -91,6 +92,11 @@ int main(int argc, char** argv) {
   ap.flag("--remote-experts",
           "experts of every layer load on --second-gpu; decode hops; DSpark stays on GPU0; prefill is per-token",
           &remote_experts);
+  ap.option("--remote-layers", "LO-HI",
+            "layers LO..HI (inclusive) keep their experts on --second-gpu, e.g. 0-19", &remote_layers);
+  ap.flag("--kv-split",
+          "3 of the 8 full-attention KV heads live on --second-gpu (needs --second-gpu and --remote-layers)",
+          &kv_split);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
@@ -139,6 +145,37 @@ int main(int argc, char** argv) {
                  "load on)\n";
     return 2;
   }
+  if (remote_experts && !remote_layers.empty()) {
+    std::cerr << "ingine-serve: error: --remote-experts and --remote-layers are exclusive\n";
+    return 2;
+  }
+  int remote_lo = -1, remote_hi = -1;
+  if (!remote_layers.empty()) {
+    if (!ingine::serve::parse_layer_range(remote_layers, ingine::model::EXPERT_RESIDENCY_LAYERS, &remote_lo,
+                                          &remote_hi)) {
+      std::cerr << "ingine-serve: error: --remote-layers takes LO-HI inside 0-"
+                << ingine::model::EXPERT_RESIDENCY_LAYERS - 1 << ", e.g. 0-19\n";
+      return 2;
+    }
+    if (second_gpu < 0) {
+      std::cerr << "ingine-serve: error: --remote-layers needs --second-gpu\n";
+      return 2;
+    }
+  }
+  if (kv_split && second_gpu < 0) {
+    std::cerr << "ingine-serve: error: --kv-split needs --second-gpu (the device the 3 heads run on)\n";
+    return 2;
+  }
+  if (kv_split && remote_experts) {
+    std::cerr << "ingine-serve: error: --kv-split with --remote-experts leaves no room for the KV shard; use "
+                 "--remote-layers 0-19\n";
+    return 2;
+  }
+  if (kv_split && remote_layers.empty()) {
+    std::cerr << "ingine-serve: error: --kv-split needs --remote-layers (its prompt processing is the decode step, "
+                 "which writes the split caches)\n";
+    return 2;
+  }
   if (second_gpu >= 0 && !engine) {
     std::cerr << "ingine-serve: error: --second-gpu needs --engine\n";
     return 2;
@@ -172,6 +209,8 @@ int main(int argc, char** argv) {
       options.vision = !no_vision;
       options.second_gpu = second_gpu;
       if (remote_experts) options.expert_residency.split.fill(0);
+      for (int l = remote_lo; l >= 0 && l <= remote_hi; ++l) options.expert_residency.split[l] = 0;
+      options.kv_split = kv_split;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");

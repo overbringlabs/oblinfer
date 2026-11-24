@@ -108,6 +108,12 @@ log_scaling, workspace, out)`
     `x.clamp(-448, 448).to(torch.float8_e4m3fn)`; real keys have norm ≤ 22.627 and values are RMS-normed,
     so saturation does not occur in practice). Every read of a cached entry, the call's own new keys/values
     included, uses that E4M3 value. Sliding rings are BF16 only (an FP8 ring is rejected).
+  * KV-head range: a launch covers KV heads `[head_begin, head_begin + head_count)` of the 8; `cache_heads`
+    is the head stride of `k_cache`/`v_cache` and of the conv state on that device (its own shard), and `out`
+    starts at query head `out_head0` with `out_stride` elements per row. Defaults: 0, 8, 8, 0, 3072. A
+    KV-head split runs heads 0-4 on one device and 5-7 on the other, each writing its own cache shard and its
+    disjoint `out` heads (three query heads per KV head); Q/K/V of a head stay on one device, so the outputs
+    concatenate along the head axis with no partial-softmax combine.
   * Scores over cached keys j (positions `kp`, distance `d = p - kp`): valid if `0 ≤ d` and, for sliding
     layers, `d < 1024` and `kp ≥ 0`. `s_j = (q_h · k_j)/√128 + (d < 1024 ? rel_logits[h, d] : 0)`.
     Softmax over valid j plus one sink logit `sink[h]` with zero value:

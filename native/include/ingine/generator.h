@@ -127,6 +127,11 @@ struct RuntimeOptions {
   // DSpark verifies eagerly at one extra host synchronisation per round, and a prompt is processed one token per
   // decode step.
   ExpertResidency expert_residency;
+  // KV-head split: KV_SPLIT_SECOND_HEADS of the 8 full-attention KV heads are cached and attended on the
+  // second device (5 stay here), so the full-visit KV bytes stream over both DRAM buses. Needs second_gpu and
+  // at least one layer's experts on the second device (its prompt processing is the decode step, which is the
+  // path that writes the split caches); not with every layer's experts there (VRAM: use a layer range).
+  bool kv_split = false;
 };
 
 class Generator {

@@ -3,7 +3,8 @@
 //
 // Design
 // ------
-// * Work: one thread-block cluster of CS blocks per KV head (grid CS x 8; CS = 16 where the GPU can hold a
+// * Work: one thread-block cluster of CS blocks per KV head (grid CS x head_count; head_count = 8 on one
+//   device, or the device's KV-head slice under --kv-split; CS = 16 where the GPU can hold a
 //   16-block cluster, else 8 - see attn_cluster_size). The cached keys [0, L_old) (full layer: positions
 //   0..p0-1 of the linear cache; sliding layer: the 1024 ring slots with their kpos) are dealt to the CS
 //   blocks in tiles, round robin, so every block gets an equal share
@@ -88,8 +89,10 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -97,7 +100,7 @@
 namespace ingine::kernels::attn {
 namespace {
 
-constexpr int HQ = 24, HKV = 8, D = 128, DREL = 16, EXT = 1024, WIN = 1024, GQA = 3, CONV_C = HKV * D;
+constexpr int HKV = 8, D = 128, DREL = 16, EXT = 1024, WIN = 1024, GQA = 3;
 constexpr int OFF_GATE = 3072, OFF_REL = 6144, OFF_SINK = 6528, OFF_K = 6552, OFF_V = 7576, OFF_KDYN = 8600,
               OFF_VDYN = 8632;
 constexpr int R_SLIDING = 8600, R_FULL = 8664;
@@ -221,6 +224,8 @@ struct Params {
     float* part;
     __nv_bfloat16* out;
     int zero;  // 0 at run time, opaque to the compiler (fenced griddepcontrol.wait)
+    // KV-head split: see DecodeArgs
+    int head_begin, head_count, cache_heads, out_head0, out_stride;
 };
 
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
@@ -366,7 +371,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     extern __shared__ __align__(16) float sm[];
     __nv_bfloat16(*s_nkv)[M][D] = reinterpret_cast<__nv_bfloat16(*)[M][D]>(sm + L::NKV);
 
-    const int g = blockIdx.y, rank = blockIdx.x;  // cluster = the CS blocks of KV head g; rank = blockIdx.x
+    // blockIdx.y is this launch's KV head (g_local); g is its head in the model (proj / out indexing)
+    const int g_local = blockIdx.y, g = p.head_begin + g_local, rank = blockIdx.x;
+    const int CC = p.cache_heads * D;  // channels of a cache row / conv-state row on this device
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, half = lane >> 4, c = lane & 15;
     const int tok = warp / KW, kw = warp % KW;
     const bool owner = rank == 0;
@@ -382,7 +389,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         for (int i = tid; i < 2 * D; i += NT) {  // sliding [kv][ch][4]; full [kv][lag][D]
             const int kv = i / D, q = i % D;
             const float* w = kv ? p.v_conv : p.k_conv;
-            cp16(sm + L::W + 4 * i, FULL ? w + (q / (D / 4)) * CONV_C + g * D + 4 * (q % (D / 4)) : w + (g * D + q) * 4);
+            cp16(sm + L::W + 4 * i, FULL ? w + (q / (D / 4)) * CC + g_local * D + 4 * (q % (D / 4)) : w + (g_local * D + q) * 4);
         }
         for (int i = tid; i < DREL * 2; i += NT)  // rel_proj[:, 0..7]: the new keys' distances
             cp16(sm + L::RELP0 + 4 * i, p.rel_proj + (i / 2) * EXT + 4 * (i % 2));
@@ -405,7 +412,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             b.k[u] = b.v[u] = KV{};
             b.kp[u] = -1;
             if (j < old_end) {
-                const size_t off = (size_t(j) * HKV + g) * D + c * 8;
+                const size_t off = (size_t(j) * p.cache_heads + g_local) * D + c * 8;
                 if constexpr (F8) {
                     b.k[u] = ld_kv8(kc + off, kvpol);
                     b.v[u] = ld_kv8(vc + off, kvpol);
@@ -450,7 +457,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             const int key = i / (2 * (D / 8)), kv = (i / (D / 8)) % 2, ch = i % (D / 8), j = base + key;
             const bool ok = j < L_old;
             cp16z(reinterpret_cast<float*>(kvs + kv_off(st, key, kv, ch)),
-                  reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 8), ok,
+                  reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * p.cache_heads + g_local) * D + ch * 8), ok,
                   kvpol);
         }
         if constexpr (!FULL) {
@@ -486,7 +493,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 const bool ok = j < L_old;
                 char* dst = raw + (t % NRAW) * RAWB + kv * KT * D + key * D + (kv ? ch : ch ^ (key & 7)) * 16;
                 cp16z(reinterpret_cast<float*>(dst),
-                      reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 16), ok,
+                      reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * p.cache_heads + g_local) * D + ch * 16), ok,
                       kvpol);
             }
         }
@@ -520,7 +527,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     if (owner) {
         for (int i = tid; i < 3 * 2 * D / 4; i += NT) {  // [j][kv][D]
             const int j = i / (2 * D / 4), kv = (i / (D / 4)) % 2, q = i % (D / 4);
-            cp16(sm + L::ST + 4 * i, (kv ? p.conv_v : p.conv_k) + j * CONV_C + g * D + 4 * q);
+            cp16(sm + L::ST + 4 * i, (kv ? p.conv_v : p.conv_k) + j * CC + g_local * D + 4 * q);
         }
         for (int i = tid; i < M * 2 * D / 4; i += NT) {  // [m][kv][D]
             const int m = i / (2 * D / 4), kv = (i / (D / 4)) % 2, q = i % (D / 4);
@@ -1109,7 +1116,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
     if (!FULL && M > 1 && owner && tid == NT - 1) {  // kpos is read by every head: the last head writes it
         __threadfence();
-        if (atomicAdd(p.counter, 1) == HKV - 1) {
+        if (atomicAdd(p.counter, 1) == p.head_count - 1) {
             __threadfence();
             for (int m = 0; m < M; ++m) p.kpos[(p0 + m) & (WIN - 1)] = p0 + m;
             *p.counter = 0;
@@ -1139,7 +1146,8 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             a += o[q] * f;
         }
         const float gate = 1.f / (1.f + expf(-sm[L::GATE + i]));
-        p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
+        const int oh = p.out_head0 + g_local * GQA + row % GQA;
+        p.out[size_t(row / GQA) * p.out_stride + size_t(oh) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
     }
 
     // owner: the global writes, at the end so they delay nothing (and, for M > 1 on a ring, because the
@@ -1149,7 +1157,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
             const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
             const uint4 u = reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
-            CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
+            CT* const dst = (kv ? vc : kc) + (size_t(row) * p.cache_heads + g_local) * D;
             if constexpr (F8) {  // exact: the values are E4M3 already
                 float f[8];
                 unpack8(u, f);
@@ -1161,7 +1169,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
         for (int idx = tid; idx < 3 * 2 * D; idx += NT) {  // conv states of this head's channels
             const int i = idx / (2 * D), kv = (idx / D) % 2, ch = idx % D;
-            (kv ? p.conv_v : p.conv_k)[i * CONV_C + g * D + ch] = sm[L::NST + idx];
+            (kv ? p.conv_v : p.conv_k)[i * CC + g_local * D + ch] = sm[L::NST + idx];
         }
         if (!FULL && M == 1 && g == 0 && tid == 0) p.kpos[p0 & (WIN - 1)] = p0;
     }
@@ -1179,14 +1187,27 @@ struct Kernel {
     size_t smem;
 };
 
+// Function attributes (dynamic shared memory, non-portable cluster) are per device, so every device that
+// launches a variant gets its own entry. Two devices is the production shape; the cap only guards indexing.
+constexpr int kMaxKernelDevices = 64;
+
 template <int M, bool FULL, bool F8, int CS>
-Kernel kernel_of() {
-    static const Kernel k = [] {
+const Kernel& kernel_of() {
+    static std::mutex mu;
+    static std::array<Kernel, kMaxKernelDevices> per_device{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxKernelDevices) {
+        (void)cudaGetLastError();
+        dev = 0;
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    Kernel& k = per_device[dev];
+    if (k.fn == nullptr) {
         const KernelFn f = attn_decode_kernel<M, FULL, F8, CS>;
         if constexpr (CS > 8) CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8, CS>::BYTES)));
-        return Kernel{f, M, Smem<M, F8, CS>::BYTES};
-    }();
+        k = Kernel{f, M, Smem<M, F8, CS>::BYTES};
+    }
     return k;
 }
 
@@ -1211,9 +1232,9 @@ Kernel select(int M, int cs) {
 
 // attrs[0]: cluster of cs blocks; attrs[1]: programmatic dependent launch (the kernel waits with
 // griddepcontrol.wait before touching anything an earlier kernel may write; a no-op without PDL)
-cudaLaunchConfig_t launch_config(const Kernel& k, int cs, cudaStream_t stream, cudaLaunchAttribute* attrs) {
+cudaLaunchConfig_t launch_config(const Kernel& k, int cs, int heads, cudaStream_t stream, cudaLaunchAttribute* attrs) {
     cudaLaunchConfig_t cfg{};
-    cfg.gridDim = dim3(cs, HKV);
+    cfg.gridDim = dim3(cs, heads);
     cfg.blockDim = dim3(NT);
     cfg.dynamicSmemBytes = k.smem;
     cfg.stream = stream;
@@ -1230,36 +1251,48 @@ cudaLaunchConfig_t launch_config(const Kernel& k, int cs, cudaStream_t stream, c
 // it, the 70-SM 5070 Ti and 36-SM 5060 Ti reject such a launch with cudaErrorInvalidClusterSize. Same
 // numbers either way: the CS blocks split the head's keys round robin and D / CS output dims each.
 // `INGINE_ATTN_CS=8|16` forces a size (to exercise both paths on one device).
+int probe_cluster_size() {
+    if (const char* e = std::getenv("INGINE_ATTN_CS")) {
+        const int v = std::atoi(e);
+        if (v == 8 || v == MAX_CS) return v;
+    }
+    // probe with the largest variant (M = 8, BF16): every other M needs no more. Widest cluster the
+    // kernel can run at all ...
+    const KernelFn f = attn_decode_kernel<MAXM, true, false, MAX_CS>;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(MAX_CS, HKV);
+    cfg.blockDim = dim3(NT);
+    cfg.dynamicSmemBytes = Smem<MAXM, false, MAX_CS>::BYTES;
+    int n = 0;
+    if (cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess ||
+        cudaOccupancyMaxPotentialClusterSize(&n, f, &cfg) != cudaSuccess || n < MAX_CS) {
+        (void)cudaGetLastError();
+        return 8;
+    }
+    cudaLaunchAttribute attr[1];  // ... and that at least one such cluster is resident
+    cudaLaunchConfig_t q = cfg;
+    attr[0].id = cudaLaunchAttributeClusterDimension;
+    attr[0].val.clusterDim.x = MAX_CS, attr[0].val.clusterDim.y = 1, attr[0].val.clusterDim.z = 1;
+    q.attrs = attr, q.numAttrs = 1;
+    if (cudaOccupancyMaxActiveClusters(&n, f, &q) != cudaSuccess || n <= 0) {
+        (void)cudaGetLastError();
+        return 8;
+    }
+    return MAX_CS;
+}
+
+// The cluster size is a property of the device the launch runs on (the 5070 Ti and the 5060 Ti differ).
 int attn_cluster_size() {
-    static const int cs = [] {
-        if (const char* e = std::getenv("INGINE_ATTN_CS")) {
-            const int v = std::atoi(e);
-            if (v == 8 || v == MAX_CS) return v;
-        }
-        // probe with the largest variant (M = 8, BF16): every other M needs no more. Widest cluster the
-        // kernel can run at all ...
-        const KernelFn f = attn_decode_kernel<MAXM, true, false, MAX_CS>;
-        cudaLaunchConfig_t cfg{};
-        cfg.gridDim = dim3(MAX_CS, HKV);
-        cfg.blockDim = dim3(NT);
-        cfg.dynamicSmemBytes = Smem<MAXM, false, MAX_CS>::BYTES;
-        int n = 0;
-        if (cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess ||
-            cudaOccupancyMaxPotentialClusterSize(&n, f, &cfg) != cudaSuccess || n < MAX_CS) {
-            (void)cudaGetLastError();
-            return 8;
-        }
-        cudaLaunchAttribute attr[1];  // ... and that at least one such cluster is resident
-        cudaLaunchConfig_t q = cfg;
-        attr[0].id = cudaLaunchAttributeClusterDimension;
-        attr[0].val.clusterDim.x = MAX_CS, attr[0].val.clusterDim.y = 1, attr[0].val.clusterDim.z = 1;
-        q.attrs = attr, q.numAttrs = 1;
-        if (cudaOccupancyMaxActiveClusters(&n, f, &q) != cudaSuccess || n <= 0) {
-            (void)cudaGetLastError();
-            return 8;
-        }
-        return MAX_CS;
-    }();
+    static std::mutex mu;
+    static std::array<int, kMaxKernelDevices> per_device{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxKernelDevices) {
+        (void)cudaGetLastError();
+        dev = 0;
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    int& cs = per_device[dev];
+    if (cs == 0) cs = probe_cluster_size();
     return cs;
 }
 
@@ -1276,7 +1309,7 @@ int max_active_clusters(int M, int window) {
     const int cs = attn_cluster_size();
     const Kernel k = window == 0 ? select<true>(M, cs) : select<false>(M, cs);
     cudaLaunchAttribute attrs[2];
-    cudaLaunchConfig_t cfg = launch_config(k, cs, nullptr, attrs);
+    cudaLaunchConfig_t cfg = launch_config(k, cs, HKV, nullptr, attrs);
     cfg.numAttrs = 1;  // occupancy: the cluster shape only
     int n = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveClusters(&n, k.fn, &cfg));
@@ -1299,6 +1332,11 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
         require(a.kpos != nullptr, "sliding layers need kpos");
     }
     require(a.workspace_size >= ws_bytes(M), "workspace too small: need workspace_bytes(M)");
+    require(a.head_begin >= 0 && a.head_count >= 1 && a.head_begin + a.head_count <= HKV,
+            "KV head range outside 0..8");
+    require(a.cache_heads >= a.head_count, "cache holds fewer heads than this launch runs");
+    require(a.out_head0 >= 0 && a.out_head0 + a.head_count * GQA <= 24, "query head range outside 0..24");
+    require(a.out_stride >= (a.out_head0 + a.head_count * GQA) * D, "out stride too small for its heads");
 
     Params p{};
     p.proj = a.proj;
@@ -1319,10 +1357,15 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.counter = static_cast<int*>(a.workspace);
     p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
     p.out = a.out;
+    p.head_begin = a.head_begin;
+    p.head_count = a.head_count;
+    p.cache_heads = a.cache_heads;
+    p.out_head0 = a.out_head0;
+    p.out_stride = a.out_stride;
     const int cs = attn_cluster_size();
     const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M, cs) : select<true>(M, cs)) : select<false>(M, cs);
     cudaLaunchAttribute attrs[2];
-    const cudaLaunchConfig_t cfg = launch_config(k, cs, stream, attrs);
+    const cudaLaunchConfig_t cfg = launch_config(k, cs, a.head_count, stream, attrs);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));
 }
 

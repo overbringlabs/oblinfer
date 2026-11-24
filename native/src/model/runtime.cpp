@@ -115,7 +115,22 @@ void Runtime::init() {
   if (ep_ && second_device_ == nullptr) {
     throw std::invalid_argument("expert residency: an expert shard needs the second device (options.second_gpu)");
   }
-  state_ = make_state(options.max_ctx, options.kv_fp8);
+  if (options.kv_split) {
+    // The split caches are written by the decode step (a prompt is processed as decode steps with experts on
+    // the second device); the chunked Prefiller writes one device's cache only, so it is not a valid pairing.
+    if (second_device_ == nullptr)
+      throw std::invalid_argument("kv split: needs a second device (options.second_gpu)");
+    if (!ep_)
+      throw std::invalid_argument("kv split: needs expert layers on the second device (options.expert_residency); "
+                                  "its prompt processing is the decode step, which writes the split caches");
+    bool all_remote = true;
+    for (const Layer& l : weights_.layers) all_remote = all_remote && l.experts.split == 0;
+    if (all_remote)
+      throw std::invalid_argument("kv split: every expert layer on the second device leaves no room for 3/8 of the "
+                                  "full-attention KV there; move some layers back (--remote-layers 0-19)");
+  }
+  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_split ? second_device_.get() : nullptr,
+                      options.kv_split ? KV_SPLIT_SECOND_HEADS : 0);
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true, second_device_.get());
   pos_ = DeviceBuffer(sizeof(std::int64_t));
   pos_.fill(0);
@@ -315,31 +330,91 @@ std::size_t Runtime::full_rows_bytes(int n) const {
   if (n < 0 || n > options_.max_ctx)
     throw std::invalid_argument("full_rows_bytes: n = " + std::to_string(n) + " outside [0, max_ctx = " +
                                 std::to_string(options_.max_ctx) + "]");
-  const std::size_t row = state_.k_full.bytes() / NUM_FULL_VISITS / std::size_t(options_.max_ctx);
+  const std::size_t row = (state_.k_full.bytes() + state_.k_full_hi.bytes()) / NUM_FULL_VISITS /
+                          std::size_t(options_.max_ctx);
   return 2 * std::size_t(NUM_FULL_VISITS) * row * std::size_t(n);
 }
 
-// one 2D copy per cache: NUM_FULL_VISITS rows of n positions, pitch max_ctx positions in the cache, packed in
-// the parked copy (k visits, then v visits)
+// one 2D copy per visit and cache: n positions, pitch max_ctx positions in the cache, packed in the parked
+// copy (k visits, then v visits, every head in head order: this device's heads first, then the second
+// device's shard)
 void Runtime::save_full_rows(void* dst, int n) {
   const std::size_t bytes = full_rows_bytes(n) / 2, width = bytes / NUM_FULL_VISITS;
   if (n == 0) return;
-  const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
+  const std::size_t row_all = width / std::size_t(n);
+  const std::size_t row_here = state_.k_full.bytes() / NUM_FULL_VISITS / std::size_t(options_.max_ctx);
   char* p = static_cast<char*>(dst);
-  for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
-    CUDA_CHECK(cudaMemcpy2DAsync(p, width, t->data, pitch, width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
-    p += bytes;
+  for (int t = 0; t < 2; ++t) {
+    const Tensor& cache = t ? state_.v_full : state_.k_full;
+    for (int f = 0; f < NUM_FULL_VISITS; ++f) {
+      const char* src = static_cast<const char*>(cache.data) + std::size_t(f) * options_.max_ctx * row_here;
+      char* d = p + std::size_t(t) * bytes + std::size_t(f) * width;
+      CUDA_CHECK(cudaMemcpy2DAsync(d, row_all, src, row_here, row_here, n, cudaMemcpyDefault, stream_));
+    }
   }
+  if (state_.kv_heads_hi == 0) return;
+  // The second device's rows: no peer access, so they are staged through pinned host memory. A checkpoint is
+  // not on a token's path, so the host synchronisation this costs is fine.
+  const std::size_t row_hi = state_.k_full_hi.bytes() / NUM_FULL_VISITS / std::size_t(options_.max_ctx);
+  if (!full_rows_host_.data()) full_rows_host_ = MappedHostBuffer(4u << 20);
+  const std::size_t per_chunk = std::max<std::size_t>(1, full_rows_host_.size() / row_hi);
+  second_device_->bind_to_current_thread();
+  CUDA_CHECK(cudaStreamSynchronize(second_device_->stream));
+  char* chunk = static_cast<char*>(full_rows_host_.data());
+  for (int t = 0; t < 2; ++t) {
+    const Tensor& cache = t ? state_.v_full_hi : state_.k_full_hi;
+    for (int f = 0; f < NUM_FULL_VISITS; ++f) {
+      const char* src = static_cast<const char*>(cache.data) + std::size_t(f) * options_.max_ctx * row_hi;
+      char* d = p + std::size_t(t) * bytes + std::size_t(f) * width + row_here;
+      for (int r = 0; r < n; r += int(per_chunk)) {
+        const int nr = std::min<int>(n - r, int(per_chunk));
+        CUDA_CHECK(cudaMemcpy(chunk, src + std::size_t(r) * row_hi, std::size_t(nr) * row_hi,
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaSetDevice(device_));
+        CUDA_CHECK(cudaMemcpy2D(d + std::size_t(r) * row_all, row_all, chunk, row_hi, row_hi, nr,
+                                cudaMemcpyDefault));
+        second_device_->bind_to_current_thread();
+      }
+    }
+  }
+  CUDA_CHECK(cudaSetDevice(device_));
 }
 
 void Runtime::restore_full_rows(const void* src, int n) {
   const std::size_t bytes = full_rows_bytes(n) / 2, width = bytes / NUM_FULL_VISITS;
   if (n == 0) return;
-  const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
+  const std::size_t row_all = width / std::size_t(n);
+  const std::size_t row_here = state_.k_full.bytes() / NUM_FULL_VISITS / std::size_t(options_.max_ctx);
   const char* p = static_cast<const char*>(src);
-  for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
-    CUDA_CHECK(cudaMemcpy2DAsync(t->data, pitch, p, width, width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
-    p += bytes;
+  for (int t = 0; t < 2; ++t) {
+    Tensor& cache = t ? state_.v_full : state_.k_full;
+    for (int f = 0; f < NUM_FULL_VISITS; ++f) {
+      char* d = static_cast<char*>(cache.data) + std::size_t(f) * options_.max_ctx * row_here;
+      const char* s = p + std::size_t(t) * bytes + std::size_t(f) * width;
+      CUDA_CHECK(cudaMemcpy2DAsync(d, row_here, s, row_all, row_here, n, cudaMemcpyDefault, stream_));
+    }
+  }
+  if (state_.kv_heads_hi == 0) return;
+  const std::size_t row_hi = state_.k_full_hi.bytes() / NUM_FULL_VISITS / std::size_t(options_.max_ctx);
+  if (!full_rows_host_.data()) full_rows_host_ = MappedHostBuffer(4u << 20);
+  const std::size_t per_chunk = std::max<std::size_t>(1, full_rows_host_.size() / row_hi);
+  char* chunk = static_cast<char*>(full_rows_host_.data());
+  CUDA_CHECK(cudaStreamSynchronize(stream_));  // the parked rows may still be in flight on this stream
+  for (int t = 0; t < 2; ++t) {
+    const Tensor& cache = t ? state_.v_full_hi : state_.k_full_hi;
+    for (int f = 0; f < NUM_FULL_VISITS; ++f) {
+      char* d = static_cast<char*>(cache.data) + std::size_t(f) * options_.max_ctx * row_hi;
+      const char* s = p + std::size_t(t) * bytes + std::size_t(f) * width + row_here;
+      for (int r = 0; r < n; r += int(per_chunk)) {
+        const int nr = std::min<int>(n - r, int(per_chunk));
+        CUDA_CHECK(cudaMemcpy2D(chunk, row_hi, s + std::size_t(r) * row_all, row_all, row_hi, nr,
+                                cudaMemcpyDefault));
+        second_device_->bind_to_current_thread();
+        CUDA_CHECK(cudaMemcpy(d + std::size_t(r) * row_hi, chunk, std::size_t(nr) * row_hi,
+                              cudaMemcpyDefault));
+        CUDA_CHECK(cudaSetDevice(device_));
+      }
+    }
   }
 }
 
