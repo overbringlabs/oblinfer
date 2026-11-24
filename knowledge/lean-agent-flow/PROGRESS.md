@@ -11,15 +11,15 @@ get here".
 
 ## In flight
 
-- (none) Steps 1–2 in tree. Next is step 3 (stub PCIe hop on supra) — needs Maya unloaded.
+- (none) Hop PASS. Waiting on Isaak for step 4 (MoE split).
 
 ## Last completed
 
-- 2026-11-24: step 1 `--second-gpu`. Step 2 expert residency table (default all GPU0; split 0 or 128 only; decode guard if any experts on GPU1).
+- 2026-11-24: hop on supra. P2P=0, mean 27.1 µs, p99 39.6. sm_120a ran on both cards. Gate 40 µs cleared.
 
 ## Needs a decision
 
-- Go on step 3 hop measurement (unload Maya), or hold.
+- Go on step 4 MoE split, or hold.
 
 ## Needs a decision
 

@@ -7,7 +7,7 @@ This file is a whiteboard, not a ledger.
 ```
 ## agent: grok-parent   since: 2026-11-24T01:47Z
 writing: (none)
-next:    (idle — steps 1–2 done; waiting on Isaak for hop measurement)
-released: step 1 --second-gpu; step 2 expert residency
+next:    (idle — hop PASS 27 µs; waiting on Isaak for MoE split)
+released: step 3 ingine-hop + plans/20261124_hop-measure.md
 ```
 

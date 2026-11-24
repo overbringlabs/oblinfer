@@ -26,7 +26,7 @@ endif()
 project(ingine LANGUAGES C CXX CUDA)
 
 option(INGINE_BUILD_TESTS "Build ingine tests" OFF)
-option(INGINE_BUILD_APPS "Build the ingine executables (serve, bench, validate)" ON)
+option(INGINE_BUILD_APPS "Build the ingine executables (serve, bench, validate, hop)" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -82,7 +82,7 @@ ingine_add_component(src/engine)
 ingine_add_component(src/serve)
 
 if(INGINE_BUILD_APPS)
-  foreach(app serve bench validate)
+  foreach(app serve bench validate hop)
     ingine_add_component(apps/${app})
   endforeach()
 endif()
