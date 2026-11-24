@@ -11,11 +11,15 @@ get here".
 
 ## In flight
 
-- Turbo explore: why ingine beats Maya at shallow depth (structural). Then implications for 2×16 GB / 256k. Report: `plans/20261124_two-gpu-explore.md`. First explorer killed — brief was the split, not the speed delta.
+- (none) Waiting on Isaak: PP vs Maya-style EP, after parent check of the explore.
 
 ## Last completed
 
-- 2026-11-24: lean-agent-flow init. First rulings: explore-first, adopt ledgers, 256k @ 100–120 tok/s on 2× 5060 Ti, do not chase 5090 tok/s.
+- 2026-11-24: Ornith explore landed `plans/20261124_two-gpu-explore.md`. Parent check: PDL/fusion/L2 stand; H1 half-wrong (`cvt.e2m1x2` is real); EP is wrong for 256k (KV stays on GPU0). Recommend PP.
+
+## Needs a decision
+
+- Split: pipeline-parallel (parent) vs Maya `IK2_EP` (Ornith). P2P on supra still unmeasured.
 
 ## Needs a decision
 
