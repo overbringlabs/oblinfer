@@ -9,7 +9,7 @@ serves abliterated thinking-model packs. Four packs are on the track;
 |---|---|
 | Inkling-2-Mini (abliterated) | runs today — two-16 GB Blackwell profile |
 | Qwen3.8-27B hybrid (DaisyRose/Swift) | planned |
-| Qwen3-MoE 35B-A3B (Qwen3.6 + Ornith NVFP4) | planned |
+| Qwen3-MoE 35B-A3B (Qwen3.6 + Ornith NVFP4) | constants scaffold (`arch/qwen35moe`); no kernels yet |
 | Nemotron 3.5 Lightning 30B-A3B | planned |
 
 The Inkling pack answers harmful test prompts instead of refusing them (refusal phrases in 1 of 104 and 3 of 48
