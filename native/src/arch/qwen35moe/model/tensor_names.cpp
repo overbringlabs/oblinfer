@@ -190,6 +190,11 @@ std::optional<TensorName> parse_tensor_name(std::string_view name) {
     TensorName base;
     return classify_body(name, base);
   }
+  if (name == "norm.weight") {  // final layer norm of the text tower
+    TensorName base;
+    base.role = Role::Norm;
+    return base;
+  }
   if (!name.starts_with(kLayersPrefix)) return std::nullopt;
   name.remove_prefix(kLayersPrefix.size());
   const size_t dot = name.find('.');

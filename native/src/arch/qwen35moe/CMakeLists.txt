@@ -33,3 +33,10 @@ add_library(qwen35moe_moe OBJECT kernels/moe/router.cu kernels/moe/moe_apply.cu 
 ingine_cuda_target(qwen35moe_moe)
 target_include_directories(qwen35moe_moe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(qwen35moe_moe PUBLIC ingine_kernels_quant PRIVATE qwen35moe_data CUDA::cudart)
+
+# Streaming upload into the placement plan: index + headers from core/safetensors, chunked reads, pinned
+# staging, one H2D per chunk. Needs CUDA and ingine_core.
+add_library(qwen35moe_uploader OBJECT model/uploader.cpp)
+ingine_cuda_target(qwen35moe_uploader)
+target_include_directories(qwen35moe_uploader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(qwen35moe_uploader PUBLIC ingine_core PRIVATE qwen35moe_data qwen35moe_placement CUDA::cudart)

@@ -156,6 +156,18 @@ std::optional<PlacementPlan> plan_placement(std::span<const TensorSize> tensors,
       return fail("layer " + std::to_string(l) + " has no tensors");
     }
   }
+
+  // Arena layout: model area first, then each layer's dense slots followed by its expert block.
+  std::uint64_t cursor = model_bytes;
+  for (LayerPlan& lp : layers) {
+    lp.dense_arena_offset = cursor;
+    cursor += lp.dense_bytes;
+    if (lp.has_experts) {
+      lp.experts.arena_offset = cursor;
+      cursor += lp.experts.bytes;
+    }
+  }
+  plan.total_bytes = cursor;
   plan.layers = std::move(layers);
   return plan;
 }

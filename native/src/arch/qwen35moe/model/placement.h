@@ -32,8 +32,9 @@ struct TensorSlot {
 // One routed expert's artifacts, laid out gate, up, down; inside a projection in artifact order
 // weight, weight_scale, weight_scale_2, input_scale. Only the artifacts the export ships are included.
 struct ExpertBlockPlan {
-  std::uint64_t stride = 0;  // bytes of one expert
-  std::uint64_t bytes = 0;   // EXPERTS * stride
+  std::uint64_t stride = 0;        // bytes of one expert
+  std::uint64_t bytes = 0;         // EXPERTS * stride, or the packed total
+  std::uint64_t arena_offset = 0;  // where this block starts in the model arena
   std::vector<TensorSlot> slots;
 };
 
@@ -41,14 +42,15 @@ struct LayerPlan {
   int layer = 0;  // LAYERS is the MTP block
   std::vector<TensorSlot> dense;
   std::uint64_t dense_bytes = 0;
+  std::uint64_t dense_arena_offset = 0;  // where this layer's dense slots start
   bool has_experts = false;
   ExpertBlockPlan experts;
 };
 
 struct PlacementPlan {
   std::vector<LayerPlan> layers;  // LAYERS + MTP_LAYERS entries
-  std::vector<TensorSlot> model;  // embeddings, head, MTP glue, vision
-  std::uint64_t total_bytes = 0;
+  std::vector<TensorSlot> model;  // embeddings, head, MTP glue, vision; offsets from 0
+  std::uint64_t total_bytes = 0;  // the full arena
   Dialect dialect = Dialect::Unknown;
 };
 

@@ -41,3 +41,8 @@ if(TARGET ingine_serve AND TARGET ingine_kernels_vision)
   ingine_add_test(NAME model_vision SOURCES test_vision_generate.cpp LIBS ingine_model ingine_serve
                   LABELS vision GPU MODEL TIMEOUT 900)
 endif()
+
+# End-to-end load of the real 23 GB checkpoint through the placement plan; skipped unless QWEN35MOE_SNAPSHOT is set
+ingine_add_test(NAME model_qwen35moe_upload SOURCES test_qwen35moe_upload.cpp
+                LIBS qwen35moe_uploader qwen35moe_placement qwen35moe_names ingine_core CUDA::cudart
+                TIMEOUT 900)
