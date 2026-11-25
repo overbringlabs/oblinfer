@@ -72,6 +72,7 @@ ingine_add_component(src/text)
 ingine_add_component(src/image)
 # Shared kernels whose shapes more than one pack publishes (currently the Qwen3.x GDN step).
 ingine_add_component(src/kernels/gdn)
+ingine_add_component(src/kernels/quant)
 
 # One pack is built at a time: Inkling unless -DINGINE_ARCH_PACK names another directory under src/arch. A pack
 # that has no sources yet contributes its header-only data target only.

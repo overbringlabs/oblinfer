@@ -26,3 +26,9 @@ if(TARGET qwen35moe_attn)
   ingine_add_test(NAME kernels_qwen35moe_rope_norm SOURCES test_qwen35moe_rope_norm.cpp
                   LIBS qwen35moe_attn CUDA::cudart ORACLE TIMEOUT 300)
 endif()
+
+# FP8 e4m3 and NVFP4 e2m1 decode GEMV against byte-identical CPU references
+if(TARGET ingine_kernels_quant)
+  ingine_add_test(NAME kernels_quant_gemv SOURCES test_quant_gemv.cpp
+                  LIBS ingine_kernels_quant CUDA::cudart ORACLE TIMEOUT 300)
+endif()
