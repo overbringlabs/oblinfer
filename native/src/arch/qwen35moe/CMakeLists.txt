@@ -14,3 +14,9 @@ target_link_libraries(qwen35moe_data_check PRIVATE qwen35moe_data)
 add_library(qwen35moe_names OBJECT model/tensor_names.cpp)
 target_include_directories(qwen35moe_names PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(qwen35moe_names PRIVATE qwen35moe_data)
+
+# Placement planner: dense slots and one packed expert block per MoE layer, from the checkpoint's real tensor
+# sizes. Host only, like the name classifier.
+add_library(qwen35moe_placement OBJECT model/placement.cpp)
+target_include_directories(qwen35moe_placement PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(qwen35moe_placement PRIVATE qwen35moe_data qwen35moe_names)
