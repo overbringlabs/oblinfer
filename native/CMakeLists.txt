@@ -57,7 +57,7 @@ add_subdirectory(src/core)
 #   src/arch/inkling/kernels/<area> -> ingine_kernels_<area>   (aggregated by ingine_kernels)
 #   src/arch/inkling/model          -> ingine_model
 #   src/arch/qwen35moe              -> qwen35moe_data | qwen35moe_data_check  (header-only, always built)
-#   src/arch/qwen38                 -> qwen38_data | qwen38_data_check        (header-only, always built)
+#   src/arch/qwen38                 -> qwen38_data | qwen38_data_check | qwen38_gdn (always built)
 #   src/engine                      -> ingine_engine
 #   src/serve                       -> ingine_serve
 #   apps/serve|bench|validate       -> ingine-serve | ingine-bench | ingine-validate

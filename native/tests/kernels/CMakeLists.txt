@@ -6,3 +6,9 @@ ingine_add_test(NAME kernels_head SOURCES test_head.cpp LIBS ingine_kernels_head
 # every output bit of the M-wide weight-streaming and sliding-attention kernels (~1 GB of GPU memory)
 ingine_add_test(NAME kernels_bitlock SOURCES test_bitlock.cpp
   LIBS ingine_kernels_dense ingine_kernels_moe ingine_kernels_attn GPU TIMEOUT 600)
+
+# qwen38 GDN decode step: the FP64 reference runs everywhere (no GPU label, so ctest -LE gpu runs it); the
+# CUDA comparison inside skips until an sm_120 device runs the sm_120a build.
+if(TARGET qwen38_gdn)
+  ingine_add_test(NAME kernels_gdn SOURCES test_gdn.cpp LIBS qwen38_gdn CUDA::cudart ORACLE TIMEOUT 300)
+endif()
