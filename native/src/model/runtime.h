@@ -109,7 +109,7 @@ class Decoder {
   MappedHostBuffer hop_x_, hop_idx_, hop_rows_;  // pinned staging: xm, idx out; per-slot rows back
   SecondStorage hop_hi_;                   // xm, idx, act, rows on the second device
   DeviceBuffer hop_rows0_;                 // the rows as they land on this device
-  DeviceBuffer hop_rows1_;                 // the second device's shard rows (an interior split only)
+  DeviceBuffer hop_rows1_;                 // the shard rows, merged in on this device (an interior split only)
   // KV-head split (allocated only with options.kv_split; nothing here exists without it)
   struct SplitLayer {
     const float* q_scale = nullptr;  // full [24, 128] copy, indexed by the absolute head

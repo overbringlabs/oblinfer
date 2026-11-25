@@ -171,10 +171,11 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
     hop_hi_.buffers.emplace_back(C * TOP_K * INTER * 2);            // act
     hop_hi_.buffers.emplace_back(C * TOP_K * H * 2);                // per-slot rows
     hop_hi_.buffers.emplace_back(C * H * 2);                        // combined rows
-    if (shard) {  // a 64/64 split returns the second device's per-slot rows instead of one combined block
-      hop_rows_ = MappedHostBuffer(C * TOP_K * H * 2);
-      hop_rows0_ = DeviceBuffer(C * TOP_K * H * 2);
-    }
+  }
+  if (shard) {  // a 64/64 split returns the second device's per-slot rows instead of one combined block; they
+    // are merged here, so hop_rows0_ is a primary allocation: made outside the bind above
+    hop_rows_ = MappedHostBuffer(C * TOP_K * H * 2);
+    hop_rows0_ = DeviceBuffer(C * TOP_K * H * 2);
   }
   if (kv_split_) {
     const std::size_t CC = std::size_t(kVkThere) * HEAD_DIM;

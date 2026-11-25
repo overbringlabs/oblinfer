@@ -149,6 +149,9 @@ Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, con
   hop_idx_ = MappedHostBuffer(std::size_t(kHopMaxM) * TOP_K * 4);           // int32 [m, 8]
   hop_rows_ = MappedHostBuffer(std::size_t(kHopMaxM) * TOP_K * HIDDEN * 2);  // bf16 [m, 8, H]
   hop_rows0_ = DeviceBuffer(std::size_t(kHopMaxM) * TOP_K * HIDDEN * 2);
+  // The split's rows are merged here, so this one is a primary allocation: made before the bind below, which
+  // makes the second device current for the hop's own staging.
+  if (shard) hop_rows1_ = DeviceBuffer(std::size_t(kHopMaxM) * TOP_K * HIDDEN * 2);
   CUDA_CHECK(cudaEventCreateWithFlags(&hop_ready_, cudaEventDisableTiming));
   const BindDevice bind(second_->device);
   CUDA_CHECK(cudaEventCreateWithFlags(&hop_back_, cudaEventDisableTiming));
@@ -157,7 +160,6 @@ Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, con
   hop_hi_.buffers.emplace_back(std::size_t(kHopMaxM) * TOP_K * 4);           // idx
   hop_hi_.buffers.emplace_back(std::size_t(kHopMaxM) * TOP_K * INTER * 2);   // act
   hop_hi_.buffers.emplace_back(std::size_t(kHopMaxM) * TOP_K * HIDDEN * 2);  // per-slot rows
-  if (shard) hop_rows1_ = DeviceBuffer(std::size_t(kHopMaxM) * TOP_K * HIDDEN * 2);
 }
 
 Decoder::~Decoder() {
