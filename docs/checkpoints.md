@@ -22,7 +22,7 @@ repo that has not been inspected at all; its rows carry no size or precision cla
 
 | Checkpoint | What | Size | Precision / KV | Spec | Status |
 |---|---|---|---|---|---|
-| `thinkingmachines/Inkling-2-Mini` | base model, mixed NVFP4 (layers 0–19) + MXFP8 (20–23) | ~20 GB | 24 looped layers, 128 experts, hidden 2304; KV BF16 or FP8 | DSpark via `mtp.safetensors` | snapshot |
+| `thinkingmachines/Inkling-2-Mini` | base model, rev `c9d028302cd0`; `Inkling2LoopForConditionalGeneration`, packed experts (1244 tensors) | 20.16 GB, 2 shards | 24 looped layers, 128 experts top-8, hidden 2304; vision 422 tensors | DSpark via `mtp.safetensors` | verified |
 | `satellitedown/Inkling-2-Mini-abliterated-ingine` | abliterated checkpoint served today, pinned at `cea73d6` in `runtime-manifest.json` | 20.2 GB | same | `mtp.safetensors` 0.64 GB | **running** |
 
 ## `arch/qwen35moe` — first target
@@ -53,14 +53,16 @@ workspaces; one 32 GB card holds it comfortably.
 
 | Checkpoint | What | Size | Precision / KV | Spec | Status |
 |---|---|---|---|---|---|
-| `nvidia/Qwen3.6-27B-NVFP4` | 27B dense hybrid | † | † | † | scaffold (shape from snapshot) |
-| `nvidia/Qwen3.8-27B-NVFP4-QAD` | 27B dense hybrid, QAD-quantized | † | † | † | scaffold |
-| `RadixArk/DaisyRose-27B-NVFP4` | Qwen3.8-27B derivative | † | † | † | scaffold |
-| `RadixArk/Qwen3.8-27B-DSpark` | DSpark drafter for the 27B | † | — | `draft-dspark` | **drafter** |
+| `nvidia/Qwen3.6-27B-NVFP4` | 27B dense hybrid, rev `0893e1606ff3` | 21.92 GB, 3 shards, 2194 tensors | FP8 208 + NVFP4 193, **KV FP8**, vision 333 | MTP head, 15 tensors incl. `mtp.fc` | verified |
+| `nvidia/Qwen3.8-27B-NVFP4-QAD` | 27B dense hybrid, QAD export, rev `cd46ab575a5a` | 19.90 GB, **64 shards**, 2304 tensors | FP8 94 + NVFP4 307, **KV FP8**, vision 333 | MTP head, 11 tensors, **no `mtp.fc`** | verified |
+| `RadixArk/DaisyRose-27B-NVFP4` | Qwen3.8-27B derivative, rev `d7a485994f1c` | 21.92 GB, 6 shards, 2194 tensors | FP8 208 + NVFP4 193, **no KV calibration**, vision 333 | MTP head, 15 tensors incl. `mtp.fc` | verified |
+| `RadixArk/Qwen3.8-27B-DSpark` | DSpark drafter, rev `b9a5dbdf03bc`; ships `dspark.py` and `dflash.py` | 3.71 GB, single safetensors | 5 layers, hidden 5120, no vision, unquantized | `DSparkDraftModel`, `draft-dspark` | **drafter** |
 
 Shape per `docs/arch/qwen3.8-27b.config.json`: 64 layers (48 GDN + 16 full), hidden 5120, 24 heads /
-4 KV, head_dim 256, MLP 17408, 48 GDN value heads, 262,144 ctx, one MTP layer. `Qwen3.6-27B`
-publishes the same `text_config`, so it is the same pack and the same build shape.
+4 KV, head_dim 256, MLP 17408, 48 GDN value heads, 262,144 ctx, one MTP layer. All three 27B
+checkpoints publish the same `text_config`, so one build shape serves them. Two export differences
+matter: QAD's MTP block has no `mtp.fc` projection and its shards are 64 instead of 3–6, and
+DaisyRose ships no FP8 KV calibration, so FP8 KV there is our choice rather than the publisher's.
 
 Qwen3.5-9B and Qwen3.5-4B stay only as build shapes (`Shape9`, `Shape4`). They are de-emphasized:
 no NVFP4 checkpoint with MTP from a publisher we trust.
@@ -69,12 +71,13 @@ no NVFP4 checkpoint with MTP from a publisher we trust.
 
 | Checkpoint | What | Size | Precision / KV | Spec | Status |
 |---|---|---|---|---|---|
-| `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` | 30B-A3B hybrid Mamba/MoE | † | snapshot says NVFP4 experts, FP8 Mamba, KV FP8 | MTP, 2 physical layers | scaffold |
-| `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash` | DFlash drafter | † | — | `draft-dflash` | **drafter** |
+| `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` | 30B-A3B hybrid, rev `bee7596271d1` | 21.56 GB, 52 shards, 18,487 tensors | FP8 46 + NVFP4 5935, **KV FP8**, no vision | MTP head, 270 tensors, 1 nextn layer | verified |
+| `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash` | DFlash drafter, rev `8abcc4db8f34` | 1.18 GB, single safetensors | 6 layers, hidden 2688, NVFP4, excludes embeddings and self-attn | `DFlashDraftModel`, `draft-dflash` | **drafter** |
 
 Shape per `docs/arch/nemotron-lightning-30b-a3b.config.json`: 52 layers (23 Mamba-2 + 23 MoE +
-6 attention), hidden 2688, 128 experts top-6, shared expert 3712, 1,048,576 ctx on the NVFP4 card,
-`relu2` experts, MTP with two physical layers.
+6 attention), hidden 2688, 128 experts top-6, shared expert 3712, 1,048,576 ctx, `relu2` experts.
+The config says **one** nextn layer; the earlier note of two physical MTP layers came from the pack
+README and is wrong. Experts ship per expert: 17,920 expert tensors (`backbone.layers.*.mixer.*`).
 
 ## Later
 
@@ -83,10 +86,13 @@ Shape per `docs/arch/nemotron-lightning-30b-a3b.config.json`: 52 layers (23 Mamb
 | `RadixArk/Muse-Glimmer-NVFP4` | `MuseGlimmerForConditionalGeneration`, dense + vision | 52 layers (39 sliding-2048 + 13 full), hidden 6656, 32/2 heads, MLP 19968, vocab 202048, 131,072 ctx, untied | needs sliding-window attention and soft-capped logits; ~25B dense, no experts |
 | `LiquidAI/LFM3-1.7B-NVFP4` | `Lfm3ForCausalLM` | 24 layers (conv k=7, sliding-256, full every 4th), hidden 2048, 16/4 heads, 262,144 ctx | short-conv + sliding-window kernels; small win |
 
-## Verification queue
+## Verification state
 
-Everything marked † above, plus the snapshot rows, needs the same read performed on
-`nvidia/Qwen3.6-35B-A3B-NVFP4` on 2026-11-25: `config.json`, `hf_quant_config.json`, and the
-`weight_map` of `model.safetensors.index.json`. Per repo, that yields the exact shard sizes, the
-precision map, the expert and MTP layouts, and whether the MTP head ships with the base checkpoint
-or only in a separate drafter repo.
+Every row above is verified: `config.json`, `hf_quant_config.json` and the index `weight_map` were
+read from the Hub. What still needs a read before its pack is implemented:
+
+- the tokenizer pre-tokenizer regex and token counts per family (Qwen, Nemotron, Inkling);
+- the safetensors header of the NVIDIA 35B MTP block, to confirm the packed `gate_up_proj` shape
+  against Ornith's per-expert naming;
+- the exact dtype of `weight_scale` / `weight_scale_2` per export (fp8 e4m3 with a per-tensor fp32
+  scale is the modelopt default; the Ornith export omits `input_scale` entirely).
