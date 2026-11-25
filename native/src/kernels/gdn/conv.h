@@ -31,6 +31,23 @@ cudaError_t conv_silu_step(const ConvStepArgs& args, cudaStream_t stream);
 // Same maths on the host, for tests and the golden path.
 void conv_silu_step_cpu(const ConvStepArgs& args);
 
+// Qwen's in_proj_qkvz emits, per key head, [q(128), k(128), v(2 x 128), z(2 x 128)]. Some exporters keep that
+// grouping in `in_proj_qkv` (512 rows per key head) instead of emitting [all q | all k | all v]. This gathers
+// the grouped layout into the contiguous q/k/v the delta rule expects: q [16 x 128], k [16 x 128], v [32 x 128].
+struct GatherQkvArgs {
+  const float* qkv = nullptr;  // [2 * key_heads * key_dim + value_heads * value_dim]
+  float* q = nullptr;          // [key_heads * key_dim]
+  float* k = nullptr;          // [key_heads * key_dim]
+  float* v = nullptr;          // [value_heads * value_dim]
+  int key_heads = 0;
+  int key_dim = 0;
+  int value_heads = 0;
+  int value_dim = 0;
+};
+
+cudaError_t gather_qkv_grouped(const GatherQkvArgs& args, cudaStream_t stream);
+void gather_qkv_grouped_cpu(const GatherQkvArgs& args);
+
 struct GatedNormArgs {
   float* x = nullptr;             // [v_heads * v_dim], updated in place
   const float* z = nullptr;       // [v_heads * v_dim] gate projection

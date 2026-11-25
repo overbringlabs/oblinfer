@@ -21,4 +21,8 @@ void rms_norm_cpu(const float* x, const float* weight, float* y, int n, float ep
 cudaError_t embedding_row(const __nv_bfloat16* table, int row, float* out, int n, cudaStream_t stream);
 void embedding_row_cpu(const __nv_bfloat16* table, int row, float* out, int n);
 
+// index = argmax(x); ties resolve to the lower index. `value` may be null.
+cudaError_t argmax(const float* x, int n, int* index, float* value, cudaStream_t stream);
+int argmax_cpu(const float* x, int n);
+
 }  // namespace ingine::kernels::dense

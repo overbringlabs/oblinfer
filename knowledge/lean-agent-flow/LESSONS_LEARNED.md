@@ -29,3 +29,4 @@ rule: The guard, in one sentence, in the imperative.
 ## Rows
 
 | **Cross-device event nodes do not pair across graph launches** (2026-11-25) | cuda, graphs, ep | Rule: order two devices inside one step with cross-device child graph nodes, never with an event pair split across two graph launches. | `lessons_learned/20261125_cross-device-graph-events.md` |
+| **Self-consistent references prove nothing** (2026-11-26) | testing, numerics | An oracle from the same reading as the kernel only proves agreement; anchor interpretations to an external implementation. | `lessons_learned/20261126_self-consistent-oracles.md` |

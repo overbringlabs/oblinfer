@@ -87,6 +87,60 @@ void conv_silu_step_cpu(const ConvStepArgs& args) {
   }
 }
 
+namespace {
+
+// One block: every element of q, k and v is a copy from a known offset in the grouped qkv vector.
+__global__ void gather_qkv_kernel(GatherQkvArgs args) {
+  const int group = args.value_heads / args.key_heads;
+  const int qk = args.key_heads * args.key_dim;
+  const int vv = args.value_heads * args.value_dim;
+  const int per_group = 2 * args.key_dim + group * args.value_dim;  // q, k, then the group's value rows
+  const int dy = args.key_dim;
+  const int stride = gridDim.x * blockDim.x;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < 2 * qk + vv; i += stride) {
+    if (i < qk) {
+      const int h = i / dy, d = i % dy;
+      args.q[i] = args.qkv[h * per_group + d];
+    } else if (i < 2 * qk) {
+      const int j = i - qk;
+      const int h = j / dy, d = j % dy;
+      args.k[j] = args.qkv[h * per_group + dy + d];
+    } else {
+      const int j = i - 2 * qk;
+      const int h = j / args.value_dim, d = j % args.value_dim;
+      const int g = h / group, slot = h % group;
+      args.v[j] = args.qkv[g * per_group + 2 * dy + slot * args.value_dim + d];
+    }
+  }
+}
+
+}  // namespace
+
+cudaError_t gather_qkv_grouped(const GatherQkvArgs& args, cudaStream_t stream) {
+  if (!args.qkv || !args.q || !args.k || !args.v || args.key_heads <= 0 || args.key_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  gather_qkv_kernel<<<64, 256, 0, stream>>>(args);
+  return cudaGetLastError();
+}
+
+void gather_qkv_grouped_cpu(const GatherQkvArgs& args) {
+  const int group = args.value_heads / args.key_heads;
+  const int dy = args.key_dim;
+  const int per_group = 2 * dy + group * args.value_dim;
+  for (int h = 0; h < args.key_heads; ++h) {
+    for (int d = 0; d < dy; ++d) {
+      args.q[h * dy + d] = args.qkv[h * per_group + d];
+      args.k[h * dy + d] = args.qkv[h * per_group + dy + d];
+    }
+    for (int s = 0; s < group; ++s) {
+      for (int d = 0; d < args.value_dim; ++d) {
+        args.v[(h * group + s) * args.value_dim + d] = args.qkv[h * per_group + 2 * dy + s * args.value_dim + d];
+      }
+    }
+  }
+}
+
 cudaError_t gated_norm(GatedNormArgs args, cudaStream_t stream) {
   if (args.v_heads <= 0 || args.v_dim != kNormThreads || !args.x || !args.z || !args.weight) {
     return cudaErrorInvalidValue;

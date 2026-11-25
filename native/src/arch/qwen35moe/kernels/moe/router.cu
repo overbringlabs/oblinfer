@@ -32,6 +32,14 @@ __global__ __launch_bounds__(ROUTER_EXPERTS) void route_kernel(RouterArgs args) 
           pick = i;
         }
       }
+      if (pick < 0) {  // NaN logits or no candidate left: fall back to the lowest unused id
+        for (int i = 0; i < ROUTER_EXPERTS; ++i) {
+          if (!used[i]) {
+            pick = i;
+            break;
+          }
+        }
+      }
       used[pick] = true;
       best[k] = pick;
     }
@@ -71,6 +79,14 @@ void route_cpu(RouterArgs args) {
       if (!used[i] && logits[i] > best_value) {
         best_value = logits[i];
         pick = i;
+      }
+    }
+    if (pick < 0) {
+      for (int i = 0; i < ROUTER_EXPERTS; ++i) {
+        if (!used[i]) {
+          pick = i;
+          break;
+        }
       }
     }
     used[pick] = true;

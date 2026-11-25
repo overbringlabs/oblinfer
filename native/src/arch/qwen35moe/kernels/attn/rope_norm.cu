@@ -51,6 +51,17 @@ __global__ __launch_bounds__(kThreads) void norm_rope_kernel(NormRopeArgs args) 
   }
 }
 
+__global__ void split_q_gate_kernel(SplitQGateArgs args) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int n = args.heads * args.head_dim;
+  if (i >= n) return;
+  const int h = i / args.head_dim;
+  const int d = i % args.head_dim;
+  const int stride = 2 * args.head_dim;
+  args.q[i] = args.qgate[h * stride + d];
+  args.gate[i] = args.qgate[h * stride + args.head_dim + d];
+}
+
 __global__ void output_gate_kernel(OutputGateArgs args) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= args.count) return;
@@ -92,6 +103,25 @@ void qk_norm_rope_cpu(NormRopeArgs args) {
     float* x = args.k + std::size_t(h) * NORM_HEAD_DIM;
     norm(x, args.k_weight, args.eps);
     rope(x, args.pos);
+  }
+}
+
+cudaError_t split_q_gate(const SplitQGateArgs& args, cudaStream_t stream) {
+  if (!args.qgate || !args.q || !args.gate || args.heads <= 0 || args.head_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int n = args.heads * args.head_dim;
+  split_q_gate_kernel<<<(n + 255) / 256, 256, 0, stream>>>(args);
+  return cudaGetLastError();
+}
+
+void split_q_gate_cpu(const SplitQGateArgs& args) {
+  for (int h = 0; h < args.heads; ++h) {
+    for (int d = 0; d < args.head_dim; ++d) {
+      const int stride = 2 * args.head_dim;
+      args.q[h * args.head_dim + d] = args.qgate[h * stride + d];
+      args.gate[h * args.head_dim + d] = args.qgate[h * stride + args.head_dim + d];
+    }
   }
 }
 

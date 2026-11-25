@@ -46,3 +46,10 @@ endif()
 ingine_add_test(NAME model_qwen35moe_upload SOURCES test_qwen35moe_upload.cpp
                 LIBS qwen35moe_uploader qwen35moe_placement qwen35moe_names ingine_core CUDA::cudart
                 TIMEOUT 900)
+
+# One-token decoder smoke test on the real checkpoint (needs QWEN35MOE_SNAPSHOT)
+# OBJECT libraries do not propagate their objects, so every one the decoder calls is listed here.
+ingine_add_test(NAME model_qwen35moe_decoder SOURCES test_qwen35moe_decoder.cpp
+                LIBS qwen35moe_decoder qwen35moe_uploader qwen35moe_moe qwen35moe_attn
+                     qwen35moe_placement qwen35moe_names ingine_kernels_gdn ingine_kernels_quant
+                     ingine_kernels_dense_ops ingine_core CUDA::cudart TIMEOUT 1800)

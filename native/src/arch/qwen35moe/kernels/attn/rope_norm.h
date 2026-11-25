@@ -31,6 +31,19 @@ struct NormRopeArgs {
 cudaError_t qk_norm_rope(NormRopeArgs args, cudaStream_t stream);
 void qk_norm_rope_cpu(NormRopeArgs args);
 
+// q_proj emits, per head, [query(head_dim), gate(head_dim)]; the head loop of the reference chunks the last
+// dimension. This splits the flat projection into a contiguous query buffer and a contiguous gate buffer.
+struct SplitQGateArgs {
+  const float* qgate = nullptr;  // [heads * 2 * head_dim]
+  float* q = nullptr;            // [heads * head_dim]
+  float* gate = nullptr;         // [heads * head_dim]
+  int heads = 0;
+  int head_dim = 0;
+};
+
+cudaError_t split_q_gate(const SplitQGateArgs& args, cudaStream_t stream);
+void split_q_gate_cpu(const SplitQGateArgs& args);
+
 struct OutputGateArgs {
   float* x = nullptr;            // [heads * head_dim], updated in place
   const float* gate = nullptr;   // same length, sigmoid applied here

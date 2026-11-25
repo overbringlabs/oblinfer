@@ -47,6 +47,48 @@ __global__ __launch_bounds__(kThreads) void rms_norm_kernel(const float* x, cons
   for (int i = threadIdx.x; i < n; i += kThreads) y[i] = x[i] * inv * weight[i];
 }
 
+__global__ __launch_bounds__(kThreads) void argmax_kernel(const float* x, int n, int* index, float* value) {
+  __shared__ float warp_values[kThreads / 32];
+  __shared__ int warp_indices[kThreads / 32];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+
+  float best = -INFINITY;
+  int best_i = 0;
+  for (int i = threadIdx.x; i < n; i += kThreads) {
+    if (x[i] > best) {
+      best = x[i];
+      best_i = i;
+    }
+  }
+  // Warp reduction keeping the lower index on ties.
+  for (int off = 16; off > 0; off >>= 1) {
+    const float other = __shfl_down_sync(0xffffffffu, best, off);
+    const int other_i = __shfl_down_sync(0xffffffffu, best_i, off);
+    if (other > best || (other == best && other_i < best_i)) {
+      best = other;
+      best_i = other_i;
+    }
+  }
+  if (lane == 0) {
+    warp_values[warp] = best;
+    warp_indices[warp] = best_i;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float top = warp_values[0];
+    int top_i = warp_indices[0];
+    for (int w = 1; w < kThreads / 32; ++w) {
+      if (warp_values[w] > top || (warp_values[w] == top && warp_indices[w] < top_i)) {
+        top = warp_values[w];
+        top_i = warp_indices[w];
+      }
+    }
+    *index = top_i;
+    if (value) *value = top;
+  }
+}
+
 __global__ void embedding_row_kernel(const __nv_bfloat16* table, int row, float* out, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -91,6 +133,20 @@ cudaError_t embedding_row(const __nv_bfloat16* table, int row, float* out, int n
 
 void embedding_row_cpu(const __nv_bfloat16* table, int row, float* out, int n) {
   for (int i = 0; i < n; ++i) out[i] = __bfloat162float(table[std::size_t(row) * n + i]);
+}
+
+cudaError_t argmax(const float* x, int n, int* index, float* value, cudaStream_t stream) {
+  if (!x || !index || n <= 0) return cudaErrorInvalidValue;
+  argmax_kernel<<<1, kThreads, 0, stream>>>(x, n, index, value);
+  return cudaGetLastError();
+}
+
+int argmax_cpu(const float* x, int n) {
+  int best = 0;
+  for (int i = 1; i < n; ++i) {
+    if (x[i] > x[best]) best = i;
+  }
+  return best;
 }
 
 }  // namespace ingine::kernels::dense
