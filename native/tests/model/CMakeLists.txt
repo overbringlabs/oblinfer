@@ -1,4 +1,6 @@
 ingine_add_test(NAME model_data SOURCES test_model_data.cpp LIBS ingine_core)
+# both Qwen3.6-35B-A3B export dialects map onto one set of typed tensor keys (host only)
+ingine_add_test(NAME model_qwen35moe_names SOURCES test_qwen35moe_names.cpp LIBS qwen35moe_names TIMEOUT 120)
 # one real layer at a time (~1.1 GB of GPU memory)
 ingine_add_test(NAME model_layer SOURCES test_layer.cpp LIBS ingine_model GPU MODEL TIMEOUT 600)
 # the decode runtime (graphs, verify widths, rollback, pipelined steps, device-selected verify) and the Generator's

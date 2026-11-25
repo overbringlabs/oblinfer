@@ -8,3 +8,9 @@ target_sources(qwen35moe_data INTERFACE model/model_data.h)
 
 add_library(qwen35moe_data_check OBJECT model/model_data_check.cpp)
 target_link_libraries(qwen35moe_data_check PRIVATE qwen35moe_data)
+
+# Host-only tensor-name classifier (and, later, the placement planner): compiled on every build so it cannot rot,
+# and not linked into ingine-serve. The model_qwen35moe_names test links it.
+add_library(qwen35moe_names OBJECT model/tensor_names.cpp)
+target_include_directories(qwen35moe_names PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(qwen35moe_names PRIVATE qwen35moe_data)
