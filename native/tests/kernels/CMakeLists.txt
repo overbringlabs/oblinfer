@@ -36,11 +36,17 @@ endif()
 # Qwen3.6-35B-A3B router: 256 bf16 logits, top 8, softmax over the selected logits
 if(TARGET qwen35moe_moe)
   ingine_add_test(NAME kernels_qwen35moe_router SOURCES test_qwen35moe_router.cpp
-                  LIBS qwen35moe_moe CUDA::cudart ORACLE TIMEOUT 300)
+                  LIBS qwen35moe_moe ingine_kernels_quant CUDA::cudart ORACLE TIMEOUT 300)
 endif()
 
 # Qwen3.6-35B-A3B routed-expert math: silu(gate x) * (up x), summed with the router weights
 if(TARGET qwen35moe_moe)
   ingine_add_test(NAME kernels_qwen35moe_moe SOURCES test_qwen35moe_moe.cpp
+                  LIBS qwen35moe_moe ingine_kernels_quant CUDA::cudart ORACLE TIMEOUT 300)
+endif()
+
+# Qwen3.6-35B-A3B shared expert: sigmoid(shared_expert_gate x) * down(silu(gate x) * up x)
+if(TARGET qwen35moe_moe)
+  ingine_add_test(NAME kernels_qwen35moe_shared_expert SOURCES test_qwen35moe_shared_expert.cpp
                   LIBS qwen35moe_moe ingine_kernels_quant CUDA::cudart ORACLE TIMEOUT 300)
 endif()
