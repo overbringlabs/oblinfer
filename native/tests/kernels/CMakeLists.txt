@@ -50,3 +50,9 @@ if(TARGET qwen35moe_moe)
   ingine_add_test(NAME kernels_qwen35moe_shared_expert SOURCES test_qwen35moe_shared_expert.cpp
                   LIBS qwen35moe_moe ingine_kernels_quant CUDA::cudart ORACLE TIMEOUT 300)
 endif()
+
+# Unquantized dense ops: bf16 GEMV, RMSNorm, embedding lookup
+if(TARGET ingine_kernels_dense_ops)
+  ingine_add_test(NAME kernels_dense_ops SOURCES test_dense_ops.cpp
+                  LIBS ingine_kernels_dense_ops CUDA::cudart ORACLE TIMEOUT 300)
+endif()
