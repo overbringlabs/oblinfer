@@ -20,3 +20,9 @@ if(TARGET qwen35moe_attn)
   ingine_add_test(NAME kernels_qwen35moe_attn SOURCES test_qwen35moe_attn.cpp
                   LIBS qwen35moe_attn CUDA::cudart ORACLE TIMEOUT 300)
 endif()
+
+# q/k RMSNorm + partial rotary and the output gate of the Qwen3.6-35B-A3B attention layers
+if(TARGET qwen35moe_attn)
+  ingine_add_test(NAME kernels_qwen35moe_rope_norm SOURCES test_qwen35moe_rope_norm.cpp
+                  LIBS qwen35moe_attn CUDA::cudart ORACLE TIMEOUT 300)
+endif()
