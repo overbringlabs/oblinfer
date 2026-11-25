@@ -38,3 +38,4 @@ question: What this ruling decides
 | **Go EP steps 1–2** (2026-11-24, standing) | serving, gpu | Isaak A: second device + residency table. Flag off = today's behaviour. | `decisions/20261124_go-ep-step1-2.md` |
 | **DSpark on the eager step** (2026-11-24, standing) | serving, gpu | Isaak A: spec verifies eagerly across the two devices; dual graphs later. Prefill one token per step under EP. | `decisions/20261124_ep-spec-eager.md` |
 | **PCIe EP, not PP** (2026-11-24, superseded by D-20261124-04) | serving, gpu | Same-day: PP is back on the table. | `decisions/20261124_pcie-ep-not-pp.md` |
+| **Target checkpoint set** (2026-11-25, standing) | scope, serving | These specific NVFP4 checkpoints define support per pack; Qwen3.5-9B/4B stay shapes only. | `decisions/20261125_target-checkpoints.md` |
