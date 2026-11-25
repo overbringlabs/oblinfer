@@ -29,7 +29,8 @@ target_include_directories(qwen35moe_attn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(qwen35moe_attn PRIVATE qwen35moe_data CUDA::cudart)
 
 # MoE decode: router (top-8 over 256 experts) and, next, the grouped expert kernels.
-add_library(qwen35moe_moe OBJECT kernels/moe/router.cu kernels/moe/moe_apply.cu kernels/moe/shared_expert.cu)
+add_library(qwen35moe_moe OBJECT kernels/moe/router.cu kernels/moe/moe_apply.cu kernels/moe/shared_expert.cu
+                                  kernels/moe/fused_experts.cu)
 ingine_cuda_target(qwen35moe_moe)
 target_include_directories(qwen35moe_moe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(qwen35moe_moe PUBLIC ingine_kernels_quant PRIVATE qwen35moe_data CUDA::cudart)

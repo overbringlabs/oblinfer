@@ -53,3 +53,9 @@ ingine_add_test(NAME model_qwen35moe_decoder SOURCES test_qwen35moe_decoder.cpp
                 LIBS qwen35moe_decoder qwen35moe_uploader qwen35moe_moe qwen35moe_attn
                      qwen35moe_placement qwen35moe_names ingine_kernels_gdn ingine_kernels_quant
                      ingine_kernels_dense_ops ingine_core CUDA::cudart TIMEOUT 1800)
+
+# Depth benchmark: prefill then decode, tok/s only (QWEN35MOE_DEPTH, QWEN35MOE_GEN)
+ingine_add_test(NAME model_qwen35moe_bench SOURCES test_qwen35moe_bench.cpp
+                LIBS qwen35moe_decoder qwen35moe_uploader qwen35moe_moe qwen35moe_attn
+                     qwen35moe_placement qwen35moe_names ingine_kernels_gdn ingine_kernels_quant
+                     ingine_kernels_dense_ops ingine_core CUDA::cudart TIMEOUT 5400)

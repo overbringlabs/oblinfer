@@ -14,6 +14,11 @@ constexpr int kWarps = kDim / 32;    // 8 warps: one position each per step
 constexpr int kGroup = ATTN_HEADS / ATTN_KV_HEADS;
 static_assert(ATTN_HEADS % ATTN_KV_HEADS == 0, "query heads must divide evenly over KV heads");
 
+// head_count > 0, so ATTN_HEADS - head_begin bounds the largest legal range without overflowing.
+bool head_range_valid(const DecodeAttnArgs& args) {
+  return args.head_begin >= 0 && args.head_count > 0 && args.head_count <= ATTN_HEADS - args.head_begin;
+}
+
 __device__ __forceinline__ float warp_sum(float v) {
   for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
   return v;
@@ -29,7 +34,7 @@ __global__ void kv_store_kernel(DecodeAttnArgs args) {
 }
 
 __global__ __launch_bounds__(kDim) void decode_kernel(DecodeAttnArgs args) {
-  const int h = blockIdx.x;
+  const int h = args.head_begin + blockIdx.x;  // absolute query head; the grid is the head range
   const int d = threadIdx.x;
   const int kh = h / kGroup;
   const int warp = threadIdx.x >> 5;
@@ -122,12 +127,15 @@ cudaError_t decode_attention(const DecodeAttnArgs& args, cudaStream_t stream) {
     return cudaErrorInvalidValue;
   }
   if (args.pos < 0 || args.pos >= args.max_pos) return cudaErrorInvalidValue;
+  if (!head_range_valid(args)) return cudaErrorInvalidValue;
   kv_store_kernel<<<ATTN_KV_HEADS, kDim, 0, stream>>>(args);
-  decode_kernel<<<ATTN_HEADS, kDim, 0, stream>>>(args);
+  decode_kernel<<<args.head_count, kDim, 0, stream>>>(args);
   return cudaGetLastError();
 }
 
 void decode_attention_cpu(const DecodeAttnArgs& args) {
+  if (!head_range_valid(args)) return;
+
   for (int h = 0; h < ATTN_KV_HEADS; ++h) {
     for (int d = 0; d < kDim; ++d) {
       const std::size_t at = (std::size_t(args.pos) * ATTN_KV_HEADS + h) * kDim + d;
@@ -140,7 +148,8 @@ void decode_attention_cpu(const DecodeAttnArgs& args) {
   std::vector<double> q(ATTN_HEADS * kDim);
   for (int i = 0; i < ATTN_HEADS * kDim; ++i) q[std::size_t(i)] = double(args.q[i]);
   std::vector<double> score(args.pos + 1);
-  for (int h = 0; h < ATTN_HEADS; ++h) {
+  for (int hh = 0; hh < args.head_count; ++hh) {
+    const int h = args.head_begin + hh;
     const int kh = h / kGroup;
     double m = -INFINITY;
     for (int i = 0; i <= args.pos; ++i) {

@@ -45,6 +45,13 @@ if(TARGET qwen35moe_moe)
                   LIBS qwen35moe_moe ingine_kernels_quant CUDA::cudart ORACLE TIMEOUT 300)
 endif()
 
+# Qwen3.6-35B-A3B token-major fused experts: one launch per projection over the eight selected experts,
+# with the router ids and weights read on the device
+if(TARGET qwen35moe_moe)
+  ingine_add_test(NAME kernels_qwen35moe_fused_experts SOURCES test_qwen35moe_fused_experts.cpp
+                  LIBS qwen35moe_moe ingine_kernels_quant CUDA::cudart ORACLE TIMEOUT 300)
+endif()
+
 # Qwen3.6-35B-A3B shared expert: sigmoid(shared_expert_gate x) * down(silu(gate x) * up x)
 if(TARGET qwen35moe_moe)
   ingine_add_test(NAME kernels_qwen35moe_shared_expert SOURCES test_qwen35moe_shared_expert.cpp
