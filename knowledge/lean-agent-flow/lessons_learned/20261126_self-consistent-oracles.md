@@ -23,3 +23,14 @@ Rule for next time: an oracle must come from a different lineage. For a checkpoi
 reference code path (transformers' module code, a vLLM/llama.cpp loader) or a converted artifact of the same
 weights — not the same maths re-derived from the same tensor names. Use my own reference only to catch
 regressions after the interpretation is anchored by something external.
+
+## Resolution
+
+HF's `Qwen3_5MoeRMSNorm` is `x/rms * (1 + weight)`; only `Qwen3_5MoeRMSNormGated` (the GDN norm) uses `weight`.
+The engine applied `weight` everywhere, so every layer was slightly wrong and the model degenerated while every
+magnitude stayed plausible.
+
+The oracle that found it: HF's own `Qwen3_5MoeDecoderLayer`, instantiated on CPU with the checkpoint's layer-0
+weights (259 MB of tensors extracted to BF16), disagreed with the engine by 0.74. No amount of agreement between
+my kernel and my numpy could outvote the publisher's module. After the fix, 16/16 greedy ids match llama.cpp on
+two prompts.

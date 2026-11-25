@@ -82,8 +82,9 @@ void* Decoder::ptr(const std::string& name) const {
   return static_cast<std::byte*>(arena_->spans[std::size_t(p.span)].device) + p.offset;
 }
 
-const float* Decoder::f32(const std::string& name) {
-  const auto hit = f32_.find(name);
+const float* Decoder::f32(const std::string& name, bool plus_one) {
+  const std::string key = plus_one ? name + "#1" : name;
+  const auto hit = f32_.find(key);
   if (hit != f32_.end()) return hit->second;
   const auto it = placed_.find(name);
   if (it == placed_.end()) throw std::runtime_error("tensor not placed: " + name);
@@ -92,10 +93,10 @@ const float* Decoder::f32(const std::string& name) {
   std::vector<__nv_bfloat16> staging(count);
   check(cudaMemcpy(staging.data(), ptr(name), p.bytes, cudaMemcpyDeviceToHost), "bf16 read");
   std::vector<float> fp32(count);
-  for (std::size_t i = 0; i < count; ++i) fp32[i] = __bfloat162float(staging[i]);
+  for (std::size_t i = 0; i < count; ++i) fp32[i] = __bfloat162float(staging[i]) + (plus_one ? 1.0f : 0.0f);
   float* device = static_cast<float*>(alloc(count * 4));
   check(cudaMemcpy(device, fp32.data(), count * 4, cudaMemcpyHostToDevice), "fp32 write");
-  f32_[name] = device;
+  f32_[key] = device;
   return device;
 }
 
@@ -365,10 +366,11 @@ void Decoder::full_layer(int l, int pos) {
   attn::NormRopeArgs rope;
   rope.q = q_attn_;
   rope.k = k_;
-  rope.q_weight = f32(p + "q_norm.weight");
-  rope.k_weight = f32(p + "k_norm.weight");
+  rope.q_weight = f32(p + "q_norm.weight", true);
+  rope.k_weight = f32(p + "k_norm.weight", true);
   rope.pos = pos;
   rope.eps = EPS;
+  rope.interleaved = std::getenv("QWEN35MOE_INTERLEAVED_ROPE") != nullptr;
   check(attn::qk_norm_rope(rope, nullptr), "qk norm rope");
 
   attn::DecodeAttnArgs dec;
@@ -517,7 +519,7 @@ bool Decoder::step(int token, int pos, int* next_token, std::string* error) {
         std::printf("[step] pos=%d layer=%d\n", pos, l);
         std::fflush(stdout);
       }
-      check(dense::rms_norm(x_, f32(layer_name(l, "input_layernorm.weight")), h_, HIDDEN, EPS, nullptr),
+      check(dense::rms_norm(x_, f32(layer_name(l, "input_layernorm.weight"), true), h_, HIDDEN, EPS, nullptr),
             "input norm");
       if (is_full_layer(l)) {
         full_layer(l, pos);
@@ -539,9 +541,17 @@ bool Decoder::step(int token, int pos, int* next_token, std::string* error) {
         for (int i = 0; i < 4; ++i) std::printf(" %.9g", out[std::size_t(i)]);
         std::printf("\n");
       }
+      if (std::getenv("QWEN35MOE_DUMP") && pos == 0 && l == 0) {
+        std::vector<float> host(HIDDEN);
+        check(cudaMemcpy(host.data(), y_, HIDDEN * 4, cudaMemcpyDeviceToHost), "save mixer");
+        if (FILE* f = std::fopen("/tmp/qwen_layer0_mixer.bin", "wb")) {
+          std::fwrite(host.data(), 4, HIDDEN, f);
+          std::fclose(f);
+        }
+      }
       check(attn::axpy(x_, y_, 1.0f, HIDDEN, nullptr), "residual");
 
-      check(dense::rms_norm(x_, f32(layer_name(l, "post_attention_layernorm.weight")), h2_, HIDDEN, EPS, nullptr),
+      check(dense::rms_norm(x_, f32(layer_name(l, "post_attention_layernorm.weight"), true), h2_, HIDDEN, EPS, nullptr),
             "post norm");
       moe(l);
       if (std::getenv("QWEN35MOE_DUMP") && pos == 0 && (l < 4 || l == 39)) {
@@ -589,7 +599,7 @@ bool Decoder::step(int token, int pos, int* next_token, std::string* error) {
       }
     }
 
-    check(dense::rms_norm(x_, f32("model.language_model.norm.weight"), h_, HIDDEN, EPS, nullptr), "final norm");
+    check(dense::rms_norm(x_, f32("model.language_model.norm.weight", true), h_, HIDDEN, EPS, nullptr), "final norm");
     nvfp4_gemv("lm_head", h_, logits_, VOCAB, HIDDEN);
     check(dense::argmax(logits_, VOCAB, argmax_dev_, nullptr, nullptr), "argmax");
     int index = 0;

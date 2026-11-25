@@ -101,25 +101,28 @@ int main(int argc, char** argv) {
       cudaEventRecord(e);
       return e;
     }();
-    for (int i = 0; i < int(prompt.size()) + kGenerate; ++i) {
-      // `next` holds the argmax of the previous step: that is the token the model generated for this slot.
-      const int token = i < int(prompt.size()) ? prompt[std::size_t(i)] : next;
-      const int pos = i;
-      if (!decoder.step(token, pos, &next, &error)) {
-        std::printf("FAIL step %d: %s\n", i, error.c_str());
+    // Prefill: the argmax after the last prompt token is the first generated token.
+    for (int i = 0; i < int(prompt.size()); ++i) {
+      if (!decoder.step(prompt[std::size_t(i)], i, &next, &error)) {
+        std::printf("FAIL prefill %d: %s\n", i, error.c_str());
         return 1;
       }
-      if (i == 0) {
-        std::printf("step 0 ok\n");
-        std::fflush(stdout);
-      }
+    }
+    for (int j = 0; j < kGenerate; ++j) {
+      out.push_back(next);
       if (!finite(decoder.logits())) {
-        std::printf("FAIL step %d: non-finite logits\n", i);
+        std::printf("FAIL step %d: non-finite logits\n", j);
         ok = false;
         break;
       }
-      if (i >= int(prompt.size())) out.push_back(next);
+      const int pos = int(prompt.size()) + j;
+      if (!decoder.step(next, pos, &next, &error)) {
+        std::printf("FAIL decode %d: %s\n", j, error.c_str());
+        return 1;
+      }
     }
+    std::printf("step 0 ok\n");
+    std::fflush(stdout);
     cudaEvent_t stop;
     cudaEventCreate(&stop);
     cudaEventRecord(stop);

@@ -52,7 +52,8 @@ class Decoder {
 
   void* ptr(const std::string& name) const;
   // FP32 view of a BF16 checkpoint tensor (norms, A_log, dt_bias, conv1d): converted once at first use.
-  const float* f32(const std::string& name);
+  // `plus_one` applies the Qwen3_5MoeRMSNorm convention y = x/rms * (1 + w); the GDN gated norm uses w.
+  const float* f32(const std::string& name, bool plus_one = false);
   float scalar(const std::string& name, float fallback) const;
   void fp8_gemv(const std::string& base, const float* x, float* y, int rows, int cols);
   void nvfp4_gemv(const std::string& base, const float* x, float* y, int rows, int cols);
