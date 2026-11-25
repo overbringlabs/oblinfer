@@ -145,16 +145,18 @@ C++ mirrors of `weights.Weights`/`Layer`/`Experts`, `model.State` and `fast.Buff
 Python names (`t["wq"]` -> `layer.wq`, `state.k_ring`, `buffers.taps`, ...), shapes and dtypes identical, plus
 the visit plan and constants of `weights.py`. The decode step, the prefill and the drafter share this header.
 
-Expert residency across two devices (EP step 2) is a load-time table. `ExpertResidency` in
+Expert residency across two devices (EP) is a load-time table. `ExpertResidency` in
 `include/ingine/generator.h` (CUDA-free, like the rest of `RuntimeOptions`) holds, per layer, how many of that
 layer's 128 experts stay on the primary device; `load_weights(dir, dense_fp8, stream, second, residency)`
-places a layer's four expert tensors and their factors whole on the device the table names (`Experts::split`,
-the `_hi` views, `Weights::storage_hi`, freed with their own device current), one granule of 546.75 MiB NVFP4 /
+places a layer's four expert tensors and their factors on the device(s) the table names (`Experts::split`, the
+`_hi` views, `Weights::storage_hi`, freed with their own device current), one granule of 546.75 MiB NVFP4 /
 1002.4 MiB MXFP8 per layer. The default table is all-primary: no second uploader, no second allocation, the same
-allocations in the same order on the same stream. Only `0` and `EXPERTS` are loadable - the moe kernels take one
-base pointer per expert tensor and address rows as `e*R`, so a split inside a layer is step 3.
+allocations in the same order on the same stream. `0` (the whole layer there), `EXPERTS` (all here) and
+`EXPERTS / 2` load: at 64 each device holds one contiguous half (`[0, 64)` here, `[64, 128)` there), its rows
+only, addressed by the local expert id `e - base` (`moe_up` / `moe_down_rows` / the grouped GEMMs take
+`ebase, ecount` and skip slots and tiles of the other shard).
 
-Decode then reads the table (EP step 4). A visit whose layer has `split == 0` runs its experts on the second
+Decode then reads the table. A visit whose layer has `split == 0` runs its experts on the second
 device (`Decoder::expert_hop`): GPU0's `xm` (bf16 `[m, H]`, 4.6 KiB at m = 1) and `idx` go to pinned host
 staging, `moe_up` and `moe_down_rows` run there, one BF16 row per slot comes back (36 KiB at m = 1), and this
 device's `moe_sum` does `moe_down`'s slot-ordered FP32 weighted sum and post-MLP conv. The rows are the values
@@ -163,14 +165,25 @@ the fused epilogue sums, so the split is bit-identical to the one-device path (t
 peer access, ordered by one non-timing event pair per visit and never by a host wait. Layers with
 `split == EXPERTS` keep the fused `moe_up`/`moe_down` pair, so the default table copies nothing.
 
+A 64/64 visit (`Decoder::expert_split_hop`) runs both devices at once: each streams its half of the routed 8
+experts for the slots that chose them (`moe_up` + `moe_down_rows`, the other shard's slots skipped), the second
+device's per-slot rows hop back, `moe_rows_merge` writes them into this device's row buffer by slot and
+`moe_sum` sums all 8 in k order here. Both GDDR buses stream the same routing, and the merged rows are again the
+values the fused epilogue reads, so the result is bit-identical to the one-device path.
+
 That step spans two devices, and a CUDA graph belongs to one, so an expert split decodes eagerly
 (`Runtime::init` skips capture, `run_step` falls back to `run_step_eager`).
 
 The prompt path hops too (`Prefiller::expert_hop`): a visit whose layer has `split == 0` sends its `xm`
 (bf16 `[T, H]`) and the router's tile and pair lists over the same pinned staging, the second device runs the
 grouped gate/up, down and slot-ordered combine GEMMs, and one bf16 `[T, H]` block of combined rows comes back
-for the post-MLP conv - bit-identical to the one-device chunk, for the same reason. The hop is per visit per
-chunk, not per token, so a split prompt costs 48 round trips per 3072-token chunk instead of one per token.
+for the post-MLP conv - bit-identical to the one-device chunk, for the same reason. A 64/64 visit
+(`Prefiller::expert_split_hop`) runs this device's grouped gate/up and down over its tiles while the second
+device runs its own; the second device's per-pair rows come back, `moe_rows_merge` fills this device's rows at
+the slots whose expert is `>= 64`, and `moe_combine` sums the slots in order here. The hop is per visit per
+chunk, not per token, so a split prompt costs 48 round trips per 3072-token chunk instead of one per token; the
+64/64 hop moves the second device's per-pair rows (`T * 8 * H` bf16, 8x the combined block) because the slot
+order is only reproducible where all 8 slots are.
 
 The KV-head split (`options.kv_split`, 3 of the 8 full-attention heads on the second device) is written by both
 paths: decode runs one launch per device (`Decoder::full_attn_split`), a chunked prefill likewise

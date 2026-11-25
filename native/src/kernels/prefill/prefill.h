@@ -165,6 +165,10 @@ void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream);
 
 struct MoeExperts {
   int fmt = 0;  // 0 NVFP4, 1 MXFP8 (weights.py layouts)
+  // The contiguous expert shard these weights hold: experts [ebase, ebase + ecount), each tensor's rows
+  // starting at its first expert. The defaults are the whole table.
+  int ebase = 0;
+  int ecount = kExperts;
   const void* w13 = nullptr;
   const void* w13_scale = nullptr;
   const float* w13_factor = nullptr;
@@ -173,7 +177,8 @@ struct MoeExperts {
   const float* w2_factor = nullptr;
 };
 // act[pair] = bf16(softcap(g, 4) * sigmoid(g) * softcap(u, 25)), g/u = bf16(W13_e . x[token]) (experts decoded
-// exactly as model.decode_experts). x bf16 [T, H], act bf16 [T * 8, 1152] by sorted pair.
+// exactly as model.decode_experts). x bf16 [T, H], act bf16 [T * 8, 1152] by sorted pair. Tiles whose expert is
+// outside the shard are skipped (the device holding it runs them), so a shard may take a subset of the tiles.
 void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
                  cudaStream_t stream);
 // down[t * 8 + slot] = bf16(W2_e . act[pair]), bf16 [T * 8, H].
@@ -181,6 +186,10 @@ void moe_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWor
               cudaStream_t stream);
 // out[t] = bf16(sum over slots in order of down[t, slot] * wts[t, slot]), bf16 [T, H].
 void moe_combine(const __nv_bfloat16* down, const float* wts, int T, __nv_bfloat16* out, cudaStream_t stream);
+// down[p] = down_hi[p] for every slot p = t * 8 + k whose expert is >= ebase (the slots the second device's
+// shard owns in a 64/64 split); the others keep the rows this device wrote. Both bf16 [T * 8, H].
+void moe_rows_merge(__nv_bfloat16* down, const __nv_bfloat16* down_hi, const int* idx, int T, int ebase,
+                    cudaStream_t stream);
 
 // ------------------------------------------------------------------------------------------------ misc
 

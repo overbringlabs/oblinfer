@@ -97,21 +97,14 @@ void Runtime::open_second_device() {
 
 void Runtime::init() {
   const RuntimeOptions& options = options_;
-  // EP step 4: a layer whose experts all live on the second device is decoded there (Decoder::expert_hop) —
-  // one hop per visit of such a layer, no peer access, per-slot BF16 rows summed here. A split inside a layer
-  // still needs per-expert base pointers, which the loader refuses (validate_residency). A step that spans two
-  // devices cannot be captured as one CUDA graph (a graph belongs to one device), so it runs eager: run_step
-  // falls back to run_step_eager, and the speculative loop verifies eagerly as well (SpecLoop reads the verify
-  // width back and runs the step instead of the captured switch; dual graphs would buy launch overhead only).
+  // Expert parallelism: a layer whose experts are not all on this device is decoded across both (a whole
+  // layer there: Decoder::expert_hop; a 64/64 split: Decoder::expert_split_hop) — one hop per visit, no peer
+  // access, per-slot BF16 rows summed here. A step that spans two devices cannot be captured as one CUDA graph
+  // (a graph belongs to one device), so it runs eager: run_step falls back to run_step_eager, and the
+  // speculative loop verifies eagerly as well (SpecLoop reads the verify width back and runs the step instead
+  // of the captured switch; dual graphs would buy launch overhead only).
   ep_ = false;
-  for (const Layer& l : weights_.layers) {
-    if (l.experts.split == EXPERTS) continue;
-    if (l.experts.split != 0) {
-      throw std::invalid_argument("expert residency: layer " + std::to_string(l.idx) + " splits its experts inside "
-                                  "the layer, which needs per-expert base pointers (step 3 of the EP plan)");
-    }
-    ep_ = true;
-  }
+  for (const Layer& l : weights_.layers) ep_ = ep_ || l.experts.split != EXPERTS;
   if (ep_ && second_device_ == nullptr) {
     throw std::invalid_argument("expert residency: an expert shard needs the second device (options.second_gpu)");
   }

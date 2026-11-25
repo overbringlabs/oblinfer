@@ -125,7 +125,7 @@ int main(int argc, char** argv) {
     };
     auto experts = [](const Layer& L) {
       const Experts& e = L.experts;
-      return pk::MoeExperts{e.fmt == ExpertFormat::NVFP4 ? 0 : 1, e.w13.data, e.w13_scale.data,
+      return pk::MoeExperts{e.fmt == ExpertFormat::NVFP4 ? 0 : 1, 0, pk::kExperts, e.w13.data, e.w13_scale.data,
                             static_cast<const float*>(e.w13_factor.data), e.w2.data, e.w2_scale.data,
                             static_cast<const float*>(e.w2_factor.data)};
     };

@@ -15,10 +15,11 @@
 
 namespace ingine::model {
 
-// Expert residency across two devices (EP step 2: load-time placement): split[l] is the number of layer l's
-// LAYER_EXPERTS experts kept on the primary device, the rest live on the second one. Only 0 (the whole layer's
-// experts there) and LAYER_EXPERTS (all here) are loadable: moe_up/moe_down take one base pointer per expert
-// tensor, so a split inside a layer needs per-expert bases (step 3). Default: every expert on the primary.
+// Expert residency across two devices (EP, load-time placement): split[l] is the number of layer l's
+// LAYER_EXPERTS experts kept on the primary device, the rest live on the second one. 0 (the whole layer's
+// experts there), LAYER_EXPERTS (all here) and LAYER_EXPERTS / 2 (contiguous halves: [0, 64) here, [64, 128)
+// there, `--expert-split 64`) are loadable; each device holds its shard's rows only and indexes them locally
+// (e - base). Default: every expert on the primary.
 inline constexpr int EXPERT_RESIDENCY_LAYERS = 24;  // = model.LAYERS
 inline constexpr int LAYER_EXPERTS = 128;           // = model.EXPERTS
 
@@ -121,17 +122,17 @@ struct RuntimeOptions {
   // (expert_residency) and their visits run there. Decode's other kernels stay on the first device. Negative:
   // one device.
   int second_gpu = -1;
-  // Where each layer's experts live (default: all on this device). Only 0 (the whole layer's experts there) and
-  // LAYER_EXPERTS load: the moe kernels take one base pointer per expert tensor, so a split inside a layer needs
-  // per-expert bases (step 3). With any layer moved, a decode step spans two devices: it runs eagerly (no CUDA
-  // graph) and DSpark verifies eagerly at one extra host synchronisation per round. A prompt is prefilled in
-  // chunks, hopping each remote layer's grouped expert GEMM.
+  // Where each layer's experts live (default: all on this device). 0 (the whole layer's experts there),
+  // LAYER_EXPERTS and LAYER_EXPERTS / 2 (64/64 contiguous halves, --expert-split 64) load. With any layer
+  // moved, a decode step spans two devices: it runs eagerly (no CUDA graph) and DSpark verifies eagerly at one
+  // extra host synchronisation per round. A prompt is prefilled in chunks, hopping each remote layer's grouped
+  // expert GEMM.
   ExpertResidency expert_residency;
   // KV-head split: KV_SPLIT_SECOND_HEADS of the 8 full-attention KV heads are cached and attended on the
   // second device (5 stay here), so the full-visit KV bytes stream over both DRAM buses. Write both shards:
-  // the chunked prefill and the decode step. Needs second_gpu and at least one layer's experts on the second
+  // the chunked prefill and the decode step. Needs second_gpu and a table that puts some experts on the second
   // device (a split visit hops, so it cannot be a captured step); not with every layer's experts there (VRAM:
-  // use a layer range).
+  // use a layer range or the 64/64 split).
   bool kv_split = false;
 };
 

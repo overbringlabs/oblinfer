@@ -58,12 +58,13 @@ struct Cfg {
 };
 
 struct GemmArgs {
-  const uint8_t* codes = nullptr;   // NVFP4 / MXFP8 expert codes [128, N, ..]
+  const uint8_t* codes = nullptr;   // NVFP4 / MXFP8 expert codes [ecount, N, ..]
   const uint8_t* scales = nullptr;  // block scales
   const float* factors = nullptr;   // NVFP4 per-expert factor
   const uint16_t* a = nullptr;      // activations (bf16)
   MoeWork w;                        // tiles and pair lists
   uint16_t* out = nullptr;
+  int ebase = 0, ecount = kExperts;  // the expert shard `codes` holds; other tiles skip
 };
 
 __device__ __forceinline__ void cp_async4(void* smem_dst, const void* gmem_src) {
@@ -112,7 +113,8 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   const int tile_idx = blockIdx.x / NTILES_N;
   if (tile_idx >= *g.w.tiles_n) return;
   const int4 tile = g.w.tiles[tile_idx];
-  const int e = tile.x, pb = tile.y, n = tile.z;
+  const int e = tile.x - g.ebase, pb = tile.y, n = tile.z;
+  if (e < 0 || e >= g.ecount) return;  // this expert lives in another device's shard
   const int n0 = (blockIdx.x % NTILES_N) * TN;
   const uint8_t* code_tile = g.codes + (int64_t(e) * NE + n0) * C::CODE_ROW;
   const uint8_t* scale_tile = g.scales + (int64_t(e) * NE + n0) * C::SCALE_ROW;
@@ -295,30 +297,28 @@ void launch_rows(const GemmArgs& g, int tm, int grid_per_row_tile, int row_tiles
   else launch<FMT, MODE, K, 128>(g, grid_per_row_tile * row_tiles, stream);
 }
 
-GemmArgs expert_args(const void* codes, const void* scales, const float* factors, const __nv_bfloat16* a,
-                     const MoeWork& w, __nv_bfloat16* out) {
-  GemmArgs g;
-  g.codes = static_cast<const uint8_t*>(codes);
-  g.scales = static_cast<const uint8_t*>(scales);
-  g.factors = factors;
-  g.a = reinterpret_cast<const uint16_t*>(a);
-  g.w = w;
-  g.out = reinterpret_cast<uint16_t*>(out);
-  return g;
+GemmArgs expert_args(const MoeExperts& e, const __nv_bfloat16* a, const MoeWork& w, __nv_bfloat16* out) {
+  return GemmArgs{static_cast<const uint8_t*>(e.w13), static_cast<const uint8_t*>(e.w13_scale), e.w13_factor,
+                  reinterpret_cast<const uint16_t*>(a), w, reinterpret_cast<uint16_t*>(out), e.ebase, e.ecount};
+}
+
+GemmArgs down_args(const MoeExperts& e, const __nv_bfloat16* a, const MoeWork& w, __nv_bfloat16* out) {
+  return GemmArgs{static_cast<const uint8_t*>(e.w2), static_cast<const uint8_t*>(e.w2_scale), e.w2_factor,
+                  reinterpret_cast<const uint16_t*>(a), w, reinterpret_cast<uint16_t*>(out), e.ebase, e.ecount};
 }
 
 }  // namespace
 
 void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
                  cudaStream_t stream) {
-  const GemmArgs g = expert_args(e.w13, e.w13_scale, e.w13_factor, x, w, act);
+  const GemmArgs g = expert_args(e, x, w, act);
   if (e.fmt == 0) launch_rows<FMT_NVFP4, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
   else launch_rows<FMT_MXFP8, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
 }
 
 void moe_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWork& w, __nv_bfloat16* down,
               cudaStream_t stream) {
-  const GemmArgs g = expert_args(e.w2, e.w2_scale, e.w2_factor, act, w, down);
+  const GemmArgs g = down_args(e, act, w, down);
   if (e.fmt == 0) launch_rows<FMT_NVFP4, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
   else launch_rows<FMT_MXFP8, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
 }

@@ -6,8 +6,10 @@
 //
 // Large tensors are uploaded straight from the file with the core DeviceUploader; small per-channel
 // parameters are read on the host, widened to FP32 (exact from BF16) and copied.
-// Expert residency (EP step 2): a layer's four expert tensors and their factors go whole onto the second
-// device when its ExpertResidency split is 0, through a second uploader; everything else stays here.
+// Expert residency (EP): a layer's four expert tensors and their factors go whole onto the second device when
+// its ExpertResidency split is 0, or split into contiguous halves (split 64: experts [0, 64) here, [64, 128)
+// there) through a second uploader; everything else stays here. The one-device default allocates and uploads
+// exactly what it did before.
 #include "model/runtime.h"
 
 #include "core/device.h"
@@ -131,11 +133,14 @@ class Loader {
     return upload_f32(host_f32(m_, name), shape);
   }
 
-  // Queues the raw bytes of `name` (rows [0, rows) if rows >= 0) for upload to `dst` on `device`.
-  void queue(const std::string& name, void* dst, std::int64_t rows = -1, int device = 0) {
+  // Queues the raw bytes of `name` (rows [first, first + rows) if rows >= 0, else all of it) for upload to
+  // `dst` on `device`.
+  void queue(const std::string& name, void* dst, std::int64_t rows = -1, int device = 0, std::int64_t first = 0) {
     const SafetensorsRef ref = m_.at(name);
+    const std::uint64_t row_bytes = ref->bytes / std::uint64_t(ref->shape[0]);
     UploadRequest r = upload_request(ref, dst);
-    if (rows >= 0) r.bytes = ref->bytes / std::uint64_t(ref->shape[0]) * std::uint64_t(rows);
+    if (rows >= 0) r.bytes = row_bytes * std::uint64_t(rows);
+    r.offset += row_bytes * std::uint64_t(first);
     pending_[device].push_back(r);
   }
 
@@ -145,6 +150,19 @@ class Loader {
     void* d = alloc(ref->bytes, device);
     queue(name, d, -1, device);
     return ref->view(d);
+  }
+
+  // Raw rows [first, first + rows) of a checkpoint tensor (its outermost dimension) in new device memory,
+  // viewed with that dimension truncated; uploaded at flush().
+  Tensor raw_rows(const std::string& name, std::int64_t first, std::int64_t rows, int device) {
+    const SafetensorsRef ref = m_.at(name);
+    const std::uint64_t row_bytes = ref->bytes / std::uint64_t(ref->shape[0]);
+    void* d = alloc(std::size_t(row_bytes * std::uint64_t(rows)), device);
+    queue(name, d, rows, device, first);
+    Tensor t = ref->view(d);
+    const int rank = static_cast<int>(ref->shape.size());
+    t.ne[rank - 1] = static_cast<std::int32_t>(rows);  // outermost dimension: ne is innermost first
+    return t;
   }
 
   // Uploads every queued range: this device's on `stream_`, the second device's on its transfer stream.
@@ -210,18 +228,19 @@ std::array<ExpertFormat, LAYERS> expert_formats(const fs::path& model_dir) {
   return fmt;
 }
 
-// Step 2 loads a layer's experts whole on one device: moe_up/moe_down take one base pointer per expert
-// tensor and address rows e*R, so a split inside a layer needs per-expert bases (step 3).
+// Loadable residencies: every expert here (EXPERTS, today's one-device load), every expert there (0), or the
+// two contiguous halves (EXPERTS / 2, the 64/64 split). Anything else has no base pointer scheme.
 void validate_residency(const ExpertResidency& residency, bool second_open) {
   for (int l = 0; l < LAYERS; ++l) {
     const int split = int(residency.split[l]);
     if (split == EXPERTS) continue;
-    if (split != 0)
+    if (split != 0 && split != LAYER_EXPERTS / 2)
       throw std::invalid_argument("expert residency: split " + std::to_string(split) + " in layer " +
-                                  std::to_string(l) + " needs per-expert base pointers (step 3)");
+                                  std::to_string(l) + " is not 0, " + std::to_string(LAYER_EXPERTS / 2) + " or " +
+                                  std::to_string(LAYER_EXPERTS));
     if (!second_open)
       throw std::invalid_argument("expert residency: layer " + std::to_string(l) +
-                                  " has its experts on the second device, which is not open");
+                                  " has experts on the second device, which is not open");
   }
 }
 
@@ -368,22 +387,28 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, int s
     layer.mlp_gate_gain = at(layer.mlp1_gate_gain, 0, DType::FP32, H, GATE_RANK);
   }
 
-  // routed experts in checkpoint encoding, whole on the device the residency table names
+  // routed experts in checkpoint encoding, on the device(s) the residency table names: all here, all there,
+  // or the contiguous halves [0, split) here and [split, 128) there
   const std::string e = p + "mlp.experts.";
   Experts& ex = layer.experts;
   ex.fmt = fmt;
   ex.split = static_cast<std::int16_t>(split);
-  const int shard = split == EXPERTS ? 0 : 1;  // ExpertResidency: 0 or EXPERTS only
-  if (shard == 0) {
-    ex.w13 = ld.raw(e + "w13_weight");
-    ex.w13_scale = ld.raw(e + "w13_weight_scale");
-    ex.w2 = ld.raw(e + "w2_weight");
-    ex.w2_scale = ld.raw(e + "w2_weight_scale");
-  } else {
-    ex.w13_hi = ld.raw(e + "w13_weight", 1);
-    ex.w13_scale_hi = ld.raw(e + "w13_weight_scale", 1);
-    ex.w2_hi = ld.raw(e + "w2_weight", 1);
-    ex.w2_scale_hi = ld.raw(e + "w2_weight_scale", 1);
+  if (split == EXPERTS || split == LAYER_EXPERTS / 2) {
+    ex.w13 = split == EXPERTS ? ld.raw(e + "w13_weight") : ld.raw_rows(e + "w13_weight", 0, split, 0);
+    ex.w13_scale =
+        split == EXPERTS ? ld.raw(e + "w13_weight_scale") : ld.raw_rows(e + "w13_weight_scale", 0, split, 0);
+    ex.w2 = split == EXPERTS ? ld.raw(e + "w2_weight") : ld.raw_rows(e + "w2_weight", 0, split, 0);
+    ex.w2_scale =
+        split == EXPERTS ? ld.raw(e + "w2_weight_scale") : ld.raw_rows(e + "w2_weight_scale", 0, split, 0);
+  }
+  if (split != EXPERTS) {
+    const std::int64_t here = split, there = EXPERTS - split;
+    ex.w13_hi = split == 0 ? ld.raw(e + "w13_weight", 1) : ld.raw_rows(e + "w13_weight", here, there, 1);
+    ex.w13_scale_hi =
+        split == 0 ? ld.raw(e + "w13_weight_scale", 1) : ld.raw_rows(e + "w13_weight_scale", here, there, 1);
+    ex.w2_hi = split == 0 ? ld.raw(e + "w2_weight", 1) : ld.raw_rows(e + "w2_weight", here, there, 1);
+    ex.w2_scale_hi =
+        split == 0 ? ld.raw(e + "w2_weight_scale", 1) : ld.raw_rows(e + "w2_weight_scale", here, there, 1);
   }
   const bool nv = fmt == ExpertFormat::NVFP4;
   const std::string want_codes = nv ? "U8" : "F8_E4M3", want_scales = nv ? "F8_E4M3" : "U8";
@@ -396,7 +421,17 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, int s
       const std::vector<float> den = host_f32(m, e + w + "_weight_outer_scale_denominator");
       std::vector<float> f(EXPERTS);
       for (int i = 0; i < EXPERTS; ++i) f[i] = amax[i] / den[den.size() == 1 ? 0 : i];  // FP32 division
-      (std::string(w) == "w13" ? ex.w13_factor : ex.w2_factor) = ld.upload_f32(f, {EXPERTS}, shard);
+      const bool w13 = std::string(w) == "w13";
+      Tensor& here = w13 ? ex.w13_factor : ex.w2_factor;
+      Tensor& there = w13 ? ex.w13_factor_hi : ex.w2_factor_hi;
+      if (split == 0) {
+        here = ld.upload_f32(f, {EXPERTS}, 1);
+      } else if (split == EXPERTS) {
+        here = ld.upload_f32(f, {EXPERTS});
+      } else {  // each device holds its shard's factors, indexed by its local expert
+        here = ld.upload_f32(std::vector<float>(f.begin(), f.begin() + split), {split});
+        there = ld.upload_f32(std::vector<float>(f.begin() + split, f.end()), {EXPERTS - split}, 1);
+      }
     }
   }
 
@@ -429,7 +464,7 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   w.residency = residency;
   w.expert_formats = expert_formats(model_dir);
   w.storage.reserve(4096);
-  w.storage_hi.buffers.reserve(2 * LAYERS);
+  w.storage_hi.buffers.reserve(6 * LAYERS);  // a 64/64 shard's four expert tensors and two factors per layer
   Loader ld(m, up, stream, w.storage, second, &w.storage_hi);
   const int H = HIDDEN;
   for (int l = 0; l < LAYERS; ++l)

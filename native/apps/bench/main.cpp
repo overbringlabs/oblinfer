@@ -139,6 +139,7 @@ int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
   int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
   int second_gpu = -1;
+  int expert_split = 0;
   bool remote_experts = false, kv_split = false;
   std::string remote_layers;
   bool dense_fp8 = false, kv_fp8 = false, spec = false;
@@ -158,8 +159,13 @@ int main(int argc, char** argv) {
           &remote_experts);
   ap.option("--remote-layers", "LO-HI",
             "layers LO..HI (inclusive) keep their experts on --second-gpu, e.g. 0-19", &remote_layers);
+  ap.option("--expert-split", "",
+            "split every layer's experts 64/64: [0, 64) on the first device and [64, 128) on --second-gpu, so "
+            "both stream after every rout (64; needs --second-gpu, not with --remote-experts/--remote-layers)",
+            &expert_split);
   ap.flag("--kv-split",
-          "3 of the 8 full-attention KV heads live on --second-gpu (needs --second-gpu and --remote-layers)",
+          "3 of the 8 full-attention KV heads live on --second-gpu (needs --second-gpu and --remote-layers or "
+          "--expert-split)",
           &kv_split);
   ap.option("--tokens", "", "", &tokens);
   ap.option("--runs", "", "", &runs);
@@ -208,14 +214,28 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "ingine-bench: error: --kv-split needs --second-gpu (the device the 3 heads run on)\n");
     return 2;
   }
-  if (kv_split && remote_experts) {
-    std::fprintf(stderr, "ingine-bench: error: --kv-split with --remote-experts leaves no room for the KV shard; "
-                         "use --remote-layers 0-19\n");
+  if (expert_split != 0 && expert_split != 64) {
+    std::fprintf(stderr, "ingine-bench: error: --expert-split takes 64 (contiguous 64-expert halves), or omit it\n");
     return 2;
   }
-  if (kv_split && remote_layers.empty()) {
-    std::fprintf(stderr, "ingine-bench: error: --kv-split needs --remote-layers (all experts on the second device "
-                         "leave no room for the KV shard)\n");
+  if (expert_split && second_gpu < 0) {
+    std::fprintf(stderr, "ingine-bench: error: --expert-split needs --second-gpu (the device the second half "
+                         "loads and runs on)\n");
+    return 2;
+  }
+  if (expert_split && (remote_experts || !remote_layers.empty())) {
+    std::fprintf(stderr, "ingine-bench: error: --expert-split and --remote-experts/--remote-layers are exclusive "
+                         "(the latter move whole layers)\n");
+    return 2;
+  }
+  if (kv_split && remote_experts) {
+    std::fprintf(stderr, "ingine-bench: error: --kv-split with --remote-experts leaves no room for the KV shard; "
+                         "use --remote-layers 0-19 or --expert-split\n");
+    return 2;
+  }
+  if (kv_split && remote_layers.empty() && expert_split == 0) {
+    std::fprintf(stderr, "ingine-bench: error: --kv-split needs --remote-layers or --expert-split (an expert "
+                         "placement that leaves room for the KV shard)\n");
     return 2;
   }
 
@@ -236,6 +256,7 @@ int main(int argc, char** argv) {
     options.second_gpu = second_gpu;
     if (remote_experts) options.expert_residency.split.fill(0);
     for (int l = remote_lo; l >= 0 && l <= remote_hi; ++l) options.expert_residency.split[l] = 0;
+    if (expert_split) options.expert_residency.split.fill(std::int16_t(expert_split));
     options.kv_split = kv_split;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();

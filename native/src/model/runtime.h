@@ -60,9 +60,9 @@ void reset_state(State& state, cudaStream_t stream);
 // ---- fast.FastDecoder
 class Decoder {
  public:
-  // `second`: the device opened for expert parallelism (options.second_gpu), or null. A visit whose layer has
+  // `second`: the device opened for expert parallelism (options.second_gpu), or null. A visit whose layer keeps
   // every expert there runs moe_up and moe_down's expert pass on it and hops the per-slot rows back
-  // (expert_hop below).
+  // (expert_hop below); a 64/64 split runs both devices' halves and merges the rows here (expert_split_hop).
   Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl = true,
           const DeviceContext* second = nullptr);
   ~Decoder();
@@ -82,6 +82,10 @@ class Decoder {
   // here. Enqueues on `stream` and the second device's stream; no host wait.
   void expert_hop(const Experts& ex, Buffers& b, int m, const float* conv_w, float* conv_state, float* conv_hist,
                   cudaStream_t stream);
+  // EP with a 64/64 split (ExpertResidency split 64): each device streams its contiguous half of the layer's
+  // experts for the slots that chose them, and moe_sum sums the merged rows here (expert_hop for whole layers).
+  void expert_split_hop(const Experts& ex, Buffers& b, int m, const float* conv_w, float* conv_state,
+                        float* conv_hist, cudaStream_t stream);
   // KV-head split (options.kv_split): one full-attention visit. GPU0 runs heads [0, kv_heads), the second
   // device runs [kv_heads, 8) against its own cache shard; the proj slices, conv state and pos hop out
   // through pinned staging and the second device's query-head output rows hop back. `a0` is the GPU0 launch.
@@ -105,6 +109,7 @@ class Decoder {
   MappedHostBuffer hop_x_, hop_idx_, hop_rows_;  // pinned staging: xm, idx out; per-slot rows back
   SecondStorage hop_hi_;                   // xm, idx, act, rows on the second device
   DeviceBuffer hop_rows0_;                 // the rows as they land on this device
+  DeviceBuffer hop_rows1_;                 // the second device's shard rows (an interior split only)
   // KV-head split (allocated only with options.kv_split; nothing here exists without it)
   struct SplitLayer {
     const float* q_scale = nullptr;  // full [24, 128] copy, indexed by the absolute head

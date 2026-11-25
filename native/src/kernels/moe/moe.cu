@@ -294,7 +294,7 @@ template <int FMT>
 __global__ void __launch_bounds__(UP_WARPS * 32)
 moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, const uint8_t* __restrict__ w,
               const uint8_t* __restrict__ ws, const float* __restrict__ wfactor, int M,
-              __nv_bfloat16* __restrict__ out) {
+              __nv_bfloat16* __restrict__ out, int ebase, int ecount) {
     constexpr int K = H, R = 2 * I;
     constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
     __shared__ float red[UP_WARPS][32][4];
@@ -309,13 +309,15 @@ moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, 
     const int lo = lane < nslots ? ld_dep(idx + lane) : -1;
     const int hi = lane + 32 < nslots ? ld_dep(idx + lane + 32) : -1;
     const int e = ld_dep(idx + slot);
+    const int le = e - ebase;
+    if (le < 0 || le >= ecount) return;  // this slot's expert lives in another device's shard
     const uint64_t mask = slot_mask(e, lo, hi);
     if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;  // an earlier slot owns this expert
 
-    const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
+    const size_t row = static_cast<size_t>(le) * R + tile * TILE + g;
     const bool on = g < M && ((mask >> (8 * g)) & 0xffu);
     Frag<FMT> f;
-    load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f,
+    load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT == 0 ? wfactor[le] : 1.f,
                    l2::policy<WEIGHT_L2>());
     load_x(f, on ? x + static_cast<size_t>(g) * K : nullptr, 4 * warp + t);
     float d[4] = {0.f, 0.f, 0.f, 0.f};
@@ -355,14 +357,15 @@ moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, 
 
 // ------------------------------------------------------------------------------------- moe_down
 
-// ROWS: the expert pass of an expert-parallel visit (EP): write one BF16 row per slot and stop, so the
-// device that owns the output sums them with moe_sum_kernel below. The expert math is the same code.
+// ROWS: the expert pass of an expert-parallel visit (EP): write one BF16 row per slot the shard owns and stop,
+// so the device that owns the output sums them with moe_sum_kernel below. The expert math is the same code.
 template <int FMT, bool ROWS>
 __global__ void __launch_bounds__(DOWN_WARPS * 32)
 moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ idx, const float* __restrict__ wts,
                 const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const float* __restrict__ wfactor,
                 int M, __nv_bfloat16* __restrict__ rows, const float* __restrict__ conv_w,
-                float* __restrict__ conv_state, float* __restrict__ out, float* __restrict__ conv_hist) {
+                float* __restrict__ conv_state, float* __restrict__ out, float* __restrict__ conv_hist,
+                int ebase, int ecount) {
     constexpr int K = I, R = H;
     constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
     __shared__ float part[DOWN_WARPS][32][4];        // per-warp partial dots of the current round
@@ -370,6 +373,7 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
     __shared__ int uexp[TOPK * MAXM];                // unique experts in first-slot order
     __shared__ unsigned long long umask[TOPK * MAXM];  // slots selecting each unique expert
     __shared__ uint8_t slot_u[TOPK * MAXM];          // slot -> unique expert index
+    __shared__ unsigned long long on_mask;           // slots this shard owns
     __shared__ int nuniq;
     __shared__ float sbuf[MAXM][TILE];
 
@@ -379,22 +383,27 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
     const int nslots = M * TOPK;
 
     if (warp == 0) {
+        for (int i = lane; i < nslots; i += 32) slot_u[i] = 0;  // slots outside the shard keep this
         // idx is read before pdl_wait on purpose: it was written by the router, which completed before
         // moe_up passed its own wait and triggered this launch.
         const int lo = lane < nslots ? ld_dep(idx + lane) : -1;
         const int hi = lane + 32 < nslots ? ld_dep(idx + lane + 32) : -1;
         uint64_t remaining = nslots == 64 ? ~0ull : ((1ull << nslots) - 1);
         int u = 0;
-        for (; remaining; ++u) {
+        unsigned long long owned = 0;
+        while (remaining) {
             const int s = __ffsll(static_cast<long long>(remaining)) - 1;
             const int e = __shfl_sync(0xffffffffu, s < 32 ? lo : hi, s & 31);
             const uint64_t mask = slot_mask(e, lo, hi);
             remaining &= ~mask;
-            if (lane == 0) uexp[u] = e, umask[u] = mask;
+            if (e - ebase < 0 || e - ebase >= ecount) continue;  // another device's shard
+            if (lane == 0) uexp[u] = e - ebase, umask[u] = mask;
             if ((mask >> lane) & 1) slot_u[lane] = uint8_t(u);
             if ((mask >> (lane + 32)) & 1) slot_u[lane + 32] = uint8_t(u);
+            owned |= mask;
+            ++u;
         }
-        if (lane == 0) nuniq = u;
+        if (lane == 0) nuniq = u, on_mask = owned;
     }
     __syncthreads();
 
@@ -444,10 +453,12 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
     pdl_trigger();  // only the short epilogue remains; dependents still wait for our completion
 
     if constexpr (ROWS) {
-        // One row per slot, duplicates included: the BF16-rounded expert output ybuf holds, which is what the
-        // fused epilogue's weighted sum reads. The other device's moe_sum reproduces it bit for bit.
+        // One row per slot this shard owns, duplicates included: the BF16-rounded expert output ybuf holds,
+        // which is what the fused epilogue's weighted sum reads. The other device's moe_sum reproduces it bit
+        // for bit; slots of another shard are left as they are (moe_rows_merge keeps that device's rows).
         for (int i = threadIdx.x; i < TILE * nslots; i += DOWN_WARPS * 32) {
             const int r = i % TILE, sl = i / TILE;
+            if (!((on_mask >> sl) & 1ull)) continue;
             rows[static_cast<std::size_t>(sl) * H + tile * TILE + r] =
                 __float2bfloat16_rn(ybuf[slot_u[sl]][r][sl / TOPK]);
         }
@@ -553,6 +564,19 @@ moe_sum_kernel(const __nv_bfloat16* __restrict__ rows, const float* __restrict__
     }
 }
 
+// ------------------------------------------------------------------------------------ moe_rows_merge
+
+// 4 bf16 per thread: the rows of the slots the second device's shard owns come back over it.
+__global__ void __launch_bounds__(256)
+rows_merge_kernel(__nv_bfloat16* __restrict__ rows, const __nv_bfloat16* __restrict__ rows_hi,
+                  const int* __restrict__ idx, int words, int ebase) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= words) return;
+    const int sl = i / (H / 4);
+    if (__ldg(idx + sl) < ebase) return;
+    reinterpret_cast<uint2*>(rows)[i] = reinterpret_cast<const uint2*>(rows_hi)[i];
+}
+
 void require(bool ok, const char* what) {
     if (!ok) throw std::invalid_argument(std::string("moe: ") + what);
 }
@@ -576,40 +600,54 @@ void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStr
 }  // namespace
 
 void moe_up(const __nv_bfloat16* x, int M, const int* idx, const void* w13, const void* w13_scale,
-            const float* w13_factor, Format fmt, __nv_bfloat16* out, bool pdl, cudaStream_t stream) {
+            const float* w13_factor, Format fmt, __nv_bfloat16* out, bool pdl, cudaStream_t stream, int ebase,
+            int ecount) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     require(x && idx && w13 && w13_scale && out, "moe_up: null argument");
     require(fmt == Format::MXFP8 || w13_factor, "NVFP4 experts need a factor tensor");
+    require(ebase >= 0 && ecount >= 1 && ebase + ecount <= kExperts, "moe_up: expert shard out of range");
     const bool nv = fmt == Format::NVFP4;
     const dim3 grid(2 * I / TILE, M * TOPK);
     launch(nv ? moe_up_kernel<0> : moe_up_kernel<1>, grid, UP_WARPS * 32, pdl, stream, x, idx,
            static_cast<const uint8_t*>(w13), static_cast<const uint8_t*>(w13_scale), nv ? w13_factor : nullptr, M,
-           out);
+           out, ebase, ecount);
 }
 
 void moe_down(const __nv_bfloat16* act, int M, const int* idx, const float* wts, const void* w2,
               const void* w2_scale, const float* w2_factor, Format fmt, const float* conv_w, float* conv_state,
-              float* out, float* conv_hist, bool pdl, cudaStream_t stream) {
+              float* out, float* conv_hist, bool pdl, cudaStream_t stream, int ebase, int ecount) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     require(act && idx && wts && w2 && w2_scale && conv_w && conv_state && out, "moe_down: null argument");
     require(fmt == Format::MXFP8 || w2_factor, "NVFP4 experts need a factor tensor");
+    require(ebase >= 0 && ecount >= 1 && ebase + ecount <= kExperts, "moe_down: expert shard out of range");
     const bool nv = fmt == Format::NVFP4;
     launch(nv ? moe_down_kernel<0, false> : moe_down_kernel<1, false>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream,
            act, idx, wts, static_cast<const uint8_t*>(w2), static_cast<const uint8_t*>(w2_scale),
-           nv ? w2_factor : nullptr, M, static_cast<__nv_bfloat16*>(nullptr), conv_w, conv_state, out, conv_hist);
+           nv ? w2_factor : nullptr, M, static_cast<__nv_bfloat16*>(nullptr), conv_w, conv_state, out, conv_hist,
+           ebase, ecount);
 }
 
 void moe_down_rows(const __nv_bfloat16* act, int M, const int* idx, const void* w2, const void* w2_scale,
-                   const float* w2_factor, Format fmt, __nv_bfloat16* rows, bool pdl, cudaStream_t stream) {
+                   const float* w2_factor, Format fmt, __nv_bfloat16* rows, bool pdl, cudaStream_t stream, int ebase,
+                   int ecount) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     require(act && idx && w2 && w2_scale && rows, "moe_down_rows: null argument");
     require(fmt == Format::MXFP8 || w2_factor, "NVFP4 experts need a factor tensor");
+    require(ebase >= 0 && ecount >= 1 && ebase + ecount <= kExperts, "moe_down_rows: expert shard out of range");
     const bool nv = fmt == Format::NVFP4;
     launch(nv ? moe_down_kernel<0, true> : moe_down_kernel<1, true>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream,
            act, idx, static_cast<const float*>(nullptr), static_cast<const uint8_t*>(w2),
            static_cast<const uint8_t*>(w2_scale), nv ? w2_factor : nullptr, M, rows,
            static_cast<const float*>(nullptr), static_cast<float*>(nullptr), static_cast<float*>(nullptr),
-           static_cast<float*>(nullptr));
+           static_cast<float*>(nullptr), ebase, ecount);
+}
+
+void moe_rows_merge(__nv_bfloat16* rows, const __nv_bfloat16* rows_hi, const int* idx, int M, int ebase,
+                    cudaStream_t stream) {
+    require(M >= 1 && M <= MAXM, "M must be in 1..8");
+    require(rows && rows_hi && idx, "moe_rows_merge: null argument");
+    const int words = M * TOPK * (H / 4);
+    rows_merge_kernel<<<(words + 255) / 256, 256, 0, stream>>>(rows, rows_hi, idx, words, ebase);
 }
 
 void moe_sum(const __nv_bfloat16* rows, int M, const float* wts, const float* conv_w, float* conv_state,

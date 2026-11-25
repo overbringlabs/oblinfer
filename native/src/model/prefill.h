@@ -37,9 +37,10 @@ namespace ingine::model {
 // feeds in as they are: no embedding norm).
 //
 // Two devices (RuntimeOptions::second_gpu): a layer whose experts live on the second device runs its grouped
-// expert GEMMs there (expert_hop), and with the KV-head split (--kv-split) the full-attention visits write and
-// attend this device's 5 heads and the second device's 3 (full_attn_split). One device, or every layer's
-// experts here: no copy and no event beyond the one-device launch sequence.
+// expert GEMMs there (expert_hop), a 64/64 split runs half of them on each device (expert_split_hop), and with
+// the KV-head split (--kv-split) the full-attention visits write and attend this device's 5 heads and the second
+// device's 3 (full_attn_split). One device, or every layer's experts here: no copy and no event beyond the
+// one-device launch sequence.
 struct EmbedRows {
   int row = 0, count = 0;
   const __nv_bfloat16* src = nullptr;
@@ -69,6 +70,10 @@ class Prefiller {
   // pair lists) and xm hop over, the second device runs the grouped gate/up, down and combine GEMMs, and the
   // combined BF16 rows come back for the post-MLP conv. No host wait.
   void expert_hop(const Experts& ex, int T, cudaStream_t stream);
+  // EP with a 64/64 split (ExpertResidency split 64): each device runs the grouped gate/up and down GEMMs of
+  // its contiguous half of the layer's experts; the second device's per-pair rows come back, this device
+  // merges them and combines the slots in order. No host wait.
+  void expert_split_hop(const Experts& ex, int T, cudaStream_t stream);
   // KV-head split (--kv-split): one full-attention visit of a chunk. `ap` / `at` describe this device's KV
   // heads [0, kv_heads); the second device writes its cache shard's rows and attends its own heads against
   // them, and its query-head rows come back into attn_out.
@@ -110,6 +115,8 @@ class Prefiller {
   cudaEvent_t hop_ready_ = nullptr;    // recorded on `stream` (device 0), waited on hop_stream_
   cudaEvent_t hop_back_ = nullptr;     // recorded on hop_stream_ (device 1), waited on `stream`
   MappedHostBuffer hop_x_, hop_work_, hop_sum_;  // pinned staging: xm and the work lists out; the rows back
+  MappedHostBuffer hop_rows_;  // the 64/64 split's per-slot rows back (sized for the whole chunk)
+  DeviceBuffer hop_rows0_;     // ... as they land on this device
   SecondStorage hop_hi_;  // x, tiles_n, tiles, pair_token, pair_dst, wts, act, down, sum on the second device
   // KV-head split (allocated only with kv_split_): the packet in (proj slices + conv state) and the rows back
   cudaEvent_t kv_ready_ = nullptr;     // recorded here, waited on the second device

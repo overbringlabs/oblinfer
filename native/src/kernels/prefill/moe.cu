@@ -107,6 +107,17 @@ __global__ void __launch_bounds__(kHidden / 4) combine_kernel(const uint2* __res
   out[size_t(t) * (kHidden / 4) + c] = make_uint2(pack_bf16x2(acc[0], acc[1]), pack_bf16x2(acc[2], acc[3]));
 }
 
+// 4 bf16 per thread: the pair rows of the slots the second device's shard owns come back over it.
+__global__ void __launch_bounds__(256) rows_merge_kernel(__nv_bfloat16* __restrict__ down,
+                                                         const __nv_bfloat16* __restrict__ down_hi,
+                                                         const int* __restrict__ idx, int words, int ebase) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= words) return;
+  const int slot = i / (kHidden / 4);
+  if (__ldg(idx + slot) < ebase) return;
+  reinterpret_cast<uint2*>(down)[i] = reinterpret_cast<const uint2*>(down_hi)[i];
+}
+
 }  // namespace
 
 int moe_tile_rows(int T) {
@@ -131,6 +142,12 @@ void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream) {
 void moe_combine(const __nv_bfloat16* down, const float* wts, int T, __nv_bfloat16* out, cudaStream_t stream) {
   combine_kernel<<<T, kHidden / 4, 0, stream>>>(reinterpret_cast<const uint2*>(down), wts,
                                                 reinterpret_cast<uint2*>(out));
+}
+
+void moe_rows_merge(__nv_bfloat16* down, const __nv_bfloat16* down_hi, const int* idx, int T, int ebase,
+                    cudaStream_t stream) {
+  const int words = T * kTopK * (kHidden / 4);
+  rows_merge_kernel<<<(words + 255) / 256, 256, 0, stream>>>(down, down_hi, idx, words, ebase);
 }
 
 }  // namespace ingine::kernels::prefill

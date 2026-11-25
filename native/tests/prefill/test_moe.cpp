@@ -90,7 +90,7 @@ bool run(Rng& rng, int fmt, int T) {
   DeviceArray<float> f13(fmt == 0 ? w13.factor : std::vector<float>(1)), f2(fmt == 0 ? w2.factor : std::vector<float>(1));
   DeviceArray<uint16_t> d_x(x), act(size_t(T) * TOPK * I), down(size_t(T) * TOPK * H), out(size_t(T) * H);
   pk::MoeWork wk{counts.get(), tiles_n.get(), tiles.get(), pair_token.get(), pair_dst.get()};
-  pk::MoeExperts ex{fmt, c13.get(), s13.get(), fmt == 0 ? f13.get() : nullptr, c2.get(), s2.get(),
+  pk::MoeExperts ex{fmt, 0, pk::kExperts, c13.get(), s13.get(), fmt == 0 ? f13.get() : nullptr, c2.get(), s2.get(),
                     fmt == 0 ? f2.get() : nullptr};
 
   pk::moe_topk(d_logits.get(), d_bias.get(), T, d_idx.get(), d_wts.get(), counts.get(), nullptr);

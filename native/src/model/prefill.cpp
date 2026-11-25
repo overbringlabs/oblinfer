@@ -9,9 +9,10 @@
 // attention / MLP writes happens inside the mixes that consume them, as in the decode step.
 //
 // Two devices: a layer whose experts live on the second device runs its grouped expert GEMMs there
-// (expert_hop) and, with the KV-head split, a full-attention visit runs one launch per device over its own KV
-// cache shard (full_attn_split). Every value the second device reads is a copy of this device's, so a hop is
-// bit-identical to the one-device path; without a second device nothing is copied or waited on.
+// (expert_hop), a 64/64 split runs half on each (expert_split_hop), and with the KV-head split a full-attention
+// visit runs one launch per device over its own KV cache shard (full_attn_split). Every value the second device
+// reads is a copy of this device's, so a hop is bit-identical to the one-device path; without a second device
+// nothing is copied or waited on.
 #include "model/prefill.h"
 
 #include "core/device.h"
@@ -96,17 +97,15 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   if (max_chunk < 1) throw std::invalid_argument("Prefiller: max_chunk must be positive");
   if (kv_split_ && second_ == nullptr)
     throw std::invalid_argument("Prefiller: the KV-head split needs the second device");
-  // EP step 2 places a layer's experts whole on one device: the grouped GEMMs take one base pointer per
-  // expert tensor, so a split inside a layer has no weights to read (step 3).
-  bool remote = false;
+  // A layer's experts that are not all here make its visit hop: a whole layer there (split 0) runs its grouped
+  // GEMMs there, a 64/64 split runs half on each device. Either way the grouped GEMMs address their tensors'
+  // rows by the local expert id.
+  bool remote = false, shard = false;
   for (const Layer& l : w.layers) {
-    if (l.experts.split == EXPERTS) continue;
-    if (l.experts.split != 0)
-      throw std::invalid_argument("Prefiller: layer " + std::to_string(l.idx) + " splits its experts inside the "
-                                  "layer, which needs per-expert base pointers (step 3 of the EP plan)");
-    remote = true;
+    remote = remote || l.experts.split == 0;
+    shard = shard || (l.experts.split != EXPERTS && l.experts.split != 0);
   }
-  if (remote && second_ == nullptr)
+  if ((remote || shard) && second_ == nullptr)
     throw std::invalid_argument("Prefiller: a layer's experts are on the second device, which is not open");
   int nfull = 0;
   for (const Layer& l : w.layers) nfull += l.full ? 1 : 0;
@@ -154,7 +153,7 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   if (second_ == nullptr) return;
   hop_stream_ = second_->stream;
   CUDA_CHECK(cudaEventCreateWithFlags(&hop_ready_, cudaEventDisableTiming));
-  if (remote) {
+  if (remote || shard) {
     // The hop's staging is sized for the whole chunk: xm out (bf16 [T, H]), the router's tile and pair lists
     // out, the combined rows back (bf16 [T, H]).
     hop_x_ = MappedHostBuffer(C * H * 2);
@@ -172,6 +171,10 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
     hop_hi_.buffers.emplace_back(C * TOP_K * INTER * 2);            // act
     hop_hi_.buffers.emplace_back(C * TOP_K * H * 2);                // per-slot rows
     hop_hi_.buffers.emplace_back(C * H * 2);                        // combined rows
+    if (shard) {  // a 64/64 split returns the second device's per-slot rows instead of one combined block
+      hop_rows_ = MappedHostBuffer(C * TOP_K * H * 2);
+      hop_rows0_ = DeviceBuffer(C * TOP_K * H * 2);
+    }
   }
   if (kv_split_) {
     const std::size_t CC = std::size_t(kVkThere) * HEAD_DIM;
@@ -494,8 +497,10 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const Experts& ex = layer.experts;
     if (ex.split == 0) {  // EP: every expert of this layer is on the second device
       expert_hop(ex, T, s);
+    } else if (ex.split != EXPERTS) {  // 64/64: each device runs the grouped GEMMs of its half
+      expert_split_hop(ex, T, s);
     } else {
-      const pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,
+      const pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, 0, EXPERTS, ex.w13.data, ex.w13_scale.data,
                               f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
       pk::moe_gate_up(me, xm_, T, work, act_, s);
       pk::moe_down(me, act_, T, work, down_, s);
@@ -557,8 +562,9 @@ void Prefiller::expert_hop(const Experts& ex, int T, cudaStream_t stream) {
     CUDA_CHECK(cudaMemcpyAsync(pair_dst1, pair_dst, pb, cudaMemcpyHostToDevice, hop_stream_));
     CUDA_CHECK(cudaMemcpyAsync(wts1, wts, pb, cudaMemcpyHostToDevice, hop_stream_));
     const pk::MoeWork work1{nullptr, tiles_n1, tiles1, pair_token1, pair_dst1};
-    const pk::MoeExperts me1{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13_hi.data, ex.w13_scale_hi.data,
-                             f32p(ex.w13_factor), ex.w2_hi.data, ex.w2_scale_hi.data, f32p(ex.w2_factor)};
+    const pk::MoeExperts me1{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, 0, EXPERTS, ex.w13_hi.data,
+                             ex.w13_scale_hi.data, f32p(ex.w13_factor), ex.w2_hi.data, ex.w2_scale_hi.data,
+                             f32p(ex.w2_factor)};
     pk::moe_gate_up(me1, x1, T, work1, act1, hop_stream_);
     pk::moe_down(me1, act1, T, work1, rows1, hop_stream_);
     pk::moe_combine(rows1, wts1, T, sum1, hop_stream_);
@@ -567,6 +573,68 @@ void Prefiller::expert_hop(const Experts& ex, int T, cudaStream_t stream) {
   }
   CUDA_CHECK(cudaStreamWaitEvent(stream, hop_back_, 0));
   CUDA_CHECK(cudaMemcpyAsync(moe_sum_, hop_sum_.data(), xb, cudaMemcpyHostToDevice, stream));
+}
+
+void Prefiller::expert_split_hop(const Experts& ex, int T, cudaStream_t stream) {
+  // 64/64 (ExpertResidency split 64): experts [0, split) run their grouped gate/up and down GEMMs here and
+  // [split, 128) on the second device, so both GDDR buses stream the routed pairs. This device's router output
+  // (the tile and expert-sorted pair lists) and xm go over; the second device's per-pair rows come back and
+  // moe_rows_merge writes them into this device's, in place. moe_combine then sums the 8 slots in order here,
+  // so the chunk is bit-identical to the one-device path. The kernels skip tiles of the other shard.
+  if (second_ == nullptr) throw std::logic_error("expert_split_hop: this Prefiller has no second device");
+  const int split = ex.split, there = EXPERTS - split;
+  const int fmt = ex.fmt == ExpertFormat::NVFP4 ? 0 : 1;
+  const std::size_t xb = std::size_t(T) * H * 2, pb = std::size_t(T) * TOP_K * 4;
+  const std::size_t tb = std::size_t(tiles_capacity_) * sizeof(int4);
+  const std::size_t rb = std::size_t(T) * TOP_K * H * 2;
+  char* work = static_cast<char*>(hop_work_.data());
+  char* pair_token = work + 4 + tb;
+  char* pair_dst = pair_token + pb;
+  char* wts = pair_dst + pb;
+  CUDA_CHECK(cudaMemcpyAsync(hop_x_.data(), xm_, xb, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(work, tiles_n_, 4, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(work + 4, tiles_, tb, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(pair_token, pair_token_, pb, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(pair_dst, pair_dst_, pb, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(wts, wts_, pb, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaEventRecord(hop_ready_, stream));
+  {
+    const BindDevice bind(second_->device);
+    __nv_bfloat16* x1 = static_cast<__nv_bfloat16*>(hop_hi_.buffers[0].p);
+    int* tiles_n1 = static_cast<int*>(hop_hi_.buffers[1].p);
+    int4* tiles1 = static_cast<int4*>(hop_hi_.buffers[2].p);
+    int* pair_token1 = static_cast<int*>(hop_hi_.buffers[3].p);
+    int* pair_dst1 = static_cast<int*>(hop_hi_.buffers[4].p);
+    float* wts1 = static_cast<float*>(hop_hi_.buffers[5].p);
+    __nv_bfloat16* act1 = static_cast<__nv_bfloat16*>(hop_hi_.buffers[6].p);
+    __nv_bfloat16* rows1 = static_cast<__nv_bfloat16*>(hop_hi_.buffers[7].p);
+    CUDA_CHECK(cudaStreamWaitEvent(hop_stream_, hop_ready_, 0));
+    CUDA_CHECK(cudaMemcpyAsync(x1, hop_x_.data(), xb, cudaMemcpyHostToDevice, hop_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(tiles_n1, work, 4, cudaMemcpyHostToDevice, hop_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(tiles1, work + 4, tb, cudaMemcpyHostToDevice, hop_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(pair_token1, pair_token, pb, cudaMemcpyHostToDevice, hop_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(pair_dst1, pair_dst, pb, cudaMemcpyHostToDevice, hop_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(wts1, wts, pb, cudaMemcpyHostToDevice, hop_stream_));
+    const pk::MoeWork work1{nullptr, tiles_n1, tiles1, pair_token1, pair_dst1};
+    const pk::MoeExperts me1{fmt, split, there, ex.w13_hi.data, ex.w13_scale_hi.data, f32p(ex.w13_factor_hi),
+                             ex.w2_hi.data, ex.w2_scale_hi.data, f32p(ex.w2_factor_hi)};
+    pk::moe_gate_up(me1, x1, T, work1, act1, hop_stream_);
+    pk::moe_down(me1, act1, T, work1, rows1, hop_stream_);
+    CUDA_CHECK(cudaMemcpyAsync(hop_rows_.data(), rows1, rb, cudaMemcpyDeviceToHost, hop_stream_));
+    CUDA_CHECK(cudaEventRecord(hop_back_, hop_stream_));
+  }
+  // this device's half runs while the second device's does
+  {
+    const pk::MoeExperts me0{fmt, 0, split, ex.w13.data, ex.w13_scale.data, f32p(ex.w13_factor),
+                             ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
+    const pk::MoeWork work0{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
+    pk::moe_gate_up(me0, xm_, T, work0, act_, stream);
+    pk::moe_down(me0, act_, T, work0, down_, stream);
+  }
+  CUDA_CHECK(cudaStreamWaitEvent(stream, hop_back_, 0));
+  CUDA_CHECK(cudaMemcpyAsync(hop_rows0_.p, hop_rows_.data(), rb, cudaMemcpyHostToDevice, stream));
+  pk::moe_rows_merge(down_, static_cast<const __nv_bfloat16*>(hop_rows0_.p), idx_, T, split, stream);
+  pk::moe_combine(down_, wts_, T, moe_sum_, stream);
 }
 
 void Prefiller::full_attn_split(State& st, const Layer& layer, pk::AttnPrepParams& ap, pk::AttnParams& at, int T,

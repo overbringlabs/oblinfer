@@ -154,10 +154,12 @@ struct Experts {
   // MXFP8: w13 e4m3 [128, 2304, 2304], w13_scale u8 (E8M0) [128, 2304, 72], w2 e4m3 [128, 2304, 1152],
   //        w2_scale u8 [128, 2304, 36], factors empty
   // The plain fields hold experts [0, split) on the primary device, the _hi ones [split, 128) on the second
-  // (ExpertResidency). Rows are addressed as e*R on either device, so a split inside a layer is step 3.
+  // (ExpertResidency); a split of 0 or EXPERTS leaves one side empty. Each tensor holds its shard's rows
+  // only and is addressed locally as (e - base)*R, base 0 here and `split` there.
   Tensor w13, w13_scale, w2, w2_scale;
   Tensor w13_hi, w13_scale_hi, w2_hi, w2_scale_hi;
-  Tensor w13_factor, w2_factor;  // fp32 [128], on the device holding this layer's experts
+  Tensor w13_factor, w2_factor;        // fp32 [split] (or [128] when one side holds every expert)
+  Tensor w13_factor_hi, w2_factor_hi;  // fp32 [128 - split], only with a split inside the layer
   std::int16_t split = EXPERTS;
 };
 

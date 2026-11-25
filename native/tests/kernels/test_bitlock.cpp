@@ -310,6 +310,57 @@ bool moe_split_matches(LockGen& g, const ExpertWeight& w13, const ExpertWeight& 
   return same;
 }
 
+// 64/64: each shard holds its contiguous half of the experts (rows only, local ids) and runs the slot mask of
+// its own experts; the merge of the two shard passes must sum to the fused epilogue's bits.
+bool moe_shard_matches(LockGen& g, const ExpertWeight& w13, const ExpertWeight& w2, bool nv, int M) {
+  const moe::Format fmt = nv ? moe::Format::NVFP4 : moe::Format::MXFP8;
+  const int half = E / 2;  // this test allocates E experts; the split point is the same fraction
+  const float* factor13 = nv ? w13.factor.get() : nullptr;
+  const float* factor2 = nv ? w2.factor.get() : nullptr;
+  // one expert's code / scale bytes
+  const size_t c13 = std::size_t(2 * I) * (nv ? H / 2 : H), s13 = std::size_t(2 * I) * (nv ? H / 16 : H / 32);
+  const size_t c2 = std::size_t(H) * (nv ? I / 2 : I), s2 = std::size_t(H) * (nv ? I / 16 : I / 32);
+  DeviceArray<int> idx(routing(g, M));
+  DeviceArray<__nv_bfloat16> x(to_bf16(g.vec_bf16(size_t(M) * H, 1.5f)));
+  DeviceArray<float> wts(g.vec(size_t(M) * TOPK, 0.9f, 1.1f)), cw(g.vec(size_t(H) * 4, 0.5f));
+  const std::vector<float> state0 = g.vec_bf16(size_t(3) * H, 0.3f);
+  const size_t na = size_t(M) * TOPK * I, nr = size_t(M) * TOPK * H;
+  DeviceArray<__nv_bfloat16> act_ref(to_bf16(std::vector<float>(na, 0.f)));
+  DeviceArray<__nv_bfloat16> act_a(to_bf16(std::vector<float>(na, 0.f))), act_b(to_bf16(std::vector<float>(na, 0.f)));
+  DeviceArray<__nv_bfloat16> rows_a(to_bf16(std::vector<float>(nr, 0.f)));
+  DeviceArray<__nv_bfloat16> rows_b(to_bf16(std::vector<float>(nr, 0.f)));
+  DeviceArray<float> st_fused(state0), out_fused(size_t(M) * H), hist_fused(size_t(M) * H);
+  DeviceArray<float> st_split(state0), out_split(size_t(M) * H), hist_split(size_t(M) * H);
+  // reference: the fused pair over the whole table
+  moe::moe_up(x.get(), M, idx.get(), w13.codes.get(), w13.scales.get(), factor13, fmt, act_ref.get(), true, g_stream);
+  moe::moe_down(act_ref.get(), M, idx.get(), wts.get(), w2.codes.get(), w2.scales.get(), factor2, fmt, cw.get(),
+                st_fused.get(), out_fused.get(), hist_fused.get(), true, g_stream);
+  // [0, half) here
+  moe::moe_up(x.get(), M, idx.get(), w13.codes.get(), w13.scales.get(), factor13, fmt, act_a.get(), false, g_stream,
+              0, half);
+  moe::moe_down_rows(act_a.get(), M, idx.get(), w2.codes.get(), w2.scales.get(), factor2, fmt, rows_a.get(), false,
+                     g_stream, 0, half);
+  // [half, E) with the tables' rows and factors advanced by half
+  moe::moe_up(x.get(), M, idx.get(), w13.codes.get() + c13 * half, w13.scales.get() + s13 * half,
+              nv ? factor13 + half : nullptr, fmt, act_b.get(), false, g_stream, half, E - half);
+  moe::moe_down_rows(act_b.get(), M, idx.get(), w2.codes.get() + c2 * half, w2.scales.get() + s2 * half,
+                     nv ? factor2 + half : nullptr, fmt, rows_b.get(), false, g_stream, half, E - half);
+  moe::moe_rows_merge(rows_a.get(), rows_b.get(), idx.get(), M, half, g_stream);
+  moe::moe_sum(rows_a.get(), M, wts.get(), cw.get(), st_split.get(), out_split.get(), hist_split.get(), g_stream);
+  sync();
+  const bool same = out_fused.download() == out_split.download() && hist_fused.download() == hist_split.download() &&
+                    st_fused.download() == st_split.download();
+  if (!same) {
+    const std::vector<float> a = out_fused.download(), b = out_split.download();
+    for (size_t i = 0; i < a.size(); ++i)
+      if (a[i] != b[i]) {
+        std::printf("  first difference: out[%zu] fused %.9g shards %.9g\n", i, double(a[i]), double(b[i]));
+        break;
+      }
+  }
+  return same;
+}
+
 // [M - 1][proj, proj_conv, head, moe nvfp4, moe mxfp8, sliding attention]
 constexpr int kLocks = 6;
 constexpr const char* kNames[kLocks] = {"proj", "proj_conv", "head", "moe nvfp4", "moe mxfp8", "attn sliding"};
@@ -387,6 +438,22 @@ int main() {
     }
   }
   if (ok) std::printf("PASS EP split moe_down_rows + moe_sum == moe_down, M = 1..8, both formats\n");
+  // 64/64 (no hash): both contiguous shards run their slots, the merge restores every slot, one sum
+  bool shard_ok = true;
+  for (int nv = 1; nv >= 0; --nv) {
+    LockGen gw{0x10c57000ull + uint64_t(nv)};
+    const ExpertWeight w13(gw, 2 * I, H, nv), w2(gw, H, I, nv);
+    for (int M = 1; M <= 8; ++M) {
+      LockGen g{0x10c58000ull + uint64_t(8 * nv + M)};
+      if (!moe_shard_matches(g, w13, w2, nv != 0, M)) {
+        std::printf("FAIL 64/64 shard M=%d %s: differs from the fused kernel\n", M, nv ? "nvfp4" : "mxfp8");
+        shard_ok = false;
+      }
+    }
+  }
+  std::printf("%s 64/64 shard passes + moe_rows_merge == moe_down, M = 1..8, both formats\n",
+              shard_ok ? "PASS" : "FAIL");
+  ok = ok && shard_ok;
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;

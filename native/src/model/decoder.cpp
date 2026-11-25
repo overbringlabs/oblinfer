@@ -133,11 +133,15 @@ Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, con
     }
   }
   if (second_ == nullptr) return;
-  // Nothing is allocated unless some layer really keeps its experts there (`--second-gpu` alone keeps today's
-  // one-device step, and then not even the staging below exists).
-  bool remote = false;
-  for (const Layer& l : w.layers) remote = remote || l.experts.split == 0;
-  if (!remote) return;
+  // Nothing is allocated unless some layer really keeps experts there (`--second-gpu` alone keeps today's
+  // one-device step, and then not even the staging below exists). A whole layer there and a 64/64 split share
+  // the staging; only the split needs the second device's shard rows on this one.
+  bool remote = false, shard = false;
+  for (const Layer& l : w.layers) {
+    remote = remote || l.experts.split == 0;
+    shard = shard || (l.experts.split != 0 && l.experts.split != EXPERTS);
+  }
+  if (!remote && !shard) return;
   // The hop (plans/20261124_hop-measure.md): portable pinned staging, one stream and one event pair. Each
   // event belongs to the device that records it: hop_ready_ to this one, hop_back_ to the second.
   hop_stream_ = second_->stream;
@@ -153,6 +157,7 @@ Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, con
   hop_hi_.buffers.emplace_back(std::size_t(kHopMaxM) * TOP_K * 4);           // idx
   hop_hi_.buffers.emplace_back(std::size_t(kHopMaxM) * TOP_K * INTER * 2);   // act
   hop_hi_.buffers.emplace_back(std::size_t(kHopMaxM) * TOP_K * HIDDEN * 2);  // per-slot rows
+  if (shard) hop_rows1_ = DeviceBuffer(std::size_t(kHopMaxM) * TOP_K * HIDDEN * 2);
 }
 
 Decoder::~Decoder() {
@@ -353,8 +358,10 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     const Experts& ex = layer.experts;
     const moe::Format fmt = ex.fmt == ExpertFormat::NVFP4 ? moe::Format::NVFP4 : moe::Format::MXFP8;
     float* conv_hist = history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr;
-    if (ex.split == 0) {  // EP: every expert of this layer is on the second device (step 4: whole layers only)
+    if (ex.split == 0) {  // EP: every expert of this layer is on the second device
       expert_hop(ex, b, m, f32p(layer.mlp_conv), st.conv_mlp_at(v), conv_hist, stream);
+    } else if (ex.split != EXPERTS) {  // 64/64: both devices stream their half of the routed experts
+      expert_split_hop(ex, b, m, f32p(layer.mlp_conv), st.conv_mlp_at(v), conv_hist, stream);
     } else {
       moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), ex.w13.data, ex.w13_scale.data,
                   f32p(ex.w13_factor), fmt, bf16m(b.act), pdl, stream);
@@ -412,6 +419,54 @@ void Decoder::expert_hop(const Experts& ex, Buffers& b, int m, const float* conv
   CUDA_CHECK(cudaMemcpyAsync(hop_rows0_.p, hop_rows_.data(), rb, cudaMemcpyHostToDevice, stream));
   moe::moe_sum(static_cast<const __nv_bfloat16*>(hop_rows0_.p), m, f32p(b.wts), conv_w, conv_state, f32m(b.y2),
                conv_hist, stream);
+}
+
+void Decoder::expert_split_hop(const Experts& ex, Buffers& b, int m, const float* conv_w, float* conv_state,
+                               float* conv_hist, cudaStream_t stream) {
+  // 64/64 (ExpertResidency split 64): experts [0, split) stream here and [split, 128) on the second device, so
+  // both GDDR buses read the routed 8 per token. Each device runs moe_up and moe_down's expert pass for the
+  // slots that chose its experts (the kernels skip the other shard, and address their rows by the local id);
+  // the second device's per-slot rows come back, moe_rows_merge writes them into this device's row buffer and
+  // moe_sum sums all 8 slots in k order with the post-MLP conv. The rows are the same values the fused epilogue
+  // would read, so the result is bit-identical to the one-device path.
+  if (second_ == nullptr) throw std::logic_error("expert_split_hop: this decoder has no second device");
+  const int split = ex.split, there = EXPERTS - split;
+  const moe::Format fmt = ex.fmt == ExpertFormat::NVFP4 ? moe::Format::NVFP4 : moe::Format::MXFP8;
+  const std::size_t xb = std::size_t(m) * HIDDEN * 2;
+  const std::size_t ib = std::size_t(m) * TOP_K * 4;
+  const std::size_t rb = std::size_t(m) * TOP_K * HIDDEN * 2;
+  const int* idx = static_cast<const int*>(b.idx.data);
+  __nv_bfloat16* xm1 = static_cast<__nv_bfloat16*>(hop_hi_.buffers[0].p);
+  int* idx1 = static_cast<int*>(hop_hi_.buffers[1].p);
+  __nv_bfloat16* act1 = static_cast<__nv_bfloat16*>(hop_hi_.buffers[2].p);
+  __nv_bfloat16* rows1 = static_cast<__nv_bfloat16*>(hop_hi_.buffers[3].p);
+  __nv_bfloat16* rows0 = static_cast<__nv_bfloat16*>(hop_rows0_.p);
+  __nv_bfloat16* rows_hi = static_cast<__nv_bfloat16*>(hop_rows1_.p);
+
+  CUDA_CHECK(cudaMemcpyAsync(hop_x_.data(), bf16m(b.xm), xb, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(hop_idx_.data(), b.idx.data, ib, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaEventRecord(hop_ready_, stream));
+  {
+    const BindDevice bind(second_->device);
+    CUDA_CHECK(cudaStreamWaitEvent(hop_stream_, hop_ready_, 0));
+    CUDA_CHECK(cudaMemcpyAsync(xm1, hop_x_.data(), xb, cudaMemcpyHostToDevice, hop_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(idx1, hop_idx_.data(), ib, cudaMemcpyHostToDevice, hop_stream_));
+    moe::moe_up(xm1, m, idx1, ex.w13_hi.data, ex.w13_scale_hi.data, f32p(ex.w13_factor_hi), fmt, act1, false,
+                hop_stream_, split, there);
+    moe::moe_down_rows(act1, m, idx1, ex.w2_hi.data, ex.w2_scale_hi.data, f32p(ex.w2_factor_hi), fmt, rows1, false,
+                       hop_stream_, split, there);
+    CUDA_CHECK(cudaMemcpyAsync(hop_rows_.data(), rows1, rb, cudaMemcpyDeviceToHost, hop_stream_));
+    CUDA_CHECK(cudaEventRecord(hop_back_, hop_stream_));
+  }
+  // this device's half runs while the second device's does
+  moe::moe_up(bf16m(b.xm), m, idx, ex.w13.data, ex.w13_scale.data, f32p(ex.w13_factor), fmt, bf16m(b.act), false,
+              stream, 0, split);
+  moe::moe_down_rows(bf16m(b.act), m, idx, ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor), fmt, rows0, false,
+                     stream, 0, split);
+  CUDA_CHECK(cudaStreamWaitEvent(stream, hop_back_, 0));
+  CUDA_CHECK(cudaMemcpyAsync(rows_hi, hop_rows_.data(), rb, cudaMemcpyHostToDevice, stream));
+  moe::moe_rows_merge(rows0, rows_hi, idx, m, split, stream);
+  moe::moe_sum(rows0, m, f32p(b.wts), conv_w, conv_state, f32m(b.y2), conv_hist, stream);
 }
 
 void Decoder::full_attn_split(const Layer& layer, Buffers& b, int m, int v, attn::DecodeArgs a0,

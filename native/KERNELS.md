@@ -49,18 +49,19 @@ Weight layouts and the visit plan are in `src/model/model_data.h` and `src/model
 
 ## Area `moe` (routed experts)
 
-`moe_up(x, idx, w13, w13_scale, w13_factor, fmt, out)`
+`moe_up(x, idx, w13, w13_scale, w13_factor, fmt, out[, ebase, ecount])`
 
 * `x` bf16 `[M, H]` (normalised MLP input), `idx` int32 `[M, 8]`, `out` bf16 `[M, 8, I]`.
-* `fmt` 0 = NVFP4 (`w13` uint8 `[128, 2I, H/2]`, `w13_scale` float8_e4m3 `[128, 2I, H/16]`, `w13_factor`
-  fp32 `[128]`), 1 = MXFP8 (`w13` float8_e4m3 `[128, 2I, H]`, `w13_scale` uint8 E8M0 `[128, 2I, H/32]`,
-  factor unused).
+* `fmt` 0 = NVFP4 (`w13` uint8 `[n, 2I, H/2]`, `w13_scale` float8_e4m3 `[n, 2I, H/16]`, `w13_factor`
+  fp32 `[n]`), 1 = MXFP8 (`w13` float8_e4m3 `[n, 2I, H]`, `w13_scale` uint8 E8M0 `[n, 2I, H/32]`,
+  factor unused). `n = ecount` (default 128): the weights hold experts `[ebase, ebase + ecount)`, addressed by
+  the local id `e - ebase`; slots whose expert is outside that shard are skipped (the other device runs them).
 * Per (m, e = idx[m, k]): `gu = W13_e · x[m]` (decoded weight value = code × block scale × factor, as
   `model.decode_experts`); gate = gu[2i], up = gu[2i+1] each rounded to BF16 (reference BF16 linear
   output); `out[m, k, i] = bf16(softcap(gate, 4) * sigmoid(gate) * softcap(up, 25))`,
   `softcap(x, c) = c * tanh(x / c)`.
 
-`moe_down(act, idx, wts, w2, w2_scale, w2_factor, fmt, conv_w, conv_state, out)`
+`moe_down(act, idx, wts, w2, w2_scale, w2_factor, fmt, conv_w, conv_state, out[, ebase, ecount])`
 
 * `act` bf16 `[M, 8, I]`, `wts` fp32 `[M, 8]`, `w2` NVFP4 uint8 `[128, H, I/2]` + e4m3 `[128, H, I/16]` +
   factor, or MXFP8 e4m3 `[128, H, I]` + E8M0 `[128, H, I/32]`.
@@ -72,13 +73,17 @@ Weight layouts and the visit plan are in `src/model/model_data.h` and `src/model
 * Target: ≥ 80% of DRAM bandwidth on the 8 experts' bytes per token (NVFP4 ≈ 4.5 MB per expert, MXFP8 ≈
   8.2 MB) for M = 1.
 
-`moe_down_rows(act, idx, w2, w2_scale, w2_factor, fmt, rows)` + `moe_sum(rows, wts, conv_w, conv_state, out)`
+`moe_down_rows(act, idx, w2, w2_scale, w2_factor, fmt, rows[, ebase, ecount])` +
+`moe_sum(rows, wts, conv_w, conv_state, out)` + `moe_rows_merge(rows, rows_hi, idx, ebase)`
 
 * The same arithmetic as `moe_down`, split at the weighted sum so the experts can run on another device (expert
-  parallelism, `src/model/decoder.cpp`'s `expert_hop`). `moe_down_rows` is `moe_down`'s expert pass alone: it
-  writes `rows[(m * 8 + k) * H + c] = bf16(W2_e · act[m, k])` for every slot, the value `moe_down` sums, and
-  reads no `wts`, conv state or output. `moe_sum` is its epilogue on the device that owns the state:
+  parallelism, `src/model/decoder.cpp`'s `expert_hop` / `expert_split_hop`). `moe_down_rows` is `moe_down`'s
+  expert pass alone: it writes `rows[(m * 8 + k) * H + c] = bf16(W2_e · act[m, k])` for every slot its shard
+  holds (`[ebase, ebase + ecount)`; the other slots are left untouched), the value `moe_down` sums, and reads no
+  `wts`, conv state or output. `moe_sum` is its epilogue on the device that owns the state:
   `s[m] = bf16(Σ_k wts[m, k] * rows[(m * 8 + k)])` in slot order, then the post-MLP convolution above.
+* A 64/64 split runs `moe_down_rows` on both devices; `moe_rows_merge` copies the rows of the slots whose expert
+  is `>= ebase` from the second device's buffer over this device's, then one `moe_sum` sums all 8 slots in order.
 * Bit-identical to one `moe_down` on the same `act`/`idx`/weights/state (`tests/kernels/test_bitlock.cpp`
   compares them for M = 1..8, both formats).
 
