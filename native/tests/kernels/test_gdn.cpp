@@ -1,4 +1,4 @@
-// Decode step of the Qwen3.8 gated delta-rule linear attention (src/arch/qwen38/kernels/gdn) against the FP64
+// Decode step of the Qwen3.x gated delta-rule linear attention (src/kernels/gdn) against the FP64
 // host reference of docs/arch/gdn-recurrent.md. Closed-form cases pin the parts of the loop a matching reference
 // and kernel cannot catch on their own (l2 norm + 1/sqrt(K_DIM) scale, repeat_interleave of the grouped k heads,
 // the decay of the state); the FP64 reference is checked against those, and the CUDA kernel against the reference.
@@ -19,7 +19,7 @@ using namespace ingine::test;
 
 namespace {
 
-namespace gdn = ingine::arch::qwen38::kernels;
+namespace gdn = ingine::kernels::gdn;
 constexpr int KD = gdn::GDN_K_DIM;
 constexpr int VD = gdn::GDN_V_DIM;
 constexpr int KH = gdn::GDN_K_HEADS;
@@ -236,6 +236,12 @@ bool cuda_case(int v_heads, Rng& rng) {
   DeviceArray<float> dstate(state0), dout(c.out.size());
 
   gdn::GdnStepArgs a = c.args();
+  // The kernel runs on the device: point every input at its device copy (c.args() returns host pointers).
+  a.q = dq.get();
+  a.k = dk.get();
+  a.v = dv.get();
+  a.beta = dbeta.get();
+  a.g = dg.get();
   a.state = dstate.get();
   a.out = dout.get();
   const cudaError_t err = gdn::gdn_recurrent_step(a, nullptr);

@@ -14,7 +14,7 @@
 #include <cmath>
 #include <cstddef>
 
-namespace ingine::arch::qwen38::kernels {
+namespace ingine::kernels::gdn {
 namespace {
 
 constexpr int kBlock = GDN_V_DIM;  // one thread per value dim
@@ -134,4 +134,4 @@ void gdn_recurrent_step_cpu(const GdnStepArgs& args, double* state, double* out)
   }
 }
 
-}  // namespace ingine::arch::qwen38::kernels
+}  // namespace ingine::kernels::gdn

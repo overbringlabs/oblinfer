@@ -9,6 +9,4 @@ ingine_add_test(NAME kernels_bitlock SOURCES test_bitlock.cpp
 
 # qwen38 GDN decode step: the FP64 reference runs everywhere (no GPU label, so ctest -LE gpu runs it); the
 # CUDA comparison inside skips until an sm_120 device runs the sm_120a build.
-if(TARGET qwen38_gdn)
-  ingine_add_test(NAME kernels_gdn SOURCES test_gdn.cpp LIBS qwen38_gdn CUDA::cudart ORACLE TIMEOUT 300)
-endif()
+ingine_add_test(NAME kernels_gdn SOURCES test_gdn.cpp LIBS ingine_kernels_gdn CUDA::cudart ORACLE TIMEOUT 300)

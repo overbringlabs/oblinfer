@@ -57,7 +57,7 @@ add_subdirectory(src/core)
 #   src/arch/inkling/kernels/<area> -> ingine_kernels_<area>   (aggregated by ingine_kernels)
 #   src/arch/inkling/model          -> ingine_model
 #   src/arch/qwen35moe              -> qwen35moe_data | qwen35moe_data_check  (header-only, always built)
-#   src/arch/qwen38                 -> qwen38_data | qwen38_data_check | qwen38_gdn (always built)
+#   src/arch/qwen38                 -> qwen38_data | qwen38_data_check (always built)
 #   src/arch/nemotron_h             -> nemotron_h_data | nemotron_h_data_check (header-only, always built)
 #   src/engine                      -> ingine_engine
 #   src/serve                       -> ingine_serve
@@ -70,6 +70,8 @@ endfunction()
 
 ingine_add_component(src/text)
 ingine_add_component(src/image)
+# Shared kernels whose shapes more than one pack publishes (currently the Qwen3.x GDN step).
+ingine_add_component(src/kernels/gdn)
 
 # One pack is built at a time: Inkling unless -DINGINE_ARCH_PACK names another directory under src/arch. A pack
 # that has no sources yet contributes its header-only data target only.

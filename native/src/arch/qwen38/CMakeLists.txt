@@ -16,10 +16,3 @@ target_compile_definitions(qwen38_data INTERFACE INGINE_QWEN38_SHAPE=${INGINE_QW
 
 add_library(qwen38_data_check OBJECT model/model_data_check.cpp)
 target_link_libraries(qwen38_data_check PRIVATE qwen38_data)
-
-# Decode-step gated delta-rule kernel: compiled on every build (like model_data_check) so it cannot rot, and not
-# linked into ingine-serve. The kernels_gdn host test links it; a qwen38 model target will when one exists.
-add_library(qwen38_gdn OBJECT kernels/gdn/gdn.cu)
-ingine_cuda_target(qwen38_gdn)
-target_include_directories(qwen38_gdn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(qwen38_gdn PRIVATE qwen38_data CUDA::cudart)

@@ -1,4 +1,6 @@
-// Decode step (S = 1) of the Qwen3.8 gated delta-rule linear attention. Math: docs/arch/gdn-recurrent.md.
+// Decode step (S = 1) of the Qwen3.x gated delta-rule linear attention: the 27B/9B/4B dense hybrids
+// (arch/qwen38) and the 35B-A3B MoE (arch/qwen35moe) publish the same linear-attention shapes, so one
+// implementation serves both. Math: docs/arch/gdn-recurrent.md.
 //
 // Per value head h, with k head kh = h / (v_heads / GDN_K_HEADS) (the repeat_interleave of the grouped heads):
 //
@@ -15,9 +17,9 @@
 
 #include <cuda_runtime.h>
 
-namespace ingine::arch::qwen38::kernels {
+namespace ingine::kernels::gdn {
 
-// 27B/9B/4B text_config: linear_num_key_heads 16, linear_key_head_dim 128, linear_value_head_dim 128.
+// Shared shapes: linear_num_key_heads 16, linear_key_head_dim 128, linear_value_head_dim 128.
 inline constexpr int GDN_K_HEADS = 16;
 inline constexpr int GDN_K_DIM = 128;
 inline constexpr int GDN_V_DIM = 128;
@@ -42,4 +44,4 @@ cudaError_t gdn_recurrent_step(const GdnStepArgs& args, cudaStream_t stream);
 // both FP64.
 void gdn_recurrent_step_cpu(const GdnStepArgs& args, double* state, double* out);
 
-}  // namespace ingine::arch::qwen38::kernels
+}  // namespace ingine::kernels::gdn
