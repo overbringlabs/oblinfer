@@ -57,6 +57,7 @@ add_subdirectory(src/core)
 #   src/arch/inkling/kernels/<area> -> ingine_kernels_<area>   (aggregated by ingine_kernels)
 #   src/arch/inkling/model          -> ingine_model
 #   src/arch/qwen35moe              -> qwen35moe_data | qwen35moe_data_check  (header-only, always built)
+#   src/arch/qwen38                 -> qwen38_data | qwen38_data_check        (header-only, always built)
 #   src/engine                      -> ingine_engine
 #   src/serve                       -> ingine_serve
 #   apps/serve|bench|validate       -> ingine-serve | ingine-bench | ingine-validate
@@ -71,16 +72,19 @@ ingine_add_component(src/image)
 
 # One pack is built at a time: Inkling unless -DINGINE_ARCH_PACK names another directory under src/arch. A pack
 # that has no sources yet contributes its header-only data target only.
-set(INGINE_ARCH_PACK inkling CACHE STRING "Model pack under src/arch (inkling, qwen35moe)")
+set(INGINE_ARCH_PACK inkling CACHE STRING "Model pack under src/arch (inkling, qwen35moe, qwen38)")
 if(NOT EXISTS ${PROJECT_SOURCE_DIR}/src/arch/${INGINE_ARCH_PACK})
   message(FATAL_ERROR "INGINE_ARCH_PACK=${INGINE_ARCH_PACK}: no such directory under src/arch")
 endif()
 
-# The qwen35moe pack is header-only: add_subdirectory always, so its constants header compiles with either pack
-# selected, and nothing from it reaches ingine-serve unless that pack is the selected one.
-if(EXISTS ${PROJECT_SOURCE_DIR}/src/arch/qwen35moe/CMakeLists.txt)
-  add_subdirectory(src/arch/qwen35moe)
-endif()
+# Header-only packs (constants and layer tables, no model or kernel sources yet): add_subdirectory always, so their
+# headers compile with any pack selected, and nothing from them reaches ingine-serve unless that pack is selected.
+set(INGINE_HEADER_ONLY_PACKS qwen35moe qwen38)
+foreach(pack ${INGINE_HEADER_ONLY_PACKS})
+  if(EXISTS ${PROJECT_SOURCE_DIR}/src/arch/${pack}/CMakeLists.txt)
+    add_subdirectory(src/arch/${pack})
+  endif()
+endforeach()
 
 set(INGINE_KERNEL_AREAS common dense moe attn head prefill draft vision)
 foreach(area ${INGINE_KERNEL_AREAS})
@@ -103,9 +107,9 @@ if(INGINE_BUILD_APPS)
   endforeach()
 endif()
 
-# A header-only pack reaches the server only through its data target, and only when it is the selected pack.
-if(INGINE_ARCH_PACK STREQUAL "qwen35moe" AND TARGET ingine-serve)
-  target_link_libraries(ingine-serve PRIVATE qwen35moe_data)
+# A header-only pack reaches the server only through its <pack>_data target, and only when it is the selected pack.
+if(TARGET ingine-serve AND TARGET ${INGINE_ARCH_PACK}_data)
+  target_link_libraries(ingine-serve PRIVATE ${INGINE_ARCH_PACK}_data)
 endif()
 
 if(INGINE_BUILD_TESTS)

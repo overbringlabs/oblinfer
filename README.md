@@ -8,7 +8,7 @@ serves abliterated thinking-model packs. Four packs are on the track;
 | Pack | Status |
 |---|---|
 | Inkling-2-Mini (abliterated) | runs today — two-16 GB Blackwell profile |
-| Qwen3.8-27B hybrid (DaisyRose/Swift) | planned |
+| Qwen3.8-27B hybrid dense (Qwen3.6-27B + DaisyRose/Swift) | constants scaffold (`arch/qwen38`); no kernels yet |
 | Qwen3-MoE 35B-A3B (Qwen3.6 + Ornith NVFP4) | constants scaffold (`arch/qwen35moe`); no kernels yet |
 | Nemotron 3.5 Lightning 30B-A3B | planned |
 
