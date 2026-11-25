@@ -336,7 +336,19 @@ void Decoder::full_layer(int l, int pos) {
     dump("/tmp/qwen_attn_v.bin", v_, KV_DIM);
   }
 
-  if (std::getenv("QWEN35MOE_FLAT_QG")) {
+  if (std::getenv("QWEN35MOE_SWAP_QG")) {
+    // per head [gate | query] instead of [query | gate]
+    attn::SplitQGateArgs split;
+    split.qgate = qgate_;
+    split.q = gate_attn_;  // swapped: second half is the query
+    split.gate = q_attn_;  // first half is the gate
+    split.heads = HEADS;
+    split.head_dim = HEAD_DIM;
+    check(attn::split_q_gate(split, nullptr), "split q gate");
+    float* tmp = q_attn_;
+    q_attn_ = gate_attn_;
+    gate_attn_ = tmp;
+  } else if (std::getenv("QWEN35MOE_FLAT_QG")) {
     // Exporter fused q and gate as two contiguous halves instead of per head.
     check(cudaMemcpy(q_attn_, qgate_, Q_DIM * 4, cudaMemcpyDeviceToDevice), "q half");
     check(cudaMemcpy(gate_attn_, qgate_ + Q_DIM, Q_DIM * 4, cudaMemcpyDeviceToDevice), "gate half");
