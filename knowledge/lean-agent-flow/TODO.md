@@ -32,4 +32,4 @@ question: What is pending
 
 ## Active
 
-| **Split topology** | 🟡 | Ranked: hybrid 111 / EP 91 / PP 61. Waiting on Isaak go to implement EP then KV-head split. | `todo/20261124_split-topology.md` |
+| **Split topology** | 🔴 | Ranked: hybrid 111 / EP 91 / PP 61. EP + 3/8 KV split implemented (decode, chunked prefill); open until the supra tok/s numbers land. | `todo/20261124_split-topology.md` |

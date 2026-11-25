@@ -11,20 +11,20 @@ get here".
 
 ## In flight
 
-- (none) Serve/bench take `--remote-experts` (working tree, uncommitted): every layer's experts on `--second-gpu`.
-  `model_ep_spec` needs supra.
+- (none)
 
 ## Last completed
 
-- 2026-11-24: EP+DSpark — spec runs on the eager step: the verify width is read back (`verify_width`) and
-  `run_step_eager` runs it, the acceptance graph unchanged; a prompt is prefilled one token per step under EP
-  (`prefill_steps`). One device / all-primary: byte-identical (captured graphs, captured verify switch).
-- 2026-11-24: step 4 `1a5a47b` — hop moe to GPU1. Spec refused.
+- 2026-11-25: dual-16 GB Blackwell serving on supra (5070 Ti + 5060 Ti, no P2P). Live llama-swap
+  `inkling-2-mini-ingine`: prefix cache to ~237k, prefill ~1.1–2.8k tok/s, decode **108–122 tok/s**
+  at that depth with DSpark (real chat). Bar 100–120 at 256k is met at ~237k. Installer and README
+  match EP 64/64 + KV-split + `--no-vision --park-mb 0`. Timings on the last SSE chunk.
+- 2026-11-24–25: two-GPU engine (second device, hop, EP decode, chunked prefill, KV-split 5/3,
+  64/64 experts, child-graph splice, CS=8 cluster fallback).
 
 ## Needs a decision
 
-- Next: hop the prefill's grouped expert GEMM (prompt prefill is one token per step on a split), dual verify
-  graphs, 64/64 split, or hold.
+- Second 5070 Ti when it lands: re-measure; even split stays honest. No code required for the bar.
 
 ## In-flight claims
 
