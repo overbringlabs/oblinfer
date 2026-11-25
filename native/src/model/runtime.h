@@ -13,8 +13,14 @@
 // the device, so the host launches step N+1 before it reads token N; a step launched past the end of the
 // generation (stop token, cancel) is undone. Device-selected verify widths (capture_switch, record_*): the
 // speculative loop picks the verify width on the device, so the verify call is launched before the draft
-// it depends on has finished. With experts on the second device there are no graphs at all: every step is
-// eager (run_step_eager), and the speculative loop reads the width back before its verify step.
+// it depends on has finished.
+//
+// With experts on the second device a step spans both devices, and two graphs launched per step cannot order
+// the hop: an event wait node binds to the event's most recent record when it runs (measured), so a wait can
+// never pair with a record of a graph launched after it. The hop is captured the other way round: the second
+// device's half of every split visit is its own graph, captured on that device, and the step graph embeds it
+// as a child graph node (measured: cross-device child nodes run on their own device and order correctly).
+// One step is one graph launch; a child node's edges are the hop's fork and join.
 #pragma once
 
 #include "model/model_data.h"
@@ -60,6 +66,14 @@ void reset_state(State& state, cudaStream_t stream);
 // ---- fast.FastDecoder
 class Decoder {
  public:
+  // What decode() does with a split visit's second-device half (expert hop, KV-head split). The second
+  // device's half is captured once per (call width, visit) into a graph on that device; the step graph then
+  // holds it as a child graph node, so a step is one launch and the hop costs no host work.
+  enum class Capture {
+    kNone,          // eager: both halves run, ordered by the hop's event pair (validation, one device)
+    kHopChildren,   // second-device halves are captured into their graphs and do not run (first device runs)
+    kStep,          // the first device's half is enqueued and the captured child graph is spliced in
+  };
   // `second`: the device opened for expert parallelism (options.second_gpu), or null. A visit whose layer keeps
   // every expert there runs moe_up and moe_down's expert pass on it and hops the per-slot rows back
   // (expert_hop below); a 64/64 split runs both devices' halves and merges the rows here (expert_split_hop).
@@ -71,26 +85,36 @@ class Decoder {
 
   // fast.FastDecoder.decode: runs b.m consecutive tokens b.token at positions *pos, *pos + 1, ...;
   // logits in b.logits, taps in b.taps, conv inputs in b.hist_* when `history`. Graph capturable once it
-  // ran eagerly for `b` (pointer tables are built on first use) — except across the expert hop, which spans
-  // two devices and so cannot be captured (the runtime then decodes eagerly).
-  void decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream);
+  // ran eagerly for `b` (pointer tables are built on first use) — except the parts that run on the second
+  // device, which `capture` selects (Capture above).
+  void decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
+              Capture capture = Capture::kNone);
 
  private:
   const std::int64_t* block_table(const std::vector<const float*>& blocks);
   // EP: one visit's experts on the second device. GPU0 sends xm (bf16 [m, H]) and idx, GPU1 runs moe_up and
   // moe_down's expert pass, its per-slot BF16 rows come back and moe_sum does the weighted sum and the conv
-  // here. Enqueues on `stream` and the second device's stream; no host wait.
-  void expert_hop(const Experts& ex, Buffers& b, int m, const float* conv_w, float* conv_state, float* conv_hist,
-                  cudaStream_t stream);
+  // here. Enqueues on `stream` and the second device's stream; no host wait. `v` is the visit (child slot).
+  void expert_hop(const Experts& ex, Buffers& b, int m, int v, const float* conv_w, float* conv_state,
+                  float* conv_hist, cudaStream_t stream);
   // EP with a 64/64 split (ExpertResidency split 64): each device streams its contiguous half of the layer's
   // experts for the slots that chose them, and moe_sum sums the merged rows here (expert_hop for whole layers).
-  void expert_split_hop(const Experts& ex, Buffers& b, int m, const float* conv_w, float* conv_state,
+  void expert_split_hop(const Experts& ex, Buffers& b, int m, int v, const float* conv_w, float* conv_state,
                         float* conv_hist, cudaStream_t stream);
   // KV-head split (options.kv_split): one full-attention visit. GPU0 runs heads [0, kv_heads), the second
   // device runs [kv_heads, 8) against its own cache shard; the proj slices, conv state and pos hop out
   // through pinned staging and the second device's query-head output rows hop back. `a0` is the GPU0 launch.
   void full_attn_split(const Layer& layer, Buffers& b, int m, int v, kernels::attn::DecodeArgs a0,
                        cudaStream_t stream);
+  // The second device's halves (`capture_` is kHopChildren): begin/end a capture on hop_stream_, which the
+  // caller bound to that device, and keep the graph under (width, visit).
+  cudaGraph_t capture_child(const std::function<void()>& body);
+  void keep_child(std::map<int, std::array<cudaGraph_t, NUM_VISITS>>& slot, int m, int v, cudaGraph_t graph);
+  cudaGraph_t child_at(const std::map<int, std::array<cudaGraph_t, NUM_VISITS>>& slot, int m, int v) const;
+  // Step capture (kStep): adds `child` to the graph being captured on `stream` after everything enqueued so
+  // far, and leaves the stream beside it; join_child makes what follows depend on the child too.
+  cudaGraphNode_t fork_child(cudaStream_t stream, cudaGraph_t child);
+  static void join_child(cudaStream_t stream, cudaGraphNode_t node);
 
   const Weights& w_;
   const Ablation& abl_;
@@ -110,6 +134,11 @@ class Decoder {
   SecondStorage hop_hi_;                   // xm, idx, act, rows on the second device
   DeviceBuffer hop_rows0_;                 // the rows as they land on this device
   DeviceBuffer hop_rows1_;                 // the shard rows, merged in on this device (an interior split only)
+  // The second device's captured halves, by call width and visit (Capture above). A full visit can have both
+  // an expert half and a KV-head half; the step graph holds each as a child node.
+  Capture capture_ = Capture::kNone;
+  std::map<int, std::array<cudaGraph_t, NUM_VISITS>> hop_child_;
+  std::map<int, std::array<cudaGraph_t, NUM_VISITS>> kv_child_;
   // KV-head split (allocated only with options.kv_split; nothing here exists without it)
   struct SplitLayer {
     const float* q_scale = nullptr;  // full [24, 128] copy, indexed by the absolute head
@@ -170,8 +199,8 @@ class Runtime {
   const RuntimeOptions& options() const { return options_; }
   // The second device opened for options.second_gpu (expert parallelism), or null with one device.
   const DeviceContext* second_device() const { return second_device_.get(); }
-  // Some layer keeps its experts on the second device: its visits hop, so a step spans two devices and runs
-  // eagerly (no graph; run_step falls back to run_step_eager).
+  // Some layer keeps its experts on the second device: its visits hop, and the hop is a child graph node of
+  // the step graph (Decoder::Capture). Falls back to eager steps if the graph could not be captured.
   bool expert_parallel() const { return ep_; }
   cudaStream_t stream() const { return stream_; }
   const Weights& weights() const { return weights_; }
@@ -187,8 +216,9 @@ class Runtime {
 
   // Stream-ordered step inputs: buffers(tokens.size()).token = tokens, pos = position (a kernel; no copy).
   void set_inputs(std::span<const std::int32_t> tokens, int position);
-  // Replays width m's graph; returns buffers(m).logits (device). Stream-ordered, no host sync. With experts on
-  // the second device there is no graph: the step runs eagerly (run_step_eager).
+  // Replays width m's graph; returns buffers(m).logits (device). Stream-ordered, no host sync. A step that
+  // spans two devices is one graph too (the hop is a child node); a width without a graph (capture failed)
+  // runs eagerly.
   const float* run_step(int m);
   // set_inputs + run_step for one token (engine._decode_logits).
   const float* decode_logits(std::int32_t token, int position);
@@ -260,7 +290,7 @@ class Runtime {
   std::unique_ptr<DeviceContext> second_device_;  // options_.second_gpu; null with one device
   RuntimeOptions options_;
   int device_ = 0;  // the device this runtime runs on; set when options_.second_gpu is opened
-  bool ep_ = false;  // some layer's experts live on the second device: the step hops, and it runs eager
+  bool ep_ = false;  // some layer's experts live on the second device: the step hops through child graphs
   cudaStream_t stream_ = nullptr;
   Weights weights_;
   Ablation ablation_;

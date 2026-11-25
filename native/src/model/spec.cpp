@@ -193,8 +193,9 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
     }
     if (!greedy) kh::uniform(kd::GAMMA, rng, scratch.uniforms, stream);
     if (rt_.expert_parallel()) {
-      // the verify step spans two devices, so it is no graph (Runtime: eager steps): the width the draft picks
-      // on the device is read back, and that width runs as a plain step before the acceptance graph
+      // the verify step spans two devices, so it is no switch graph: the width the draft picks on the device
+      // is read back, and that width replays as its captured step (one launch on both devices; the hop is a
+      // child graph node). A width whose capture failed steps eagerly inside run_step.
       verify_width(draft_.conf, draft_.tokens, rt_.options().spec_threshold, widths,
                    rt_.tokens(), static_cast<std::int32_t*>(width_.p), stream);
       CUDA_CHECK(cudaMemcpyAsync(width_host_.data(), width_.p, sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));
@@ -202,7 +203,7 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
       CUDA_CHECK(cudaEventSynchronize(done_));
       const int m = *static_cast<const std::int32_t*>(width_host_.data());
       rt_.record_save_verify(m, stream);
-      rt_.run_step_eager(m);
+      rt_.run_step(m);
     } else {
       verify_.launch(stream);
     }

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -99,10 +100,9 @@ void Runtime::init() {
   const RuntimeOptions& options = options_;
   // Expert parallelism: a layer whose experts are not all on this device is decoded across both (a whole
   // layer there: Decoder::expert_hop; a 64/64 split: Decoder::expert_split_hop) — one hop per visit, no peer
-  // access, per-slot BF16 rows summed here. A step that spans two devices cannot be captured as one CUDA graph
-  // (a graph belongs to one device), so it runs eager: run_step falls back to run_step_eager, and the
-  // speculative loop verifies eagerly as well (SpecLoop reads the verify width back and runs the step instead
-  // of the captured switch; dual graphs would buy launch overhead only).
+  // access, per-slot BF16 rows summed here. The hop is captured as a graph on the second device and the step
+  // graph holds it as a child node, so a step is one launch on both devices (see Decoder::Capture for why
+  // two graphs and an event pair cannot order it). A step whose capture fails runs eagerly instead.
   ep_ = false;
   for (const Layer& l : weights_.layers) ep_ = ep_ || l.experts.split != EXPERTS;
   if (ep_ && second_device_ == nullptr) {
@@ -110,8 +110,8 @@ void Runtime::init() {
   }
   if (options.kv_split) {
     // The split caches are written by both the chunked Prefiller and the decode step's split visit; a split
-    // visit crosses devices through pinned host staging, so a step is not capturable and needs the eager step
-    // of expert parallelism.
+    // visit crosses devices through pinned host staging, so it needs the expert-parallel step (the second
+    // device's half is a child graph of that step).
     if (second_device_ == nullptr)
       throw std::invalid_argument("kv split: needs a second device (options.second_gpu)");
     if (!ep_)
@@ -160,9 +160,20 @@ void Runtime::init() {
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
   // write one place)
   for (auto& [m, b] : buffers_) b.token = rm(token_.p, DType::I64, {m});
-  // An expert split decodes eagerly (run_step): a step that spans two devices is not one CUDA graph.
-  if (!ep_)
-    for (const auto& [m, history] : history_) capture(m, history);
+  // A step that spans two devices is one captured graph too (the hop is a child graph node). A two-device
+  // capture that cannot be built leaves that width on the eager step; one device has no fallback and throws.
+  for (const auto& [m, history] : history_) {
+    if (!ep_) {
+      capture(m, history);
+      continue;
+    }
+    try {
+      capture(m, history);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "ingine: width %d: decode capture failed (%s): stepping eagerly\n", m, e.what());
+      graphs_.erase(m);
+    }
+  }
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
@@ -210,13 +221,30 @@ void Runtime::capture(int m, bool history) {
   // warm up so the pointer tables and kernel attributes are set outside capture; the scratch writes to the
   // conv states and ring positions are undone afterwards (the cache rows it wrote are never valid)
   const Snapshot saved = snapshot();
+  bool pending = true;  // the warm-up and capture wrote the state: undo it, also when capture throws
+  struct RestoreOnThrow {
+    Runtime& rt;
+    const Snapshot& snap;
+    bool& pending;
+    ~RestoreOnThrow() {
+      if (pending) rt.restore(snap);
+    }
+  } undo{*this, saved, pending};
   Buffers& b = buffers(m);
   for (int i = 0; i < 2; ++i) decoder_->decode(b, pos(), history, stream_);
   CUDA_CHECK(cudaStreamSynchronize(stream_));
+  if (ep_) {
+    // The second device's half of every split visit, one graph per visit on that device: captured with the
+    // device bound outside the capture (the decoder does that) and with no event inside it, because the step
+    // graph's child node edges are the hop's fork and join. This pass runs the step here as well; its writes
+    // are part of the state the warm-up already invalidated.
+    decoder_->decode(b, pos(), history, stream_, Decoder::Capture::kHopChildren);
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+  }
   cudaGraph_t graph = nullptr;
   CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
   try {
-    decoder_->decode(b, pos(), history, stream_);
+    decoder_->decode(b, pos(), history, stream_, ep_ ? Decoder::Capture::kStep : Decoder::Capture::kNone);
   } catch (...) {
     cudaStreamEndCapture(stream_, &graph);
     if (graph) cudaGraphDestroy(graph);
@@ -229,6 +257,7 @@ void Runtime::capture(int m, bool history) {
   CUDA_CHECK(err);
   CUDA_CHECK(cudaGraphUpload(exec, stream_));
   graphs_[m] = exec;
+  pending = false;
   restore(saved);
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
@@ -242,8 +271,8 @@ void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
 const float* Runtime::run_step(int m) {
   auto it = graphs_.find(m);
   if (it == graphs_.end()) {
-    // with experts on the second device there is no captured step (init skips capture), so the eager step is
-    // the step; without one, a missing width is an error as before
+    // a two-device step whose capture failed steps eagerly (init kept no graph for it); without a second
+    // device a missing width is an error as before
     if (!ep_) throw std::invalid_argument("no decode graph for width " + std::to_string(m));
     return run_step_eager(m);
   }

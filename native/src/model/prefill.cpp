@@ -61,7 +61,7 @@ constexpr std::array<VkSlice, 8> kVkSlices = {{
 }};
 
 // Makes `device` current for the scope, restoring the caller's on exit (the hop's device-1 copies and
-// launches). Never used inside stream capture: a split visit is not capturable.
+// launches). Never used inside stream capture: prefill is eager.
 struct BindDevice {
   explicit BindDevice(int device) {
     CUDA_CHECK(cudaGetDevice(&saved));

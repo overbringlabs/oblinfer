@@ -63,7 +63,7 @@ constexpr std::size_t kVkLayerWeights = std::size_t(HEADS) * HEAD_DIM * 4 + std:
                                        2 * std::size_t(CONV_K) * kVkHeads * HEAD_DIM * 4;
 
 // Makes `device` current for the scope, restoring the caller's on exit (the hop's device-1 copies and
-// launches). Never used inside stream capture: a split visit's step is not capturable.
+// launches). Never used inside stream capture: a split visit's second-device half is captured on its own.
 struct BindDevice {
   explicit BindDevice(int device) {
     CUDA_CHECK(cudaGetDevice(&saved));
@@ -163,6 +163,11 @@ Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, con
 }
 
 Decoder::~Decoder() {
+  // Before the second device goes: the child graphs were captured on it (their nodes' kernels live there).
+  for (auto* slot : {&hop_child_, &kv_child_})
+    for (auto& [m, per_visit] : *slot)
+      for (cudaGraph_t& g : per_visit)
+        if (g) cudaGraphDestroy(g);
   if (second_ == nullptr) return;
   {
     const BindDevice bind(second_->device);  // the second device's events and storage
@@ -188,7 +193,62 @@ const std::int64_t* Decoder::block_table(const std::vector<const float*>& blocks
   return static_cast<const std::int64_t*>(it->second.p);
 }
 
-void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream) {
+cudaGraph_t Decoder::capture_child(const std::function<void()>& body) {
+  // Called with the second device current and no capture active on this thread: its kernels need that
+  // device, and cudaSetDevice is not allowed inside a capture.
+  CUDA_CHECK(cudaStreamBeginCapture(hop_stream_, cudaStreamCaptureModeThreadLocal));
+  try {
+    body();
+  } catch (...) {
+    cudaGraph_t out = nullptr;
+    cudaStreamEndCapture(hop_stream_, &out);
+    if (out) cudaGraphDestroy(out);
+    throw;
+  }
+  cudaGraph_t graph = nullptr;
+  CUDA_CHECK(cudaStreamEndCapture(hop_stream_, &graph));
+  return graph;
+}
+
+void Decoder::keep_child(std::map<int, std::array<cudaGraph_t, NUM_VISITS>>& slot, int m, int v,
+                         cudaGraph_t graph) {
+  cudaGraph_t& held = slot[m][v];
+  if (held) cudaGraphDestroy(held);
+  held = graph;
+}
+
+cudaGraph_t Decoder::child_at(const std::map<int, std::array<cudaGraph_t, NUM_VISITS>>& slot, int m, int v) const {
+  auto it = slot.find(m);
+  if (it == slot.end() || it->second[v] == nullptr)
+    throw std::logic_error("decode capture: no second-device graph for width " + std::to_string(m) + ", visit " +
+                           std::to_string(v));
+  return it->second[v];
+}
+
+cudaGraphNode_t Decoder::fork_child(cudaStream_t stream, cudaGraph_t child) {
+  cudaStreamCaptureStatus status;
+  cudaGraph_t graph = nullptr;
+  const cudaGraphNode_t* deps = nullptr;
+  const cudaGraphEdgeData* edges = nullptr;
+  std::size_t n = 0;
+  CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, nullptr, &graph, &deps, &edges, &n));
+  if (status != cudaStreamCaptureStatusActive) throw std::logic_error("fork_child: the stream is not capturing");
+  cudaGraphNode_t node = nullptr;
+  CUDA_CHECK(cudaGraphAddChildGraphNode(&node, graph, deps, n, child));
+  return node;
+}
+
+void Decoder::join_child(cudaStream_t stream, cudaGraphNode_t node) {
+  CUDA_CHECK(cudaStreamUpdateCaptureDependencies(stream, &node, nullptr, 1, cudaStreamAddCaptureDependencies));
+}
+
+void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream, Capture capture) {
+  struct Restore {
+    Capture& slot;
+    Capture saved;
+    ~Restore() { slot = saved; }
+  } restore{capture_, capture_};
+  capture_ = capture;
   const int m = b.m;
   const int H = HIDDEN;
   const bool pdl = pdl_;
@@ -361,9 +421,9 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     const moe::Format fmt = ex.fmt == ExpertFormat::NVFP4 ? moe::Format::NVFP4 : moe::Format::MXFP8;
     float* conv_hist = history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr;
     if (ex.split == 0) {  // EP: every expert of this layer is on the second device
-      expert_hop(ex, b, m, f32p(layer.mlp_conv), st.conv_mlp_at(v), conv_hist, stream);
+      expert_hop(ex, b, m, v, f32p(layer.mlp_conv), st.conv_mlp_at(v), conv_hist, stream);
     } else if (ex.split != EXPERTS) {  // 64/64: both devices stream their half of the routed experts
-      expert_split_hop(ex, b, m, f32p(layer.mlp_conv), st.conv_mlp_at(v), conv_hist, stream);
+      expert_split_hop(ex, b, m, v, f32p(layer.mlp_conv), st.conv_mlp_at(v), conv_hist, stream);
     } else {
       moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), ex.w13.data, ex.w13_scale.data,
                   f32p(ex.w13_factor), fmt, bf16m(b.act), pdl, stream);
@@ -385,7 +445,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   dense::head(bf16m(b.xf), m, matrix(w.unembed), f32m(b.logits), pdl, stream);
 }
 
-void Decoder::expert_hop(const Experts& ex, Buffers& b, int m, const float* conv_w, float* conv_state,
+void Decoder::expert_hop(const Experts& ex, Buffers& b, int m, int v, const float* conv_w, float* conv_state,
                          float* conv_hist, cudaStream_t stream) {
   // EP step 4 (plans/20261124_ingine-vs-maya-ds.md §4.2/§7.4): the layer's experts are on the second device
   // and no peer access is enabled, so the visit's expert work goes over pinned host staging, the protocol
@@ -404,10 +464,7 @@ void Decoder::expert_hop(const Experts& ex, Buffers& b, int m, const float* conv
   __nv_bfloat16* rows1 = static_cast<__nv_bfloat16*>(hop_hi_.buffers[3].p);
   CUDA_CHECK(cudaMemcpyAsync(hop_x_.data(), bf16m(b.xm), xb, cudaMemcpyDeviceToHost, stream));
   CUDA_CHECK(cudaMemcpyAsync(hop_idx_.data(), b.idx.data, ib, cudaMemcpyDeviceToHost, stream));
-  CUDA_CHECK(cudaEventRecord(hop_ready_, stream));
-  {
-    const BindDevice bind(second_->device);
-    CUDA_CHECK(cudaStreamWaitEvent(hop_stream_, hop_ready_, 0));
+  auto second_half = [&] {
     CUDA_CHECK(cudaMemcpyAsync(xm1, hop_x_.data(), xb, cudaMemcpyHostToDevice, hop_stream_));
     CUDA_CHECK(cudaMemcpyAsync(idx1, hop_idx_.data(), ib, cudaMemcpyHostToDevice, hop_stream_));
     moe::moe_up(xm1, m, idx1, ex.w13_hi.data, ex.w13_scale_hi.data, f32p(ex.w13_factor), fmt, act1, false,
@@ -415,15 +472,28 @@ void Decoder::expert_hop(const Experts& ex, Buffers& b, int m, const float* conv
     moe::moe_down_rows(act1, m, idx1, ex.w2_hi.data, ex.w2_scale_hi.data, f32p(ex.w2_factor), fmt, rows1, false,
                        hop_stream_);
     CUDA_CHECK(cudaMemcpyAsync(hop_rows_.data(), rows1, rb, cudaMemcpyDeviceToHost, hop_stream_));
-    CUDA_CHECK(cudaEventRecord(hop_back_, hop_stream_));
+  };
+  if (capture_ == Capture::kStep) {  // the visit's hop is the captured second-device graph
+    join_child(stream, fork_child(stream, child_at(hop_child_, m, v)));
+  } else if (capture_ == Capture::kHopChildren) {
+    const BindDevice bind(second_->device);
+    keep_child(hop_child_, m, v, capture_child(second_half));
+  } else {
+    CUDA_CHECK(cudaEventRecord(hop_ready_, stream));
+    {
+      const BindDevice bind(second_->device);
+      CUDA_CHECK(cudaStreamWaitEvent(hop_stream_, hop_ready_, 0));
+      second_half();
+      CUDA_CHECK(cudaEventRecord(hop_back_, hop_stream_));
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(stream, hop_back_, 0));
   }
-  CUDA_CHECK(cudaStreamWaitEvent(stream, hop_back_, 0));
   CUDA_CHECK(cudaMemcpyAsync(hop_rows0_.p, hop_rows_.data(), rb, cudaMemcpyHostToDevice, stream));
   moe::moe_sum(static_cast<const __nv_bfloat16*>(hop_rows0_.p), m, f32p(b.wts), conv_w, conv_state, f32m(b.y2),
                conv_hist, stream);
 }
 
-void Decoder::expert_split_hop(const Experts& ex, Buffers& b, int m, const float* conv_w, float* conv_state,
+void Decoder::expert_split_hop(const Experts& ex, Buffers& b, int m, int v, const float* conv_w, float* conv_state,
                                float* conv_hist, cudaStream_t stream) {
   // 64/64 (ExpertResidency split 64): experts [0, split) stream here and [split, 128) on the second device, so
   // both GDDR buses read the routed 8 per token. Each device runs moe_up and moe_down's expert pass for the
@@ -447,10 +517,7 @@ void Decoder::expert_split_hop(const Experts& ex, Buffers& b, int m, const float
 
   CUDA_CHECK(cudaMemcpyAsync(hop_x_.data(), bf16m(b.xm), xb, cudaMemcpyDeviceToHost, stream));
   CUDA_CHECK(cudaMemcpyAsync(hop_idx_.data(), b.idx.data, ib, cudaMemcpyDeviceToHost, stream));
-  CUDA_CHECK(cudaEventRecord(hop_ready_, stream));
-  {
-    const BindDevice bind(second_->device);
-    CUDA_CHECK(cudaStreamWaitEvent(hop_stream_, hop_ready_, 0));
+  auto second_half = [&] {
     CUDA_CHECK(cudaMemcpyAsync(xm1, hop_x_.data(), xb, cudaMemcpyHostToDevice, hop_stream_));
     CUDA_CHECK(cudaMemcpyAsync(idx1, hop_idx_.data(), ib, cudaMemcpyHostToDevice, hop_stream_));
     moe::moe_up(xm1, m, idx1, ex.w13_hi.data, ex.w13_scale_hi.data, f32p(ex.w13_factor_hi), fmt, act1, false,
@@ -458,14 +525,34 @@ void Decoder::expert_split_hop(const Experts& ex, Buffers& b, int m, const float
     moe::moe_down_rows(act1, m, idx1, ex.w2_hi.data, ex.w2_scale_hi.data, f32p(ex.w2_factor_hi), fmt, rows1, false,
                        hop_stream_, split, there);
     CUDA_CHECK(cudaMemcpyAsync(hop_rows_.data(), rows1, rb, cudaMemcpyDeviceToHost, hop_stream_));
-    CUDA_CHECK(cudaEventRecord(hop_back_, hop_stream_));
+  };
+  // The hop forks after this device's input copies and joins after its own half, so the two devices' expert
+  // passes overlap as they do eagerly.
+  cudaGraphNode_t hop_node = nullptr;
+  if (capture_ == Capture::kStep) {
+    hop_node = fork_child(stream, child_at(hop_child_, m, v));
+  } else if (capture_ == Capture::kHopChildren) {
+    const BindDevice bind(second_->device);
+    keep_child(hop_child_, m, v, capture_child(second_half));
+  } else {
+    CUDA_CHECK(cudaEventRecord(hop_ready_, stream));
+    {
+      const BindDevice bind(second_->device);
+      CUDA_CHECK(cudaStreamWaitEvent(hop_stream_, hop_ready_, 0));
+      second_half();
+      CUDA_CHECK(cudaEventRecord(hop_back_, hop_stream_));
+    }
   }
   // this device's half runs while the second device's does
   moe::moe_up(bf16m(b.xm), m, idx, ex.w13.data, ex.w13_scale.data, f32p(ex.w13_factor), fmt, bf16m(b.act), false,
               stream, 0, split);
   moe::moe_down_rows(bf16m(b.act), m, idx, ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor), fmt, rows0, false,
                      stream, 0, split);
-  CUDA_CHECK(cudaStreamWaitEvent(stream, hop_back_, 0));
+  if (capture_ == Capture::kStep) {
+    join_child(stream, hop_node);
+  } else if (capture_ != Capture::kHopChildren) {
+    CUDA_CHECK(cudaStreamWaitEvent(stream, hop_back_, 0));
+  }
   CUDA_CHECK(cudaMemcpyAsync(rows_hi, hop_rows_.data(), rb, cudaMemcpyHostToDevice, stream));
   moe::moe_rows_merge(rows0, rows_hi, idx, m, split, stream);
   moe::moe_sum(rows0, m, f32p(b.wts), conv_w, conv_state, f32m(b.y2), conv_hist, stream);
@@ -504,8 +591,9 @@ void Decoder::full_attn_split(const Layer& layer, Buffers& b, int m, int v, attn
                           {SEG_BEGIN[SEG_K_DYN] + here * CONV_K, there * CONV_K},
                           {SEG_BEGIN[SEG_V_DYN] + here * CONV_K, there * CONV_K}};
   // The packet mirrors a proj row, so the second device can address its slices exactly as it would the whole
-  // row. Its previous reader must be done before it is rewritten.
-  CUDA_CHECK(cudaStreamWaitEvent(stream, kv_.loaded, 0));
+  // row. Its previous reader must be done before it is rewritten: eagerly the event pair orders that, in a
+  // captured step the previous visit's child node already precedes these copies.
+  if (capture_ == Capture::kNone) CUDA_CHECK(cudaStreamWaitEvent(stream, kv_.loaded, 0));
   for (const Slice& s : slices)
     CUDA_CHECK(cudaMemcpy2DAsync(in + s.col, std::size_t(R) * 4, proj + s.col, std::size_t(R) * 4,
                                  std::size_t(s.len) * 4, m, cudaMemcpyDeviceToHost, stream));
@@ -516,6 +604,9 @@ void Decoder::full_attn_split(const Layer& layer, Buffers& b, int m, int v, attn
                                cudaMemcpyDeviceToHost, stream));
   CUDA_CHECK(cudaMemcpyAsync(pos_host, a0.pos, sizeof(std::int64_t), cudaMemcpyDeviceToHost, stream));
   if (!kv_.weights_ready) {  // immutable per-layer slices, once: q/r scales, rel_proj, static conv rows
+    // A captured half holds no upload (it changes the graph topology): the eager warm-up must have run first.
+    if (capture_ != Capture::kNone)
+      throw std::logic_error("full_attn_split: the second device's weight slices must be uploaded before capture");
     char* w = static_cast<char*>(kv_.w_host.data());
     const std::size_t qb = std::size_t(HEADS) * HEAD_DIM * 4, rb = std::size_t(HEADS) * D_REL * 4,
                       pb = std::size_t(D_REL) * REL_EXTENT * 4, kb = std::size_t(CONV_K) * CC * 4;
@@ -534,19 +625,8 @@ void Decoder::full_attn_split(const Layer& layer, Buffers& b, int m, int v, attn
                                    CONV_K, cudaMemcpyDeviceToHost, stream));
     }
   }
-  CUDA_CHECK(cudaEventRecord(kv_.ready, stream));
 
-  // this device's heads, concurrently with the second device's
-  a0.head_begin = 0;
-  a0.head_count = here;
-  a0.cache_heads = here;
-  a0.out_head0 = 0;
-  a0.out_stride = HEADS * HEAD_DIM;
-  attn::attn_decode(a0, stream);
-
-  {
-    const BindDevice bind(second_->device);
-    CUDA_CHECK(cudaStreamWaitEvent(kv_.stream, kv_.ready, 0));
+  auto packet_h2d = [&] {
     CUDA_CHECK(cudaMemcpyAsync(kv_.proj, in, std::size_t(m) * R * 4, cudaMemcpyHostToDevice, kv_.stream));
     CUDA_CHECK(cudaMemcpyAsync(kv_.conv, conv, 2 * std::size_t(K) * CC * 4, cudaMemcpyHostToDevice, kv_.stream));
     CUDA_CHECK(cudaMemcpyAsync(kv_.pos, pos_host, sizeof(std::int64_t), cudaMemcpyHostToDevice, kv_.stream));
@@ -557,8 +637,8 @@ void Decoder::full_attn_split(const Layer& layer, Buffers& b, int m, int v, attn
                                  kv_.stream));
       kv_.weights_ready = true;  // ordered before every later kernel on this stream
     }
-    CUDA_CHECK(cudaEventRecord(kv_.loaded, kv_.stream));
-
+  };
+  auto shard_attn = [&] {
     const auto& wl = kv_.layer[layer.idx];
     attn::DecodeArgs a1;
     a1.proj = static_cast<const float*>(kv_.proj);
@@ -587,16 +667,52 @@ void Decoder::full_attn_split(const Layer& layer, Buffers& b, int m, int v, attn
     a1.out_head0 = 0;
     a1.out_stride = q_count * HEAD_DIM;
     attn::attn_decode(a1, kv_.stream);
-
-    CUDA_CHECK(cudaStreamWaitEvent(kv_.stream, kv_.consumed, 0));  // this device is done with the last result
+  };
+  auto rows_back = [&] {
     CUDA_CHECK(cudaMemcpy2DAsync(out_host, std::size_t(q_count) * HEAD_DIM * 2, kv_.out,
                                  std::size_t(q_count) * HEAD_DIM * 2, std::size_t(q_count) * HEAD_DIM * 2, m,
                                  cudaMemcpyDeviceToHost, kv_.stream));
     CUDA_CHECK(cudaMemcpyAsync(out_conv, kv_.conv, 2 * std::size_t(K) * CC * 4, cudaMemcpyDeviceToHost,
                                kv_.stream));
+  };
+
+  // The hop forks after this visit's packet and joins after this device's own heads, so the two devices'
+  // attention runs concurrently as it does eagerly.
+  cudaGraphNode_t kv_node = nullptr;
+  if (capture_ == Capture::kStep) {
+    kv_node = fork_child(stream, child_at(kv_child_, m, v));
+  } else if (capture_ == Capture::kNone) {
+    CUDA_CHECK(cudaEventRecord(kv_.ready, stream));
+  }
+
+  // this device's heads, concurrently with the second device's
+  a0.head_begin = 0;
+  a0.head_count = here;
+  a0.cache_heads = here;
+  a0.out_head0 = 0;
+  a0.out_stride = HEADS * HEAD_DIM;
+  attn::attn_decode(a0, stream);
+
+  if (capture_ == Capture::kStep) {
+    join_child(stream, kv_node);
+  } else if (capture_ == Capture::kHopChildren) {
+    const BindDevice bind(second_->device);
+    keep_child(kv_child_, m, v, capture_child([&] {
+                  packet_h2d();
+                  shard_attn();
+                  rows_back();
+                }));
+  } else {
+    const BindDevice bind(second_->device);
+    CUDA_CHECK(cudaStreamWaitEvent(kv_.stream, kv_.ready, 0));
+    packet_h2d();
+    CUDA_CHECK(cudaEventRecord(kv_.loaded, kv_.stream));
+    shard_attn();
+    CUDA_CHECK(cudaStreamWaitEvent(kv_.stream, kv_.consumed, 0));  // this device is done with the last result
+    rows_back();
     CUDA_CHECK(cudaEventRecord(kv_.back, kv_.stream));
   }
-  CUDA_CHECK(cudaStreamWaitEvent(stream, kv_.back, 0));
+  if (capture_ == Capture::kNone) CUDA_CHECK(cudaStreamWaitEvent(stream, kv_.back, 0));
   CUDA_CHECK(cudaMemcpy2DAsync(bf16m(b.attn_out) + q_begin * HEAD_DIM, std::size_t(HEADS) * HEAD_DIM * 2, out_host,
                                std::size_t(q_count) * HEAD_DIM * 2, std::size_t(q_count) * HEAD_DIM * 2, m,
                                cudaMemcpyHostToDevice, stream));
@@ -605,7 +721,7 @@ void Decoder::full_attn_split(const Layer& layer, Buffers& b, int m, int v, attn
   CUDA_CHECK(cudaMemcpy2DAsync(st_.conv_v_at(v) + here * HEAD_DIM, std::size_t(KV_DIM) * 4,
                                out_conv + std::size_t(K) * CC, std::size_t(CC) * 4, std::size_t(CC) * 4, K,
                                cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaEventRecord(kv_.consumed, stream));
+  if (capture_ == Capture::kNone) CUDA_CHECK(cudaEventRecord(kv_.consumed, stream));
 }
 
 }  // namespace ingine::model

@@ -5,8 +5,8 @@
 // A prompt that extends the tokens already in the state only prefills the new suffix; any other prompt
 // starts from an empty state. The Prefiller runs the prompt in chunks on either topology: with experts on the
 // second device it hops each remote layer's grouped expert GEMM and, under the KV-head split, the second
-// device's 3 full-attention heads. With experts on the second device no decode step is a graph, so the
-// speculative loop verifies eagerly.
+// device's 3 full-attention heads. With experts on the second device a decode step is one graph over both
+// devices; the speculative loop reads the verify width back and replays that width's graph.
 #include "ingine/generator.h"
 
 #include "core/arena.h"

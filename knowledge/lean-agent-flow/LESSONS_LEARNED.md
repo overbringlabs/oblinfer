@@ -25,3 +25,7 @@ touches: ["lib/**", "test/**"]
 rule: The guard, in one sentence, in the imperative.
 ---
 ```
+
+## Rows
+
+| **Cross-device event nodes do not pair across graph launches** (2026-11-25) | cuda, graphs, ep | Rule: order two devices inside one step with cross-device child graph nodes, never with an event pair split across two graph launches. | `lessons_learned/20261125_cross-device-graph-events.md` |

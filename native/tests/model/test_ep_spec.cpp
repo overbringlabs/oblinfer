@@ -1,7 +1,8 @@
 // Expert parallelism with DSpark: with experts on the second device a verify step spans two devices, so it is
-// no CUDA graph and the speculative loop runs it eagerly (SpecLoop reads the verify width back and steps that
-// width). A greedy speculative generation must still walk the plain decode's tokens: the accept rule only takes
-// drafts equal to the target's argmax. The prompt goes through the chunked Prefiller, whose remote layers hop
+// no switch graph; the speculative loop reads the verify width back and replays that width's step graph (the
+// hop is a child graph node of it, Decoder::Capture). A greedy speculative generation must still walk the
+// plain decode's tokens: the accept rule only takes drafts equal to the target's argmax. The prompt goes
+// through the chunked Prefiller, whose remote layers hop
 // their grouped expert GEMM, so this covers that path too.
 // Two GPUs and the whole checkpoint (~16.5 GB across both cards): skips (77) unless INGINE_RESIDENCY_TEST=1.
 #include "common/test_util.h"
@@ -103,7 +104,7 @@ int main() {
          "both runs emit the token budget");
   // a round emits the drafts it accepted plus one token
   expect(spec.spec_rounds > 0 && spec.spec_rounds + spec.spec_accepted >= tokens,
-         "the speculative loop ran its rounds on the eager verify step");
+         "the speculative loop ran its rounds on the two-device verify step");
   int same = 0;
   for (std::size_t i = 0; i < spec_out.size() && i < plain_out.size(); ++i) same += spec_out[i] == plain_out[i];
   std::printf("positions equal to plain decode: %d of %d\n", same, tokens);
