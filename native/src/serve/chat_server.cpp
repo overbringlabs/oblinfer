@@ -97,6 +97,31 @@ Json usage(const Exchange& x) {
   return Json{{"prompt_tokens", prompt}, {"completion_tokens", completion}, {"total_tokens", prompt + completion}};
 }
 
+// llama.cpp timings object: llama-swap Playground/activity read prompt_ms / predicted_ms / cache_n / draft_*.
+Json timings(const Exchange& x) {
+  const auto st = x.job->stats();
+  const int prompt = int(x.job->prompt_ids.size());
+  const int completion = x.parser.num_tokens();
+  const int cached = st ? st->reused_tokens : 0;
+  const int prefilled = std::max(0, prompt - cached);
+  const double prompt_s = st ? st->prefill_seconds : 0;
+  const double decode_s = st ? st->decode_seconds : 0;
+  const int draft_n = st ? st->spec_accepted + st->spec_rounds : 0;
+  const int draft_ok = st ? st->spec_accepted : 0;
+  Json t{{"prompt_n", prefilled},
+         {"prompt_ms", prompt_s * 1e3},
+         {"prompt_per_second", prompt_s > 0 ? prefilled / prompt_s : 0.0},
+         {"predicted_n", completion},
+         {"predicted_ms", decode_s * 1e3},
+         {"predicted_per_second", decode_s > 0 && completion > 1 ? (completion - 1) / decode_s : 0.0},
+         {"cache_n", cached}};
+  if (draft_n > 0) {
+    t["draft_n"] = draft_n;
+    t["draft_n_accepted"] = draft_ok;
+  }
+  return t;
+}
+
 void log_done(const Exchange& x) {
   const Clock::time_point now = Clock::now();
   const engine::Job& job = *x.job;
@@ -279,7 +304,8 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
                                                  {"logprobs", nullptr},
                                                  {"finish_reason", result.finish_reason ? Json(*result.finish_reason)
                                                                                         : Json()}}})},
-                   {"usage", usage(*x)}});
+                   {"usage", usage(*x)},
+                   {"timings", timings(*x)}});
     return;
   }
 
@@ -320,7 +346,8 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
                                             {"model", model_id_},
                                             {"system_fingerprint", nullptr},
                                             {"choices", Json::array()},
-                                            {"usage", usage(x)}})));
+                                            {"usage", usage(x)},
+                                            {"timings", timings(x)}})));
             }
           }
           transport.write(sse("[DONE]"));

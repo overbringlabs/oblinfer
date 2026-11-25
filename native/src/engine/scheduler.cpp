@@ -91,6 +91,16 @@ void Job::finish() {
   cv_.notify_all();
 }
 
+void Job::set_stats(model::GenerateStats stats) {
+  std::lock_guard lock(mutex_);
+  stats_ = std::move(stats);
+}
+
+std::optional<model::GenerateStats> Job::stats() const {
+  std::lock_guard lock(mutex_);
+  return stats_;
+}
+
 Scheduler::Scheduler(model::Generator& generator, std::vector<int32_t> stop_ids, int max_queue)
     : generator_(generator),
       stop_list_(std::move(stop_ids)),
@@ -188,6 +198,7 @@ void Scheduler::run(Job& job) {
         st.decode_seconds > 0 && st.generated_tokens > 1 ? (st.generated_tokens - 1) / st.decode_seconds : 0;
     server_log().info("{}: generated={} decode={:.3f}s tok/s={:.1f} spec_rounds={} spec_accepted={}", job.id,
                       st.generated_tokens, st.decode_seconds, decode_tok_s, st.spec_rounds, st.spec_accepted);
+    job.set_stats(st);
     if (!job.images.empty()) {  // images: all of the prompt, those the vision tower encoded now, its time
       server_log().info("{}: images={} image_tokens={} encoded={} vit={:.3f}s", job.id, job.images.size(),
                         st.image_tokens, st.images_encoded, st.vision_seconds);

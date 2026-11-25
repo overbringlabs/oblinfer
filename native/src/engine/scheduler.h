@@ -47,6 +47,7 @@ class Job {
   void cancel() { cancel_.store(true, std::memory_order_release); }
   bool cancelled() const { return cancel_.load(std::memory_order_acquire); }
   std::optional<Clock::time_point> t_start() const;
+  std::optional<model::GenerateStats> stats() const;
 
   // Waits up to `timeout` for output, then returns everything available (empty on timeout).
   JobBatch take(Clock::duration timeout);
@@ -57,6 +58,7 @@ class Job {
   void push(const std::vector<int32_t>& tokens);
   void fail(std::string message);
   void finish();
+  void set_stats(model::GenerateStats stats);
 
   std::atomic<bool> cancel_{false};
   mutable std::mutex mutex_;
@@ -65,6 +67,7 @@ class Job {
   std::optional<std::string> failure_;
   bool end_ = false;
   std::optional<Clock::time_point> t_start_;
+  std::optional<model::GenerateStats> stats_;
 };
 
 struct SchedulerStats {
