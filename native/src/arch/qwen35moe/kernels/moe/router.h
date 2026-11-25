@@ -21,6 +21,7 @@ struct RouterArgs {
   const float* x = nullptr;               // [ROUTER_HIDDEN]
   int* ids = nullptr;                     // [ROUTER_TOP_K], descending logit
   float* weights = nullptr;               // [ROUTER_TOP_K], softmax over the selected logits
+  float* logits = nullptr;                // [ROUTER_EXPERTS] scratch, written by the logits kernel
 };
 
 cudaError_t route(RouterArgs args, cudaStream_t stream);

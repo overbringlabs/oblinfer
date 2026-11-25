@@ -6,59 +6,67 @@
 namespace ingine::arch::qwen35moe::kernels {
 namespace {
 
-// One block of 256 threads: thread e owns expert e, so the router needs no cross-thread reduction for the
-// logits. Selection and softmax are single-thread over 256 shared floats, which is cheaper than a parallel
-// top-k at decode width.
-__global__ __launch_bounds__(ROUTER_EXPERTS) void route_kernel(RouterArgs args) {
-  __shared__ float logits[ROUTER_EXPERTS];
-  const int e = threadIdx.x;
+// Phase 1: one warp per expert, each lane covering 64 of the 2048 columns, warp-reduced. The previous
+// single-block version gave every thread a full 2048-long dot, which cost hundreds of microseconds per layer.
+constexpr int kRouterThreads = 256;
+constexpr int kExpertsPerBlock = kRouterThreads / 32;
 
-  const __nv_bfloat16* w = args.weight + std::size_t(e) * ROUTER_HIDDEN;
+__global__ __launch_bounds__(kRouterThreads) void router_logits_kernel(const __nv_bfloat16* w, const float* x,
+                                                                      float* logits) {
+  const int expert = blockIdx.x * kExpertsPerBlock + (threadIdx.x >> 5);
+  if (expert >= ROUTER_EXPERTS) return;
+  const int lane = threadIdx.x & 31;
+  const __nv_bfloat16* row = w + std::size_t(expert) * ROUTER_HIDDEN;
   float acc = 0.0f;
-#pragma unroll 8
-  for (int i = 0; i < ROUTER_HIDDEN; ++i) acc += __bfloat162float(w[i]) * args.x[i];
-  logits[e] = acc;
-  __syncthreads();
+  for (int i = lane; i < ROUTER_HIDDEN; i += 32) acc += __bfloat162float(row[i]) * x[i];
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  if (lane == 0) logits[expert] = acc;
+}
 
-  if (e == 0) {
-    bool used[ROUTER_EXPERTS] = {};
-    int best[ROUTER_TOP_K];
-    for (int k = 0; k < ROUTER_TOP_K; ++k) {
-      int pick = -1;
-      float best_value = -INFINITY;
+// Phase 2: top-k and the softmax over the selected logits, single thread over 256 floats.
+__global__ void router_select_kernel(const float* logits, int* ids, float* weights) {
+  bool used[ROUTER_EXPERTS] = {};
+  int best[ROUTER_TOP_K];
+  for (int k = 0; k < ROUTER_TOP_K; ++k) {
+    int pick = -1;
+    float best_value = -INFINITY;
+    for (int i = 0; i < ROUTER_EXPERTS; ++i) {
+      if (!used[i] && logits[i] > best_value) {
+        best_value = logits[i];
+        pick = i;
+      }
+    }
+    if (pick < 0) {
       for (int i = 0; i < ROUTER_EXPERTS; ++i) {
-        if (!used[i] && logits[i] > best_value) {
-          best_value = logits[i];
+        if (!used[i]) {
           pick = i;
+          break;
         }
       }
-      if (pick < 0) {  // NaN logits or no candidate left: fall back to the lowest unused id
-        for (int i = 0; i < ROUTER_EXPERTS; ++i) {
-          if (!used[i]) {
-            pick = i;
-            break;
-          }
-        }
-      }
-      used[pick] = true;
-      best[k] = pick;
     }
-    float m = -INFINITY;
-    for (int k = 0; k < ROUTER_TOP_K; ++k) m = fmaxf(m, logits[best[k]]);
-    float sum = 0.0f;
-    for (int k = 0; k < ROUTER_TOP_K; ++k) {
-      sum += expf(logits[best[k]] - m);
-      args.ids[k] = best[k];
-    }
-    for (int k = 0; k < ROUTER_TOP_K; ++k) args.weights[k] = expf(logits[best[k]] - m) / sum;
+    used[pick] = true;
+    best[k] = pick;
   }
+  float m = -INFINITY;
+  for (int k = 0; k < ROUTER_TOP_K; ++k) m = fmaxf(m, logits[best[k]]);
+  float sum = 0.0f;
+  for (int k = 0; k < ROUTER_TOP_K; ++k) {
+    sum += expf(logits[best[k]] - m);
+    ids[k] = best[k];
+  }
+  for (int k = 0; k < ROUTER_TOP_K; ++k) weights[k] = expf(logits[best[k]] - m) / sum;
 }
 
 }  // namespace
 
 cudaError_t route(RouterArgs args, cudaStream_t stream) {
   if (!args.weight || !args.x || !args.ids || !args.weights) return cudaErrorInvalidValue;
-  route_kernel<<<1, ROUTER_EXPERTS, 0, stream>>>(args);
+  if (!args.logits) return cudaErrorInvalidValue;
+  router_logits_kernel<<<(ROUTER_EXPERTS + kExpertsPerBlock - 1) / kExpertsPerBlock, kRouterThreads, 0, stream>>>(
+      args.weight, args.x, args.logits);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  router_select_kernel<<<1, 1, 0, stream>>>(args.logits, args.ids, args.weights);
   return cudaGetLastError();
 }
 

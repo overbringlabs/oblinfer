@@ -73,6 +73,7 @@ Decoder::~Decoder() {
     (void)name;
     if (buffer) cudaFree(buffer);
   }
+  if (router_logits_) cudaFree(router_logits_);
   if (argmax_dev_) cudaFree(argmax_dev_);
   if (dev1_ != dev0_) {
     cudaSetDevice(dev1_);
@@ -189,6 +190,7 @@ bool Decoder::init(const TextArena& arena, int max_pos, std::string* error) {
       check(cudaHostAlloc(reinterpret_cast<void**>(&pinned_out_), HIDDEN * 4, cudaHostAllocDefault), "host alloc");
     }
 
+    router_logits_ = static_cast<float*>(alloc(attn::ROUTER_EXPERTS * 4));
     ids_dev_ = static_cast<int*>(alloc(attn::ROUTER_TOP_K * 4));
     weights_dev_ = static_cast<float*>(alloc(attn::ROUTER_TOP_K * 4));
     argmax_dev_ = static_cast<int*>(alloc(4));
@@ -477,6 +479,7 @@ void Decoder::moe(int l) {
   router.x = h2_;
   router.ids = ids_dev_;
   router.weights = weights_dev_;
+  router.logits = router_logits_;
   check(cudaSetDevice(dev0_), "set device 0");
   check(attn::route(router, nullptr), "router");
 

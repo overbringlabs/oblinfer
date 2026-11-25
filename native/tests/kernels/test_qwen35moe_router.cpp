@@ -44,11 +44,13 @@ bool one_hot_case() {
   x[0] = 1.0f;  // logit[e] == w[e][0]
   std::vector<int> ids(K);
   std::vector<float> weights(K);
+  std::vector<float> logits(K);
   moe::RouterArgs a;
   a.weight = w.data();
   a.x = x.data();
   a.ids = ids.data();
   a.weights = weights.data();
+  a.logits = logits.data();
   moe::route_cpu(a);
 
   // Expected: the top 8 of the first column, descending.
@@ -86,12 +88,13 @@ bool random_case(bool cuda) {
   for (auto& v : x) v = float(rng.normal());
 
   std::vector<int> ref_ids(K);
-  std::vector<float> ref_w(K), got_w(K);
+  std::vector<float> ref_w(K), got_w(K), ref_logits(K);
   moe::RouterArgs r;
   r.weight = w.data();
   r.x = x.data();
   r.ids = ref_ids.data();
   r.weights = ref_w.data();
+  r.logits = ref_logits.data();
   moe::route_cpu(r);
   if (!cuda) return true;
 
@@ -99,12 +102,13 @@ bool random_case(bool cuda) {
   DeviceArray<__nv_bfloat16> dw(w);
   DeviceArray<float> dx(x);
   DeviceArray<int> di(K);
-  DeviceArray<float> dwn(K);
+  DeviceArray<float> dwn(K), dl(E);
   moe::RouterArgs d;
   d.weight = dw.get();
   d.x = dx.get();
   d.ids = di.get();
   d.weights = dwn.get();
+  d.logits = dl.get();
   if (moe::route(d, nullptr) != cudaSuccess) {
     std::printf("FAIL route launch\n");
     return false;

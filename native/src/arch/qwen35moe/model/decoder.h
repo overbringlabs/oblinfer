@@ -123,7 +123,9 @@ class Decoder {
   float* fscratch_down_[2] = {};
   int* peer_ids_ = nullptr;
   float* peer_weights_ = nullptr;
+  __nv_bfloat16* peer_router_ = nullptr;  // [LAYERS][ROUTER_EXPERTS][HIDDEN]: the router replicated on card 1
 
+  float* router_logits_ = nullptr;
   int* ids_dev_ = nullptr;
   float* weights_dev_ = nullptr;
   int* argmax_dev_ = nullptr;
