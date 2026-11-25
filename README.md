@@ -1,9 +1,20 @@
-# Inkling-2-Mini abliterated: ingine
+# oblinfer
 
-An abliterated [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) served
-by **ingine**, a C++/CUDA engine. It answers harmful test prompts instead of refusing them (refusal phrases in 1
-of 104 and 3 of 48 answers, the 3 followed by the requested text), and stays close to the original elsewhere
-(KL 0.014 on harmless answers).
+A C++/CUDA inference engine (a fork of
+[waseigo/inkling-2-mini-abliterated-ingine](https://github.com/waseigo/inkling-2-mini-abliterated-ingine)) that
+serves abliterated thinking-model packs. Four packs are on the track;
+[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) is the only one that runs today:
+
+| Pack | Status |
+|---|---|
+| Inkling-2-Mini (abliterated) | runs today — two-16 GB Blackwell profile |
+| Qwen3.8-27B hybrid (DaisyRose/Swift) | planned |
+| Qwen3-MoE 35B-A3B (Qwen3.6 + Ornith NVFP4) | planned |
+| Nemotron 3.5 Lightning 30B-A3B | planned |
+
+The Inkling pack answers harmful test prompts instead of refusing them (refusal phrases in 1 of 104 and 3 of 48
+answers, the 3 followed by the requested text), and stays close to the original elsewhere (KL 0.014 on harmless
+answers).
 
 The checkpoint is mixed **NVFP4** (layers 0–19) and **MXFP8** (20–23), about 20 GB. That does not fit one 16 GB
 card, and 16 GB of host RAM cannot hold the spill. Serving uses **two Blackwell GPUs** (compute capability 12.0):
@@ -43,14 +54,14 @@ no Python or PyTorch at runtime.
 ## Run
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/satellitedown/inkling-2-mini-abliterated-ingine/main/get.sh | bash
+curl -fsSL https://raw.githubusercontent.com/overbringlabs/oblinfer/main/get.sh | bash
 ```
 
 Or:
 
 ```bash
-git clone https://github.com/satellitedown/inkling-2-mini-abliterated-ingine
-cd inkling-2-mini-abliterated-ingine
+git clone https://github.com/overbringlabs/oblinfer
+cd oblinfer
 bash setup.sh
 ```
 

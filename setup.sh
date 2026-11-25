@@ -188,7 +188,7 @@ update_installer() {
   top="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null)" || top=""
   if [[ -z "$top" || ! "$top" -ef "$ROOT" ]]; then
     echo "This folder is not a git clone of the installer, so it cannot update itself." >&2
-    echo "Clone https://github.com/satellitedown/inkling-2-mini-abliterated-ingine and install from it." >&2
+    echo "Clone https://github.com/overbringlabs/oblinfer and install from it." >&2
     return 1
   fi
   before="$(git -C "$ROOT" rev-parse HEAD)" || return 1

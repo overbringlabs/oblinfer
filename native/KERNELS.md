@@ -2,14 +2,14 @@
 
 ingine runs Inkling-2-Mini on one RTX 5090 (sm_120a, 32 GB, ~1.79 TB/s). The decode step (one token, or up to 8
 consecutive tokens for speculative verification) is a fixed sequence of custom kernels captured in one CUDA graph
-per call width (`src/model/decoder.cpp`, `src/model/runtime.cpp`). This file is the contract between those
-kernels (`src/kernels/{moe,attn,dense}`) and the host code. The prefill (`src/kernels/prefill`) and the DSpark
-drafter (`src/kernels/draft`) compute the same model math; their headers document their own precision.
+per call width (`src/arch/inkling/decoder.cpp`, `src/arch/inkling/runtime.cpp`). This file is the contract between those
+kernels (`src/arch/inkling/{moe,attn,dense}`) and the host code. The prefill (`src/arch/inkling/prefill`) and the DSpark
+drafter (`src/arch/inkling/draft`) compute the same model math; their headers document their own precision.
 
 The kernels were written as PyTorch extensions, qualified against ingine's PyTorch model (FP32 activations, BF16
 matrix inputs; itself checked against the transformers reference) and then ported unchanged to C++ launchers.
 That engine was removed once the C++ engine matched it; it is in the history up to commit 44bc891 (`engine/`).
-Weight layouts and the visit plan are in `src/model/model_data.h` and `src/model/weights.cpp`.
+Weight layouts and the visit plan are in `src/arch/inkling/model_data.h` and `src/arch/inkling/weights.cpp`.
 
 ## Model facts used by kernels
 
@@ -17,13 +17,13 @@ Weight layouts and the visit plan are in `src/model/model_data.h` and `src/model
 * 48 layer visits per token: layers 0-5, layers 6-17 three times, layers 18-23. Full-attention layers are
   5, 11, 17, 23; all others use a 1024-token sliding window.
 * MoE: 128 experts, top-8, expert intermediate I = 1152. Experts of layers 0-19 are NVFP4, 20-23 MXFP8
-  (layouts in `src/model/model_data.h`). `w13` rows are interleaved: row 2i = gate i, row 2i+1 = up i.
+  (layouts in `src/arch/inkling/model_data.h`). `w13` rows are interleaved: row 2i = gate i, row 2i+1 = up i.
 * All short convolutions have kernel 4 and keep the previous 3 inputs as state ``[3, C]`` (oldest first,
   zeros before the first token).
 
 ## Conventions (all kernels)
 
-* One static library per area: `src/kernels/<area>/` -> `ingine_kernels_<area>`, raw-pointer launchers declared
+* One static library per area: `src/arch/inkling/<area>/` -> `ingine_kernels_<area>`, raw-pointer launchers declared
   in `<area>.h`.
 * Every launcher takes preallocated outputs and workspaces and a stream, never allocates, never synchronises, and
   reads positions/lengths from device memory, so it can be captured in a CUDA graph and replayed with different
@@ -77,7 +77,7 @@ Weight layouts and the visit plan are in `src/model/model_data.h` and `src/model
 `moe_sum(rows, wts, conv_w, conv_state, out)` + `moe_rows_merge(rows, rows_hi, idx, ebase)`
 
 * The same arithmetic as `moe_down`, split at the weighted sum so the experts can run on another device (expert
-  parallelism, `src/model/decoder.cpp`'s `expert_hop` / `expert_split_hop`). `moe_down_rows` is `moe_down`'s
+  parallelism, `src/arch/inkling/decoder.cpp`'s `expert_hop` / `expert_split_hop`). `moe_down_rows` is `moe_down`'s
   expert pass alone: it writes `rows[(m * 8 + k) * H + c] = bf16(W2_e · act[m, k])` for every slot its shard
   holds (`[ebase, ebase + ecount)`; the other slots are left untouched), the value `moe_down` sums, and reads no
   `wts`, conv state or output. `moe_sum` is its epilogue on the device that owns the state:
@@ -187,7 +187,7 @@ Not part of the decode step: `model::VisionEncoder` runs these once per image, b
 holds the image's tokens. Reference: transformers `Inkling2ImageProcessor` and `Inkling2VisionModel`
 (`tools/vision_ref.py`; its `--check-spec` implements this section in NumPy and compares it with transformers).
 Matrix products are `kernels::prefill::Gemm` (BF16 operands, FP32 accumulation); the kernels of this area are
-the elementwise work between them (`src/kernels/vision/vision.h`).
+the elementwise work between them (`src/arch/inkling/vision/vision.h`).
 
 Pixels. RGB bytes `[H, W, 3]`; transparency is composited before (`src/image`): `(c * a + bg * (255 - a) + 127)
 // 255` with `bg = 204` where `(y // 8 + x // 8)` is even, else `153`. No resizing. The image is padded right

@@ -9,15 +9,15 @@ math, decode kernels, CLI flags and HTTP behaviour. Hardware: RTX 5090 class onl
 
 | C++ | Ported from the Python engine |
 |---|---|
-| `src/model/model_data.h`, `weights.cpp`, `state.cpp` | `weights.py`: checkpoint names, constants, visit plan (48 visits: layers 0-5, 6-17 three times, 18-23), expert formats (NVFP4 layers 0-19, MXFP8 20-23); `model.py` `State` (caches), ablation, taps |
-| `src/model/decoder.cpp`, `runtime.cpp` | `fast.py`: the fused decode step (kernel sequence per visit, buffers per call width, projection layout, FP8 dense conversion) |
-| `src/kernels/{dense,moe,attn}`, `KERNELS.md` | `csrc/**` and `SPEC.md`: the decode kernels and their contracts, ported unchanged |
-| `src/model/prefill.cpp`, `src/kernels/prefill` | `model.py` `Model.prefill` (chunked prompt processing); new kernels (flash attention, grouped MoE GEMMs) |
-| `src/model/drafter.*`, `src/kernels/draft` | `dspark.py`: the DSpark drafter (draft/commit, context buckets, top-1024 Markov candidates) |
-| `src/model/generator.cpp`, `spec.*`, `src/kernels/head` | `engine.py`: prefix reuse, decode graphs per width (1, 2, 4, 8), speculative loop (draft, adaptive verify width, accept, rollback, commit), sampling |
+| `src/arch/inkling/model_data.h`, `weights.cpp`, `state.cpp` | `weights.py`: checkpoint names, constants, visit plan (48 visits: layers 0-5, 6-17 three times, 18-23), expert formats (NVFP4 layers 0-19, MXFP8 20-23); `model.py` `State` (caches), ablation, taps |
+| `src/arch/inkling/decoder.cpp`, `runtime.cpp` | `fast.py`: the fused decode step (kernel sequence per visit, buffers per call width, projection layout, FP8 dense conversion) |
+| `src/arch/inkling/{dense,moe,attn}`, `KERNELS.md` | `csrc/**` and `SPEC.md`: the decode kernels and their contracts, ported unchanged |
+| `src/arch/inkling/prefill.cpp`, `src/arch/inkling/prefill` | `model.py` `Model.prefill` (chunked prompt processing); new kernels (flash attention, grouped MoE GEMMs) |
+| `src/arch/inkling/drafter.*`, `src/arch/inkling/draft` | `dspark.py`: the DSpark drafter (draft/commit, context buckets, top-1024 Markov candidates) |
+| `src/arch/inkling/generator.cpp`, `spec.*`, `src/arch/inkling/head` | `engine.py`: prefix reuse, decode graphs per width (1, 2, 4, 8), speculative loop (draft, adaptive verify width, accept, rollback, commit), sampling |
 | `src/text` | `chat.py`: chat rendering (the model's `chat_template.jinja`), reasoning/tool output parsing (`StreamParser`), effort levels |
 | `src/serve`, `src/engine` | `server.py`: `/health`, `/v1/models`, `/v1/chat/completions` (streaming, `reasoning_content`, tools), FIFO scheduler |
-| `src/image`, `src/kernels/vision`, `src/model/vision.*` | none (the Python engine was text only): image input, written against the transformers reference (`Inkling2ImageProcessor`, `Inkling2VisionModel`); see "Images" below |
+| `src/image`, `src/arch/inkling/vision`, `src/arch/inkling/vision.*` | none (the Python engine was text only): image input, written against the transformers reference (`Inkling2ImageProcessor`, `Inkling2VisionModel`); see "Images" below |
 
 The serving profile (262,144 tokens, `--dense-fp8 --kv-fp8 --spec --spec-threshold 0.8`, 127.0.0.1:8003) comes
 from `runtime-manifest.json`.
@@ -48,10 +48,10 @@ native/
   src/image/       -> ingine_image                   image decoding (stb_image, libwebp), the reference
                                                      processor's pixels, reduction, content hash and prompt ids
                                                      (CUDA-free)
-  src/kernels/<a>/ -> ingine_kernels_<a>             dense, moe, attn, head (ported decode kernels + sampling),
+  src/arch/inkling/<a>/ -> ingine_kernels_<a>             dense, moe, attn, head (ported decode kernels + sampling),
                                                      prefill (new), draft (new), vision (new); aggregated by
                                                      ingine_kernels
-  src/model/       -> ingine_model                   weights, state, decode step + graphs, prefill driver,
+  src/arch/inkling/       -> ingine_model                   weights, state, decode step + graphs, prefill driver,
                                                      drafter, speculative loop, vision tower, Generator
                                                      implementation
   src/engine/      -> ingine_engine                  request scheduler (1 active + bounded FIFO), cancellation
@@ -112,7 +112,7 @@ The split regex (tokenizer.json `pre_tokenizer`) is
 `[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+`;
 implement it as a hand-written matcher with utf8proc categories (fngine's `qwen_word_end` approach).
 
-### Generator (`src/model`, namespace `ingine::model`), mirror of `engine.Engine.generate`
+### Generator (`src/arch/inkling`, namespace `ingine::model`), mirror of `engine.Engine.generate`
 
 ```cpp
 struct Sampling { float temperature = 1.0f; float top_p = 1.0f; int top_k = 0; std::optional<uint64_t> seed; };
@@ -138,7 +138,7 @@ class Generator {
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options);   // the model
 ```
 
-### Model data (`src/model/model_data.h`)
+### Model data (`src/arch/inkling/model_data.h`)
 
 C++ mirrors of `weights.Weights`/`Layer`/`Experts`, `model.State` and `fast.Buffers`, using `ingine::Tensor`
 (fngine's non-owning view: data, DType incl. FP8_E4M3FN, ne/nb) over device memory. Field names follow the
@@ -200,7 +200,7 @@ device. A round costs one extra host synchronisation and loses the overlap of th
 emission. With one device, or a table that moves nothing, `ep_` is false and nothing changes: every step is a
 captured graph, the verify call the captured switch, and the prefill chunked.
 
-### Prefill (`src/model/prefill.{h,cpp}`)
+### Prefill (`src/arch/inkling/prefill.{h,cpp}`)
 
 ```cpp
 // Processes prompt tokens [T] (device int32) at positions pos0..pos0+T-1 on top of `state` (exactly
@@ -218,7 +218,7 @@ class Prefiller {
 };
 ```
 
-### Images (`src/image`, `src/kernels/vision`, `src/model/vision.{h,cpp}`)
+### Images (`src/image`, `src/arch/inkling/vision`, `src/arch/inkling/vision.{h,cpp}`)
 
 The checkpoint holds Inkling-2's vision tower (`model.visual.*`, 422 BF16 tensors, 636 MB): a 23-layer ViT over
 20x20-pixel patches with a class token, learned position embeddings resampled to the patch grid, 2-D rotary
@@ -276,7 +276,7 @@ for 4096 tokens), released on return. Time on an RTX 5090: 3 ms up to 64 tokens,
 1849, 1.1 s for 4096 (attention is a GEMM pair per head over chunks of queries; a fused kernel would be the
 next step). `RuntimeOptions::vision` (ingine-serve: on unless `--no-vision`) loads the tower.
 
-### Speculative decoding (`src/model/drafter.*`, `src/model/spec.*`)
+### Speculative decoding (`src/arch/inkling/drafter.*`, `src/arch/inkling/spec.*`)
 
 `Drafter` mirrors `dspark.Drafter` (`draft(anchor, P, temperature) -> tokens[7], logits[7, V]`,
 `commit(feats [n,4,H], start)`, graphs per context bucket and one for small commits). `SpecLoop::generate(...)`
@@ -292,7 +292,7 @@ draft distribution is valid, because drafts are verified by the full model (gree
 probabilities they were drawn from. It keeps checkpoints of its context for prompt-prefix reuse
 (`save_checkpoint`/`restore_checkpoint`; `checkpoint_regions`/`adopt_checkpoint` for parked conversations).
 
-`src/model/runtime.h` is the model runtime the Generator, Prefiller and speculative loop share: stream, weights,
+`src/arch/inkling/runtime.h` is the model runtime the Generator, Prefiller and speculative loop share: stream, weights,
 state, decode graphs per width with history and taps, the state accessors for rollback, and pipelined width-1
 steps (`chain_*`: each step's input token is the previous step's sampled token on the device, so plain decoding
 launches step N+1 before the host reads token N; a step launched past a stop token or a cancel is undone) and
