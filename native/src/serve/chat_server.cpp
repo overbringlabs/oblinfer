@@ -87,7 +87,10 @@ void pump(Exchange& x, const std::function<bool()>& gone, const std::function<vo
       deltas.insert(deltas.end(), std::make_move_iterator(d.begin()), std::make_move_iterator(d.end()));
     }
     if (!deltas.empty()) emit(deltas);
-    if (x.parser.finish_reason()) break;
+    if (x.failure) break;
+    // Worker publishes GenerateStats then Job::finish(). Breaking on the stop
+    // token alone raced that and emitted timings with zeros (Playground 0.00 t/s).
+    if (batch.end) break;
   }
 }
 
