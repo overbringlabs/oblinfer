@@ -13,3 +13,10 @@ ingine_add_test(NAME kernels_gdn SOURCES test_gdn.cpp LIBS ingine_kernels_gdn CU
 # conv1d + SiLU and the gated RMSNorm around the delta rule: FP64 halves run everywhere, the CUDA comparison
 # skips off sm_120
 ingine_add_test(NAME kernels_gdn_conv SOURCES test_gdn_conv.cpp LIBS ingine_kernels_gdn CUDA::cudart ORACLE TIMEOUT 300)
+
+# Qwen3.6-35B-A3B decode attention (head 256, 2 KV heads, BF16 cache) against the FP64 reference; the CUDA
+# comparison runs only on sm_120.
+if(TARGET qwen35moe_attn)
+  ingine_add_test(NAME kernels_qwen35moe_attn SOURCES test_qwen35moe_attn.cpp
+                  LIBS qwen35moe_attn CUDA::cudart ORACLE TIMEOUT 300)
+endif()

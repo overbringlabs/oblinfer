@@ -20,3 +20,10 @@ target_link_libraries(qwen35moe_names PRIVATE qwen35moe_data)
 add_library(qwen35moe_placement OBJECT model/placement.cpp)
 target_include_directories(qwen35moe_placement PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(qwen35moe_placement PRIVATE qwen35moe_data qwen35moe_names)
+
+# Decode attention of the full-attention layers (head 256, 2 KV heads, BF16 cache). Compiled on every build
+# like the other shared kernels; the kernels_qwen35moe_attn test links it.
+add_library(qwen35moe_attn OBJECT kernels/attn/decode_attn.cu)
+ingine_cuda_target(qwen35moe_attn)
+target_include_directories(qwen35moe_attn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(qwen35moe_attn PRIVATE qwen35moe_data CUDA::cudart)
