@@ -58,6 +58,7 @@ add_subdirectory(src/core)
 #   src/arch/inkling/model          -> ingine_model
 #   src/arch/qwen35moe              -> qwen35moe_data | qwen35moe_data_check  (header-only, always built)
 #   src/arch/qwen38                 -> qwen38_data | qwen38_data_check | qwen38_gdn (always built)
+#   src/arch/nemotron_h             -> nemotron_h_data | nemotron_h_data_check (header-only, always built)
 #   src/engine                      -> ingine_engine
 #   src/serve                       -> ingine_serve
 #   apps/serve|bench|validate       -> ingine-serve | ingine-bench | ingine-validate
@@ -72,14 +73,14 @@ ingine_add_component(src/image)
 
 # One pack is built at a time: Inkling unless -DINGINE_ARCH_PACK names another directory under src/arch. A pack
 # that has no sources yet contributes its header-only data target only.
-set(INGINE_ARCH_PACK inkling CACHE STRING "Model pack under src/arch (inkling, qwen35moe, qwen38)")
+set(INGINE_ARCH_PACK inkling CACHE STRING "Model pack under src/arch (inkling, qwen35moe, qwen38, nemotron_h)")
 if(NOT EXISTS ${PROJECT_SOURCE_DIR}/src/arch/${INGINE_ARCH_PACK})
   message(FATAL_ERROR "INGINE_ARCH_PACK=${INGINE_ARCH_PACK}: no such directory under src/arch")
 endif()
 
 # Header-only packs (constants and layer tables, no model or kernel sources yet): add_subdirectory always, so their
 # headers compile with any pack selected, and nothing from them reaches ingine-serve unless that pack is selected.
-set(INGINE_HEADER_ONLY_PACKS qwen35moe qwen38)
+set(INGINE_HEADER_ONLY_PACKS qwen35moe qwen38 nemotron_h)
 foreach(pack ${INGINE_HEADER_ONLY_PACKS})
   if(EXISTS ${PROJECT_SOURCE_DIR}/src/arch/${pack}/CMakeLists.txt)
     add_subdirectory(src/arch/${pack})
