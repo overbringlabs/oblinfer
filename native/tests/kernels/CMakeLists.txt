@@ -63,3 +63,8 @@ if(TARGET ingine_kernels_dense_ops)
   ingine_add_test(NAME kernels_dense_ops SOURCES test_dense_ops.cpp
                   LIBS ingine_kernels_dense_ops CUDA::cudart ORACLE TIMEOUT 300)
 endif()
+
+# GEMV design bench (variants side by side, realised GB/s). Run manually on sm_120.
+if(TARGET ingine_kernels_quant)
+  ingine_add_test(NAME bench_gemv SOURCES bench_gemv.cu LIBS CUDA::cudart TIMEOUT 600)
+endif()
