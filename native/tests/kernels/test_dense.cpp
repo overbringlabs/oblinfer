@@ -1,8 +1,8 @@
-// Dense decode kernels (src/kernels/dense) against FP64 oracles of KERNELS.md area `dense`, at the model's
-// shapes with synthetic weights (adapted from the PyTorch engine's test_dense.py: proj BF16/FP8 for several M and
-// both projection layouts, proj_conv with its state update and history, head BF16/FP8, router with FP32 and
-// BF16 weights, mix over its block/query/optional-tensor variants, message gates G = 1/3 with FP32/BF16
-// forget/gain weights, embed, fp8_rows and dequant_rows).
+// Dense decode kernels (src/arch/inkling/kernels/dense) against FP64 oracles of KERNELS.md area `dense`, at
+// the model's shapes with synthetic weights (adapted from the PyTorch engine's test_dense.py: proj BF16/FP8
+// for several M and both projection layouts, proj_conv with its state update and history, head BF16/FP8,
+// router with FP32 and BF16 weights, mix over its block/query/optional-tensor variants, message gates G = 1/3
+// with FP32/BF16 forget/gain weights, embed, fp8_rows and dequant_rows).
 #include "kernels/oracle.h"
 
 #include "kernels/dense/dense.h"

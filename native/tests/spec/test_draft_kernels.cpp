@@ -1,7 +1,7 @@
-// CPU-oracle tests of the DSpark draft kernels (src/kernels/draft) at small sizes. The oracles repeat
-// dspark.py's rounding points in FP32 (reductions in FP64), so results agree to about one BF16 ulp; discrete
-// outputs (candidate sets, picks, tokens, slots) must match exactly or be consistent with the kernel's own
-// logits.
+// CPU-oracle tests of the DSpark draft kernels (src/arch/inkling/kernels/draft) at small sizes. The oracles
+// repeat dspark.py's rounding points in FP32 (reductions in FP64), so results agree to about one BF16 ulp;
+// discrete outputs (candidate sets, picks, tokens, slots) must match exactly or be consistent with the
+// kernel's own logits.
 #include "common/test_util.h"
 #include "kernels/draft/draft.h"
 #include "kernels/draft/rng.h"

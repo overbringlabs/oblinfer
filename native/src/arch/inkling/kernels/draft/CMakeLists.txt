@@ -5,7 +5,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_shortlist_bin}
 file(READ ${_shortlist_bin} _shortlist_hex HEX)
 string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _shortlist_bytes "${_shortlist_hex}")
 file(WRITE ${_shortlist_cpp}.tmp
-  "// Generated from draft_shortlist.bin by src/kernels/draft/CMakeLists.txt.\n"
+  "// Generated from draft_shortlist.bin by src/arch/inkling/kernels/draft/CMakeLists.txt.\n"
   "#include \"kernels/draft/shortlist.h\"\n"
   "namespace ingine::kernels::draft {\nnamespace {\n"
   "alignas(4) const unsigned char kBytes[] = {${_shortlist_bytes}};\n}\n"

@@ -1,10 +1,10 @@
-// Attention core (src/kernels/attn) against an FP64 oracle of KERNELS.md area `attn` (adapted from the PyTorch
-// engine's test_attn.py): sliding layers with an empty, partially filled, wrapped, and wrapped ring
-// holding stale speculative entries, M = 1..8; full layers at p0 = 0, 3000 and 9000 (log scaling active)
-// with BF16 and FP8 (E4M3) caches, plus every FP8 verify width M = 2..8 at p0 = 4637 (a partial last 64-key
-// tile). Checks the output, the new cache rows, ring positions and conv states; full layers also rerun with
-// random bytes in the rows at and after p0 + M (stale speculative rows) and require identical output bits.
-// Synthetic layer parameters; caches of 10016 rows (about 40 MB).
+// Attention core (src/arch/inkling/kernels/attn) against an FP64 oracle of KERNELS.md area `attn`
+// (adapted from the PyTorch engine's test_attn.py): sliding layers with an empty, partially filled,
+// wrapped, and wrapped ring holding stale speculative entries, M = 1..8; full layers at p0 = 0, 3000 and
+// 9000 (log scaling active) with BF16 and FP8 (E4M3) caches, plus every FP8 verify width M = 2..8 at
+// p0 = 4637 (a partial last 64-key tile). Checks the output, the new cache rows, ring positions and conv
+// states; full layers also rerun with random bytes in the rows at and after p0 + M (stale speculative
+// rows) and require identical output bits. Synthetic layer parameters; caches of 10016 rows (about 40 MB).
 #include "kernels/oracle.h"
 
 #include "kernels/attn/attn.h"

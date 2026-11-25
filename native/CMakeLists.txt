@@ -50,13 +50,15 @@ add_subdirectory(src/core)
 
 # Every other component directory owns its CMakeLists.txt and defines the target named here; a
 # directory is added only once it has one, so the tree builds while components are in progress.
-#   src/text              -> ingine_text
-#   src/image             -> ingine_image
-#   src/kernels/<area>    -> ingine_kernels_<area>   (aggregated by ingine_kernels)
-#   src/model             -> ingine_model
-#   src/engine            -> ingine_engine
-#   src/serve             -> ingine_serve
-#   apps/serve|bench|validate -> ingine-serve | ingine-bench | ingine-validate
+# A model pack lives under src/arch/<pack>/ (header root, so its sources still include "model/..." and
+# "kernels/...").
+#   src/text                        -> ingine_text
+#   src/image                       -> ingine_image
+#   src/arch/inkling/kernels/<area> -> ingine_kernels_<area>   (aggregated by ingine_kernels)
+#   src/arch/inkling/model          -> ingine_model
+#   src/engine                      -> ingine_engine
+#   src/serve                       -> ingine_serve
+#   apps/serve|bench|validate       -> ingine-serve | ingine-bench | ingine-validate
 function(ingine_add_component dir)
   if(EXISTS ${PROJECT_SOURCE_DIR}/${dir}/CMakeLists.txt)
     add_subdirectory(${dir})
@@ -66,9 +68,10 @@ endfunction()
 ingine_add_component(src/text)
 ingine_add_component(src/image)
 
+set(INGINE_ARCH_PACK inkling)
 set(INGINE_KERNEL_AREAS common dense moe attn head prefill draft vision)
 foreach(area ${INGINE_KERNEL_AREAS})
-  ingine_add_component(src/kernels/${area})
+  ingine_add_component(src/arch/${INGINE_ARCH_PACK}/kernels/${area})
 endforeach()
 add_library(ingine_kernels INTERFACE)
 foreach(area ${INGINE_KERNEL_AREAS})
@@ -77,7 +80,7 @@ foreach(area ${INGINE_KERNEL_AREAS})
   endif()
 endforeach()
 
-ingine_add_component(src/model)
+ingine_add_component(src/arch/${INGINE_ARCH_PACK}/model)
 ingine_add_component(src/engine)
 ingine_add_component(src/serve)
 

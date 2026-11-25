@@ -1,6 +1,6 @@
-// Token selection kernels (src/kernels/head) against host oracles of engine.Engine._probs / _sample:
-// argmax (first maximum on ties), the sampling distribution over the full 200058-token vocabulary for
-// temperature / top-k / top-p combinations, top-k = 1 and temperature 0 draws, seeded determinism, the
+// Token selection kernels (src/arch/inkling/kernels/head) against host oracles of engine.Engine._probs /
+// _sample: argmax (first maximum on ties), the sampling distribution over the full 200058-token vocabulary
+// for temperature / top-k / top-p combinations, top-k = 1 and temperature 0 draws, seeded determinism, the
 // empirical distribution of many draws, sample_from_probs and uniform.
 #include "kernels/oracle.h"
 

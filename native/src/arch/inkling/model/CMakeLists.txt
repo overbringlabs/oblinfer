@@ -14,7 +14,8 @@ foreach(src prefill.cpp drafter.cpp spec.cpp)
 endforeach()
 ingine_cuda_target(ingine_model)
 ingine_internal_includes(ingine_model)
-target_include_directories(ingine_model PUBLIC ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+target_include_directories(ingine_model PUBLIC
+  ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/src/arch/inkling ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(ingine_model PUBLIC
   ingine_core
   ingine_kernels_dense

@@ -10,7 +10,7 @@ ingine_add_test(NAME spec_sampling_fidelity SOURCES test_sampling_fidelity.cpp
 # drafter.cpp is compiled in directly so the test needs only the dense and draft kernels.
 if(TARGET ingine_kernels_dense)
   ingine_add_test(NAME spec_drafter
-                  SOURCES test_drafter.cpp ${PROJECT_SOURCE_DIR}/src/model/drafter.cpp
+                  SOURCES test_drafter.cpp ${PROJECT_SOURCE_DIR}/src/arch/inkling/model/drafter.cpp
                   LIBS ingine_kernels_draft ingine_kernels_dense ingine_core CUDA::cudart
                   GPU MODEL TIMEOUT 600)
 endif()

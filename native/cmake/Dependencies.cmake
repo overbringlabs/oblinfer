@@ -8,10 +8,13 @@ foreach(_cuda_target CUDA::cudart CUDA::cublasLt)
 endforeach()
 
 # Internal headers: public API in include/, implementation in src/, vendored headers in third_party/.
+# src/arch/<pack> is the root of a model pack's headers, so they are included as "model/..." and
+# "kernels/..." regardless of the pack directory.
 function(ingine_internal_includes target)
   target_include_directories(${target} PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src/arch/inkling
     ${PROJECT_SOURCE_DIR}/third_party)
 endfunction()
 

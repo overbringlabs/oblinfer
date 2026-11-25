@@ -1,4 +1,4 @@
-"""Builds native/src/kernels/draft/draft_shortlist.bin, the token ranking of the drafter's shortlist head.
+"""Builds native/src/arch/inkling/kernels/draft/draft_shortlist.bin, the token ranking of the drafter's shortlist head.
 
 The drafter scores its base logits over the first K tokens of this ranking (plus the special tokens and the
 tokens of the current context) instead of the whole 200,058-token unembedding. The ranking is token frequency
@@ -47,7 +47,7 @@ def collect(patterns, budget):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokenizer", required=True)
-    ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "../src/kernels/draft/draft_shortlist.bin"))
+    ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "../src/arch/inkling/kernels/draft/draft_shortlist.bin"))
     a = ap.parse_args()
     random.seed(0)
     tok = Tokenizer.from_file(a.tokenizer)
