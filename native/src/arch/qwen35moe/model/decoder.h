@@ -16,6 +16,7 @@
 
 #include <cuda_bf16.h>
 
+#include "arch/qwen35moe/kernels/moe/fused_experts.h"
 #include "arch/qwen35moe/model/uploader.h"
 
 namespace ingine::arch::qwen35moe {
@@ -47,8 +48,10 @@ class Decoder {
     int span = 0;  // which device holds this expert
   };
 
-  // Runs one expert's gate/up/down on `device`, reading x and writing out there.
-  void run_expert(int l, int expert, int device, const float* x, float* out, float* scratch_h, float* scratch_up);
+  struct FusedTable {
+    std::vector<kernels::FusedExpertLayer> host;  // LAYERS * EXPERTS, indexed [layer * EXPERTS + expert]
+    kernels::FusedExpertLayer* device = nullptr;
+  };
 
   void* ptr(const std::string& name) const;
   // FP32 view of a BF16 checkpoint tensor (norms, A_log, dt_bias, conv1d): converted once at first use.
@@ -113,6 +116,13 @@ class Decoder {
   float* peer_out_ = nullptr;  // device 1: expert output
   float* pinned_in_ = nullptr;
   float* pinned_out_ = nullptr;
+
+  FusedTable fused_[2];
+  float* fscratch_gate_[2] = {};
+  float* fscratch_up_[2] = {};
+  float* fscratch_down_[2] = {};
+  int* peer_ids_ = nullptr;
+  float* peer_weights_ = nullptr;
 
   int* ids_dev_ = nullptr;
   float* weights_dev_ = nullptr;

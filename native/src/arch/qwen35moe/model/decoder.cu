@@ -59,6 +59,16 @@ Decoder::~Decoder() {
   }
   if (ids_dev_) cudaFree(ids_dev_);
   if (weights_dev_) cudaFree(weights_dev_);
+  for (int d = 0; d < 2; ++d) {
+    cudaSetDevice(d == 0 ? dev0_ : dev1_);
+    for (float* p : {fscratch_gate_[d], fscratch_up_[d], fscratch_down_[d]}) {
+      if (p) cudaFree(p);
+    }
+    if (fused_[d].device) cudaFree(fused_[d].device);
+  }
+  if (peer_ids_) cudaFree(peer_ids_);
+  if (peer_weights_) cudaFree(peer_weights_);
+  cudaSetDevice(dev0_);
   for (auto& [name, buffer] : f32_) {
     (void)name;
     if (buffer) cudaFree(buffer);
@@ -120,10 +130,12 @@ bool Decoder::init(const TextArena& arena, int max_pos, std::string* error) {
       if (p.name.ends_with(".weight_scale") || p.name.ends_with(".weight_scale_2") ||
           p.name.ends_with(".input_scale")) {
         float value = 0.0f;
+        check(cudaSetDevice(arena.spans[std::size_t(p.span)].cuda_device), "scale device");
         check(cudaMemcpy(&value, ptr(p.name), 4, cudaMemcpyDeviceToHost), "scale read");
         scalars_[p.name] = value;
       }
     }
+    check(cudaSetDevice(dev0_), "set device 0");
 
     x_ = static_cast<float*>(alloc(HIDDEN * 4));
     h_ = static_cast<float*>(alloc(HIDDEN * 4));
@@ -199,6 +211,71 @@ bool Decoder::init(const TextArena& arena, int max_pos, std::string* error) {
         experts_[l][e].span = placed_.at(base + "gate_proj.weight")->span;
       }
     }
+
+    // Fused MoE tables, one per device: entry [l * EXPERTS + e]. A foreign expert carries stride 0 and the
+    // kernel skips it, so both cards run the same router ids and each contributes its own experts.
+    for (int d = 0; d < 2; ++d) {
+      fused_[d].host.assign(std::size_t(LAYERS) * EXPERTS, kernels::FusedExpertLayer{});
+      check(cudaSetDevice(d == 0 ? dev0_ : dev1_), "set scratch device");
+      fscratch_gate_[d] = static_cast<float*>(alloc(std::size_t(attn::ROUTER_TOP_K) * MOE_INTER * 4));
+      fscratch_up_[d] = static_cast<float*>(alloc(std::size_t(attn::ROUTER_TOP_K) * MOE_INTER * 4));
+      fscratch_down_[d] = static_cast<float*>(alloc(std::size_t(attn::ROUTER_TOP_K) * HIDDEN * 4));
+    }
+    check(cudaSetDevice(dev0_), "set device 0");
+    for (int l = 0; l < LAYERS; ++l) {
+      const LayerPlan& lp = arena.plan.layers[std::size_t(l)];
+      if (!lp.has_experts) throw std::runtime_error("layer " + std::to_string(l) + " has no expert block");
+      int off[3][4] = {};
+      for (const TensorSlot& slot : lp.experts.slots) {
+        const int proj = slot.projection == Projection::GateProj ? 0 : slot.projection == Projection::UpProj ? 1 : 2;
+        const int art = slot.artifact == Artifact::Weight          ? 0
+                        : slot.artifact == Artifact::WeightScale   ? 1
+                        : slot.artifact == Artifact::WeightScale2  ? 2
+                                                                   : 3;
+        off[proj][art] = int(slot.offset);
+      }
+      const int stride = int(lp.experts.stride);
+      for (int e = 0; e < EXPERTS; ++e) {
+        const std::string ebase = layer_name(l, "mlp.experts.") + std::to_string(e) + ".";
+        const int span = placed_.at(ebase + "gate_proj.weight")->span;
+        // weight_scale_2 is per expert, not per layer.
+        const float gate2 = scalar(ebase + "gate_proj.weight_scale_2", 1.0f);
+        const float up2 = scalar(ebase + "up_proj.weight_scale_2", 1.0f);
+        const float down2 = scalar(ebase + "down_proj.weight_scale_2", 1.0f);
+        for (int d = 0; d < 2; ++d) {
+          kernels::FusedExpertLayer& f = fused_[d].host[std::size_t(l) * EXPERTS + e];
+          if (span != d) {
+            f.stride_bytes = 0;
+            continue;
+          }
+          f.stride_bytes = stride;
+          f.scale_stride_bytes = stride;
+          f.gate_weight_off = off[0][0];
+          f.up_weight_off = off[1][0];
+          f.down_weight_off = off[2][0];
+          f.gate_scale_off = off[0][1];
+          f.up_scale_off = off[1][1];
+          f.down_scale_off = off[2][1];
+          f.gate_scale2 = gate2;
+          f.up_scale2 = up2;
+          f.down_scale2 = down2;
+          f.w_base = static_cast<const std::uint8_t*>(ptr(ebase + "gate_proj.weight")) -
+                     std::size_t(e) * std::size_t(stride) - std::size_t(off[0][0]);
+          f.s_base = static_cast<const std::uint8_t*>(ptr(ebase + "gate_proj.weight_scale")) -
+                     std::size_t(e) * std::size_t(stride) - std::size_t(off[0][1]);
+        }
+      }
+    }
+    for (int d = 0; d < 2; ++d) {
+      const std::size_t bytes = fused_[d].host.size() * sizeof(kernels::FusedExpertLayer);
+      check(cudaSetDevice(d == 0 ? dev0_ : dev1_), "set table device");
+      fused_[d].device = static_cast<kernels::FusedExpertLayer*>(alloc(bytes));
+      check(cudaMemcpy(fused_[d].device, fused_[d].host.data(), bytes, cudaMemcpyHostToDevice), "fused table");
+    }
+    check(cudaSetDevice(dev1_), "set device 1");
+    peer_ids_ = static_cast<int*>(alloc(attn::ROUTER_TOP_K * 4));
+    peer_weights_ = static_cast<float*>(alloc(attn::ROUTER_TOP_K * 4));
+    check(cudaSetDevice(dev0_), "set device 0");
     return true;
   } catch (const std::exception& e) {
     if (error) *error = e.what();
@@ -394,24 +471,6 @@ void Decoder::full_layer(int l, int pos) {
   if (dump_here) dump("/tmp/qwen_attn_y.bin", y_, HIDDEN);
 }
 
-void Decoder::run_expert(int l, int expert, int device, const float* x, float* out, float* scratch_h,
-                         float* scratch_up) {
-  const ExpertRow& row = experts_[l][std::size_t(expert)];
-  quant::Nvfp4GemvArgs gate{row.gate.w, row.gate.scales, row.gate.scale, x, scratch_h, MOE_INTER, HIDDEN};
-  quant::Nvfp4GemvArgs up{row.up.w, row.up.scales, row.up.scale, x, scratch_up, MOE_INTER, HIDDEN};
-  quant::Nvfp4GemvArgs down{row.down.w, row.down.scales, row.down.scale, scratch_h, out, HIDDEN, MOE_INTER};
-  check(cudaSetDevice(device), "set expert device");
-  if (std::getenv("QWEN35MOE_DEBUG")) {
-    std::printf("[expert] l=%d e=%d dev=%d span=%d w=%p scales=%p x=%p y=%p\n", l, expert, device,
-                row.span, static_cast<const void*>(gate.w), static_cast<const void*>(gate.scales),
-                static_cast<const void*>(gate.x), static_cast<void*>(gate.y));
-  }
-  check(quant::nvfp4_gemv(gate, nullptr), "expert gate");
-  check(quant::nvfp4_gemv(up, nullptr), "expert up");
-  check(attn::silu_mul(scratch_h, scratch_h, scratch_up, MOE_INTER, nullptr), "expert silu");
-  check(quant::nvfp4_gemv(down, nullptr), "expert down");
-}
-
 void Decoder::moe(int l) {
   attn::RouterArgs router;
   router.weight = static_cast<const __nv_bfloat16*>(ptr(layer_name(l, "mlp.gate.weight")));
@@ -426,49 +485,40 @@ void Decoder::moe(int l) {
   check(cudaMemcpy(ids, ids_dev_, sizeof(ids), cudaMemcpyDeviceToHost), "ids copy");
   check(cudaMemcpy(weights, weights_dev_, sizeof(weights), cudaMemcpyDeviceToHost), "weights copy");
 
-  check(cudaMemset(moe_out_, 0, HIDDEN * 4), "moe zero");
-  for (int k = 0; k < attn::ROUTER_TOP_K; ++k) {
-    const int expert = ids[k];
-    const int span = experts_[l][std::size_t(expert)].span;
-    float* out = y_;
-    if (span == dev0_ || dev1_ == dev0_) {
-      run_expert(l, expert, dev0_, h2_, out, shared_h_, shared_up_);
-      check(cudaSetDevice(dev0_), "set device 0");
-    } else {
-      // No P2P between the cards: stage the 2048-wide input and output through pinned host memory.
-      check(cudaMemcpy(pinned_in_, h2_, HIDDEN * 4, cudaMemcpyDeviceToHost), "peer in");
-      check(cudaSetDevice(dev1_), "set device 1");
-      check(cudaMemcpy(peer_x_, pinned_in_, HIDDEN * 4, cudaMemcpyHostToDevice), "peer in h2d");
-      run_expert(l, expert, dev1_, peer_x_, peer_out_, peer_h_, peer_up_);
-      check(cudaMemcpy(pinned_out_, peer_out_, HIDDEN * 4, cudaMemcpyDeviceToHost), "peer out");
-      check(cudaSetDevice(dev0_), "set device 0");
-      check(cudaMemcpy(out, pinned_out_, HIDDEN * 4, cudaMemcpyHostToDevice), "peer out h2d");
-    }
-    if (std::getenv("QWEN35MOE_DUMP") && last_pos_ == 0 && l == 0 && k == 0) {
-      std::vector<float> xv(HIDDEN), ov(HIDDEN);
-      check(cudaMemcpy(xv.data(), h2_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump moe x");
-      check(cudaMemcpy(ov.data(), out, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump moe out");
-      std::printf("moe_e0 expert=%d x0:", expert);
-      for (int i = 0; i < 4; ++i) std::printf(" %.9g", xv[std::size_t(i)]);
-      std::printf("\n");
-      std::printf("moe_e0 out0:");
-      for (int i = 0; i < 4; ++i) std::printf(" %.9g", ov[std::size_t(i)]);
-      std::printf("\n");
-      if (FILE* fx = std::fopen("/tmp/qwen_moe_x.bin", "wb")) {
-        std::fwrite(xv.data(), 4, HIDDEN, fx);
-        std::fclose(fx);
-      }
-      if (FILE* fo = std::fopen("/tmp/qwen_moe_out.bin", "wb")) {
-        std::fwrite(ov.data(), 4, HIDDEN, fo);
-        std::fclose(fo);
-      }
-      if (FILE* fw = std::fopen("/tmp/qwen_moe_w.bin", "wb")) {
-        std::fwrite(weights, 4, attn::ROUTER_TOP_K, fw);
-        std::fclose(fw);
-      }
-    }
-    check(attn::axpy(moe_out_, out, weights[k], HIDDEN, nullptr), "moe accumulate");
+  if (dev1_ != dev0_) {
+    check(cudaMemcpy(pinned_in_, h2_, HIDDEN * 4, cudaMemcpyDeviceToHost), "peer x");
+    check(cudaSetDevice(dev1_), "set device 1");
+    check(cudaMemcpy(peer_x_, pinned_in_, HIDDEN * 4, cudaMemcpyHostToDevice), "peer x h2d");
+    check(cudaMemcpy(peer_ids_, ids, sizeof(ids), cudaMemcpyHostToDevice), "peer ids");
+    check(cudaMemcpy(peer_weights_, weights, sizeof(weights), cudaMemcpyHostToDevice), "peer weights");
+    kernels::FusedMoeArgs a1;
+    a1.layers = fused_[1].device + std::size_t(l) * EXPERTS;
+    a1.x = peer_x_;
+    a1.ids = peer_ids_;
+    a1.weights = peer_weights_;
+    a1.y = peer_out_;
+    a1.scratch_gate = fscratch_gate_[1];
+    a1.scratch_up = fscratch_up_[1];
+    a1.scratch_down = fscratch_down_[1];
+    check(kernels::fused_moe_apply(a1, nullptr), "fused moe dev1");
+    check(cudaMemcpy(pinned_out_, peer_out_, HIDDEN * 4, cudaMemcpyDeviceToHost), "peer y");
+    check(cudaSetDevice(dev0_), "set device 0");
+    check(cudaMemcpy(y_, pinned_out_, HIDDEN * 4, cudaMemcpyHostToDevice), "peer y h2d");
+  } else {
+    check(cudaMemset(y_, 0, HIDDEN * 4), "peer y zero");
   }
+
+  kernels::FusedMoeArgs a0;
+  a0.layers = fused_[0].device + std::size_t(l) * EXPERTS;
+  a0.x = h2_;
+  a0.ids = ids_dev_;
+  a0.weights = weights_dev_;
+  a0.y = moe_out_;
+  a0.scratch_gate = fscratch_gate_[0];
+  a0.scratch_up = fscratch_up_[0];
+  a0.scratch_down = fscratch_down_[0];
+  check(kernels::fused_moe_apply(a0, nullptr), "fused moe dev0");
+  check(attn::axpy(moe_out_, y_, 1.0f, HIDDEN, nullptr), "merge expert partials");
 
   attn::SharedExpertArgs shared;
   shared.gate = {static_cast<const std::uint8_t*>(ptr(layer_name(l, "mlp.shared_expert.gate_proj.weight"))),
