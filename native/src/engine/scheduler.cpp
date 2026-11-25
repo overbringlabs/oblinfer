@@ -184,6 +184,10 @@ void Scheduler::run(Job& job) {
     // prefix reuse of the prompt: the path, the tokens reused and prefilled, the prefill time
     server_log().info("{}: reuse={} reused={} prefilled={} prefill={:.3f}s", job.id, model::to_string(st.reuse),
                       st.reused_tokens, st.prompt_tokens - st.reused_tokens, st.prefill_seconds);
+    const double decode_tok_s =
+        st.decode_seconds > 0 && st.generated_tokens > 1 ? (st.generated_tokens - 1) / st.decode_seconds : 0;
+    server_log().info("{}: generated={} decode={:.3f}s tok/s={:.1f} spec_rounds={} spec_accepted={}", job.id,
+                      st.generated_tokens, st.decode_seconds, decode_tok_s, st.spec_rounds, st.spec_accepted);
     if (!job.images.empty()) {  // images: all of the prompt, those the vision tower encoded now, its time
       server_log().info("{}: images={} image_tokens={} encoded={} vit={:.3f}s", job.id, job.images.size(),
                         st.image_tokens, st.images_encoded, st.vision_seconds);
