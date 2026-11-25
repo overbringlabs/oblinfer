@@ -32,3 +32,9 @@ if(TARGET ingine_kernels_quant)
   ingine_add_test(NAME kernels_quant_gemv SOURCES test_quant_gemv.cpp
                   LIBS ingine_kernels_quant CUDA::cudart ORACLE TIMEOUT 300)
 endif()
+
+# Qwen3.6-35B-A3B router: 256 bf16 logits, top 8, softmax over the selected logits
+if(TARGET qwen35moe_moe)
+  ingine_add_test(NAME kernels_qwen35moe_router SOURCES test_qwen35moe_router.cpp
+                  LIBS qwen35moe_moe CUDA::cudart ORACLE TIMEOUT 300)
+endif()
