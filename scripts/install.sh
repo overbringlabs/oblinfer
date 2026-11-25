@@ -34,8 +34,10 @@ performance state (driver 595 or newer; about 0.8% more tokens per second).
 CUDAHOSTCXX selects the host compiler nvcc uses; by default CXX when set, else the first of c++,
 g++, g++-16, g++-15, g++-14, g++-13 and g++-12 that the pinned nvcc accepts. CXX (default: that
 host compiler) compiles the C++ code, CC (default: cc) the C code.
-Requires Linux x86_64, an NVIDIA driver for CUDA 13 (580 or newer), git, curl and a C++20
-compiler. The installer does not install or change GPU drivers.
+Requires Linux x86_64, two NVIDIA Blackwell GPUs (compute 12.0, 16 GB each), a driver for
+CUDA 13 (580 or newer), git, curl and a C++20 compiler. The installer does not install or
+change GPU drivers. Option --download-only still fetches the abliterated checkpoint (weights
+plus inkling-2-mini-abliterated.safetensors) without a GPU.
 HELP
   exit 0
 fi
@@ -58,7 +60,8 @@ BUILD="$ROOT/native/build-install"  # the "install" preset in native/CMakePreset
 SERVER="$BUILD/apps/serve/ingine-serve"
 PROFILE="$BUILD/profile.env"
 MIN_DRIVER=580
-MIN_GPU_MIB=31744
+MIN_GPU_MIB=15000
+MIN_GPUS=2
 CONFIG="$HOME/.config/ingine/env"
 
 confirm() {
@@ -83,7 +86,7 @@ existing_parent() {
 
 # ---- checks before any change ----------------------------------------------------------------------
 
-[[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || fail 'ingine requires Linux x86_64 with an NVIDIA RTX 5090.'
+[[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || fail 'ingine requires Linux x86_64 with two NVIDIA Blackwell GPUs (16 GB each).'
 for command in git curl; do
   command -v "$command" >/dev/null || fail "Missing $command. Install it, or run bash setup.sh and choose 1."
 done
@@ -101,8 +104,9 @@ if [[ "$MODE" != download ]]; then
   driver_major="${driver%%.*}"
   [[ "$driver_major" =~ ^[0-9]+$ ]] || fail "Cannot read the NVIDIA driver version from nvidia-smi ($driver)."
   (( driver_major >= MIN_DRIVER )) || fail "NVIDIA driver $driver is too old: ingine is built with CUDA 13, which needs driver $MIN_DRIVER or newer. Update the driver, then rerun."
-  if ! awk -F', ' -v min="$MIN_GPU_MIB" '$3 == "12.0" && $4 + 0 >= min {found = 1} END {exit !found}' <<< "$gpus"; then
-    confirm 'ingine targets a 32 GB RTX 5090 (compute capability 12.0, sm_120a); its kernels do not run on other GPUs, and the served 262,144-token context needs about 31 GiB of GPU memory.'
+  n_ok="$(awk -F', ' -v min="$MIN_GPU_MIB" '$3 == "12.0" && $4 + 0 >= min {n++} END {print n+0}' <<< "$gpus")"
+  if (( n_ok < MIN_GPUS )); then
+    confirm "ingine serves on two Blackwell GPUs (compute 12.0, at least ${MIN_GPU_MIB} MiB each). One 16 GB card cannot hold the 20 GB checkpoint. Detected ${n_ok} matching GPU(s)."
   fi
 fi
 
@@ -331,9 +335,15 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     manifest = json.load(stream)
 serving, model = manifest["serving"], manifest["model"]
-flags = ["--" + key.replace("_", "-") for key in ("dense_fp8", "kv_fp8", "spec") if serving[key]]
-if serving["spec"]:
+flags = ["--" + key.replace("_", "-") for key in ("dense_fp8", "kv_fp8", "spec", "kv_split", "no_vision") if serving.get(key)]
+if serving.get("spec"):
     flags += ["--spec-threshold", str(serving["spec_threshold"])]
+if serving.get("second_gpu") is not None:
+    flags += ["--second-gpu", str(serving["second_gpu"])]
+if serving.get("expert_split") is not None:
+    flags += ["--expert-split", str(serving["expert_split"])]
+if "park_mb" in serving:
+    flags += ["--park-mb", str(serving["park_mb"])]
 # Files the server reads; the ablation file is checked on its own because INGINE_ABLATION may replace it.
 skip = {"README.md", "LICENSE", "NOTICE", "SHA256SUMS", ".gitattributes", manifest["ablation"]}
 required = [name for name in dict.fromkeys(["config.json", *model["files"]]) if name not in skip]
@@ -348,9 +358,7 @@ PY
   mv -f -- "$PROFILE.tmp" "$PROFILE"
   echo 'The C++ engine is built.'
 
-  # The driver holds CUDA programs at its "stable performance" state (P1 on an RTX 5090). An application
-  # profile, the mechanism the driver ships for OBS, lets ingine's processes reach P0, whose memory clock is
-  # 1.4% higher: about 0.8% more tokens per second, same output, same idle power. Driver 595 or newer.
+  # Optional: let ingine-serve use the GPU's P0 performance state (driver 595+).
   NV_PROFILE="$HOME/.nv/nvidia-application-profiles-rc.d/50-ingine"
   if [[ "${INGINE_GPU_PROFILE:-1}" == 0 ]]; then
     rm -f -- "$NV_PROFILE"

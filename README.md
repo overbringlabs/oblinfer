@@ -35,8 +35,10 @@ The model files are
 - C++20 compiler (GCC 12–16), ~24 GB disk for the checkpoint and build.
 - Two-GPU flags: `--second-gpu 1 --expert-split 64 --kv-split --dense-fp8 --kv-fp8 --spec --no-vision --park-mb 0 --max-ctx 262144`.
 
-The installer below still assumes a build machine with CUDA 13. It does not install GPU drivers. The server is
-C++/CUDA: no Python or PyTorch at runtime.
+The installer checks for two matching GPUs, then builds with a private CUDA 13.4 toolkit. It does not install
+GPU drivers. Option 2 still downloads the pinned abliterated checkpoint (weights +
+`inkling-2-mini-abliterated.safetensors`). `INGINE_ABLATION=` serves the original model. The server is C++/CUDA:
+no Python or PyTorch at runtime.
 
 ## Run
 

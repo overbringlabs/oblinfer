@@ -11,7 +11,7 @@ main() {
   local dir="${INGINE_DIR:-$HOME/inkling-2-mini-abliterated-ingine}"
 
   if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
-    echo "This installer needs Linux x86_64 with an NVIDIA RTX 5090." >&2
+    echo "This installer needs Linux x86_64 with two NVIDIA Blackwell GPUs (16 GB each)." >&2
     exit 1
   fi
   if ! command -v git >/dev/null; then

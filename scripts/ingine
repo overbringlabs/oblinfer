@@ -41,8 +41,8 @@ Settings: environment variables, or shell assignments in $CONFIG (the environmen
   INGINE_EXTRA_ARGS     extra server flags, split on whitespace (e.g. "--spec-threshold 0.7")
   INGINE_START_TIMEOUT  seconds start waits for /health (default 300)
 Relative paths are relative to \$ROOT ($ROOT).
-Profile: \$ROOT/runtime-manifest.json "serving" (FP8 dense weights, FP8 KV cache, speculative decoding), as
-written by the installer to \$ROOT/native/build-install/profile.env next to the server binary.
+Profile: \$ROOT/runtime-manifest.json "serving" (two-GPU EP 64/64, KV-split, dense-fp8, kv-fp8, DSpark,
+no vision, park-mb 0), written by the installer to \$ROOT/native/build-install/profile.env.
 
 The API has no authentication; keep it on loopback.
 Endpoints: http://HOST:PORT/v1/chat/completions, /v1/models, /health.

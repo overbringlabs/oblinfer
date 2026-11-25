@@ -84,6 +84,11 @@
     "kv_fp8": true,
     "spec": true,
     "spec_threshold": 0.8,
+    "second_gpu": 1,
+    "expert_split": 64,
+    "kv_split": true,
+    "no_vision": true,
+    "park_mb": 0,
     "model_id": "inkling-2-mini-abliterated"
   },
   "runtime": {

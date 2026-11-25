@@ -5,7 +5,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export PATH="$ROOT/.tools/bin:$PATH"
 
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
-  printf 'Usage: bash setup.sh [--update]\n\nChoose 1 to install ingine (build tools and a private CUDA 13.4 toolkit, then build the\nC++ server) and download the pinned Inkling-2-Mini checkpoint.\nChoose 2 to download or resume the model download.\nChoose 3 to start the server in the foreground with the manifest profile.\nChoose 4, or run bash setup.sh --update, to update this installer, rebuild the server (only\nwhat changed) and rerun the install steps; the model is downloaded again only when its\npinned revision changed (mismatching files are moved to <model folder>.previous-<time>/,\nnot deleted).\nChoose 5 to install the ingine command (start, stop, status, logs, update) as\n~/.local/bin/ingine.\n\nINGINE_MODEL_DIR reuses an existing download of the model. Serving requires Linux x86_64,\nan RTX 5090 (32 GB) and an NVIDIA driver for CUDA 13 (580 or newer). Allow about 20.2 GB\nfor the model plus about 3 GB for software.\n'
+  printf 'Usage: bash setup.sh [--update]\n\nChoose 1 to install ingine (build tools and a private CUDA 13.4 toolkit, then build the\nC++ server) and download the pinned Inkling-2-Mini checkpoint plus the abliteration file.\nChoose 2 to download or resume that model download (weights and ablation).\nChoose 3 to start the server in the foreground with the two-GPU serving profile.\nChoose 4, or run bash setup.sh --update, to update this installer, rebuild the server (only\nwhat changed) and rerun the install steps; the model is downloaded again only when its\npinned revision changed (mismatching files are moved to <model folder>.previous-<time>/,\nnot deleted).\nChoose 5 to install the ingine command (start, stop, status, logs, update) as\n~/.local/bin/ingine.\n\nINGINE_MODEL_DIR reuses an existing download. Serving needs Linux x86_64, two Blackwell\nGPUs (compute 12.0, 16 GB each) and an NVIDIA driver for CUDA 13 (580 or newer). Allow\nabout 20.2 GB for the model plus about 3 GB for software. INGINE_ABLATION= serves the\noriginal (non-abliterated) weights.\n'
   exit 0
 fi
 # --update-continue is internal: after --update (or option 4) pulls the installer, the pulled
@@ -238,7 +238,7 @@ fi
 
 while true; do
   printf '\nInkling-2-Mini abliterated - ingine\n'
-  printf 'RTX 5090, 262,144-token context, FP8 weights and KV cache, speculative decoding\n\n'
+  printf 'Two Blackwell 16 GB GPUs, 262,144-token context, NVFP4/MXFP8, DSpark\n\n'
   printf '  1) Install everything (software + C++ engine build + model)\n'
   printf '  2) Download / resume model\n'
   printf '  3) Start the server (Ctrl-C to stop)\n'
