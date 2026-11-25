@@ -370,7 +370,6 @@ void Decoder::full_layer(int l, int pos) {
   rope.k_weight = f32(p + "k_norm.weight", true);
   rope.pos = pos;
   rope.eps = EPS;
-  rope.interleaved = std::getenv("QWEN35MOE_INTERLEAVED_ROPE") != nullptr;
   check(attn::qk_norm_rope(rope, nullptr), "qk norm rope");
 
   attn::DecodeAttnArgs dec;
