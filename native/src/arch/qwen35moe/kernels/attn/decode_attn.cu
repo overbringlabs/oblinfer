@@ -61,67 +61,91 @@ __device__ __forceinline__ float bf16_hi(std::uint32_t w) {
 
 // Partial dot of one lane's value words against its q registers. `USED` is the word count for the format: four
 // int32 words of q8_0, two of q4_0's nibbles, eight of bf16, all read out of the same eight-word staging.
+// Four independent accumulator chains: a single chain of sixteen dependent multiplies serialises the score at
+// one latency per value, and the block runs only eight (HPAIR = 1) or four (HPAIR = 2) warps per scheduler.
 template <int USED>
 __device__ __forceinline__ float dot_q8(const std::uint32_t (&w)[8], const float (&q)[kLaneDims]) {
-  float dot = 0.0f;
+  float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
 #pragma unroll
   for (int u = 0; u < USED; ++u) {
-#pragma unroll
-    for (int b = 0; b < 4; ++b) dot = fmaf(q[u * 4 + b], q8_byte(w[u], 8 * b), dot);
+    d0 = fmaf(q[u * 4 + 0], q8_byte(w[u], 0), d0);
+    d1 = fmaf(q[u * 4 + 1], q8_byte(w[u], 8), d1);
+    d2 = fmaf(q[u * 4 + 2], q8_byte(w[u], 16), d2);
+    d3 = fmaf(q[u * 4 + 3], q8_byte(w[u], 24), d3);
   }
-  return dot;
+  return (d0 + d1) + (d2 + d3);
 }
 template <int USED>
 __device__ __forceinline__ float dot_bf16(const std::uint32_t (&w)[8], const float (&q)[kLaneDims]) {
-  float dot = 0.0f;
+  float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
 #pragma unroll
-  for (int u = 0; u < USED; ++u) {
-    dot = fmaf(q[u * 2], bf16_lo(w[u]), dot);
-    dot = fmaf(q[u * 2 + 1], bf16_hi(w[u]), dot);
+  for (int u = 0; u < USED; u += 2) {
+    d0 = fmaf(q[u * 2], bf16_lo(w[u]), d0);
+    d1 = fmaf(q[u * 2 + 1], bf16_hi(w[u]), d1);
+    d2 = fmaf(q[u * 2 + 2], bf16_lo(w[u + 1]), d2);
+    d3 = fmaf(q[u * 2 + 3], bf16_hi(w[u + 1]), d3);
   }
-  return dot;
+  return (d0 + d1) + (d2 + d3);
 }
 // q4_0's sixteen dims are two words of eight nibbles, low nibble first, so the unrolled shift is 4 * b.
 template <int USED>
 __device__ __forceinline__ float dot_q4(const std::uint32_t (&w)[8], const float (&q)[kLaneDims]) {
-  float dot = 0.0f;
+  float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
 #pragma unroll
   for (int u = 0; u < USED; ++u) {
 #pragma unroll
-    for (int b = 0; b < 8; ++b) dot = fmaf(q[u * 8 + b], q4_nibble(w[u], 4 * b), dot);
+    for (int b = 0; b < 8; b += 4) {
+      d0 = fmaf(q[u * 8 + b + 0], q4_nibble(w[u], 4 * (b + 0)), d0);
+      d1 = fmaf(q[u * 8 + b + 1], q4_nibble(w[u], 4 * (b + 1)), d1);
+      d2 = fmaf(q[u * 8 + b + 2], q4_nibble(w[u], 4 * (b + 2)), d2);
+      d3 = fmaf(q[u * 8 + b + 3], q4_nibble(w[u], 4 * (b + 3)), d3);
+    }
   }
-  return dot;
+  return (d0 + d1) + (d2 + d3);
 }
-// acc = acc * corr + p * v. The row scale is folded into p, so the decode costs one multiply per dim.
-__device__ __forceinline__ void accum_q8(float (&acc)[kLaneDims], const std::uint32_t (&w)[8], float p,
-                                         float corr) {
+// The running numerator update acc = acc * corr + p * v, in its two halves: the rescale by the max correction and
+// the term the new position adds. The row scale of the V side folds into p, so the add costs one multiply per
+// dim.
+__device__ __forceinline__ void acc_scale(float (&acc)[kLaneDims], float corr) {
+#pragma unroll
+  for (int j = 0; j < kLaneDims; ++j) acc[j] *= corr;
+}
+__device__ __forceinline__ void acc_add_q8(float (&acc)[kLaneDims], const std::uint32_t (&w)[8], float p) {
 #pragma unroll
   for (int u = 0; u < kQ8Words; ++u) {
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
       const int j = u * 4 + b;
-      acc[j] = fmaf(p, q8_byte(w[u], 8 * b), acc[j] * corr);
+      acc[j] = fmaf(p, q8_byte(w[u], 8 * b), acc[j]);
     }
   }
 }
-__device__ __forceinline__ void accum_bf16(float (&acc)[kLaneDims], const std::uint32_t (&w)[8], float p,
-                                            float corr) {
+__device__ __forceinline__ void acc_add_bf16(float (&acc)[kLaneDims], const std::uint32_t (&w)[8], float p) {
 #pragma unroll
   for (int u = 0; u < kBfWords; ++u) {
-    acc[u * 2] = fmaf(p, bf16_lo(w[u]), acc[u * 2] * corr);
-    acc[u * 2 + 1] = fmaf(p, bf16_hi(w[u]), acc[u * 2 + 1] * corr);
+    acc[u * 2] = fmaf(p, bf16_lo(w[u]), acc[u * 2]);
+    acc[u * 2 + 1] = fmaf(p, bf16_hi(w[u]), acc[u * 2 + 1]);
   }
 }
-__device__ __forceinline__ void accum_q4(float (&acc)[kLaneDims], const std::uint32_t (&w)[8], float p,
-                                         float corr) {
+__device__ __forceinline__ void acc_add_q4(float (&acc)[kLaneDims], const std::uint32_t (&w)[8], float p) {
 #pragma unroll
   for (int u = 0; u < kQ4Words; ++u) {
 #pragma unroll
     for (int b = 0; b < 8; ++b) {
       const int j = u * 8 + b;
-      acc[j] = fmaf(p, q4_nibble(w[u], 4 * b), acc[j] * corr);
+      acc[j] = fmaf(p, q4_nibble(w[u], 4 * b), acc[j]);
     }
   }
+}
+
+// Sum inside the sixteen-lane half that owns one position. The xor distances never cross the half-warp, so the
+// full mask is the correct mask and needs no convergence bookkeeping.
+__device__ __forceinline__ float lane_sum16(float v) {
+  v += __shfl_xor_sync(0xffffffffu, v, 8);
+  v += __shfl_xor_sync(0xffffffffu, v, 4);
+  v += __shfl_xor_sync(0xffffffffu, v, 2);
+  v += __shfl_xor_sync(0xffffffffu, v, 1);
+  return v;
 }
 
 __device__ __forceinline__ float kv_at(const void* base, KvType type, std::size_t index, std::uint64_t values) {
@@ -374,10 +398,117 @@ __global__ __launch_bounds__(512) void kv_store_mixed_kernel(DecodeAttnArgs args
 // The cache formats are template arguments, not a runtime test: the measured loop is 1.2-1.4x faster for
 // q8_0 and no slower for bf16 when each instantiation carries only its own decode, and it keeps the register
 // count at the 64 that holds four blocks per SM.
-template <KvType KTYPE_K, KvType KTYPE_V>
+//
+// HPAIR query heads share one block. They sit in the same KV group, so they read the same K and V rows: one
+// decode of the sixteen dims feeds HPAIR dots and HPAIR value updates. That decode is the largest single block
+// of instructions in the step — 56 of its 170 warp instructions are byte extraction and int8 conversion, and the
+// conversions run on the half-rate pipe — so serving a pair is what pays: 694 us per layer at 258048 on sm_120
+// against 937 for the committed single-head step. HPAIR = 1 is the shape used for a head range that cannot be
+// paired.
+template <int HPAIR>
+struct SplitHeadState {
+  float q[HPAIR][kLaneDims];
+  float acc[HPAIR][kLaneDims];
+  float m[HPAIR];
+  float l[HPAIR];
+};
+
+// One position of one lane as loaded: its sixteen K and sixteen V values plus the two block scales. Kept apart
+// from the arithmetic so a step reads its operands from here and nothing hides the loads behind the reduction.
+struct KvStage {
+  std::uint32_t kw[8];
+  std::uint32_t vw[8];
+  float ks = 1.0f;  // bf16 stores no block scale, and the multiplies by it are folded away
+  float vs = 1.0f;
+};
+
+// The lane's sixteen dims of one position, for every cache format. `GUARD` is the form used where the position
+// may be past the end of the column, which is only ever the final step of a warp: it reads the last real row
+// instead, so the staged words stay finite — the value update of that stream multiplies them by a zero weight
+// and zero times an infinity would be a NaN.
+template <KvType TK, KvType TV, bool GUARD>
+__device__ __forceinline__ void load_kv(const std::uint64_t cache_values, int band, int kh, int d0, int p, int end,
+                                        void* k_cache, void* v_cache, KvStage& s) {
+  const int row = (GUARD && p >= end) ? end - 1 : p;
+  const std::size_t at = (std::size_t(row - band) * ATTN_KV_HEADS + kh) * kDim + d0;
+
+  if constexpr (TK == KvType::Q8_0) {
+    const int4 r = *reinterpret_cast<const int4*>(kv_q8_values(k_cache) + at);
+    s.kw[0] = r.x; s.kw[1] = r.y; s.kw[2] = r.z; s.kw[3] = r.w;
+    s.ks = __half2float(kv_q8_scales(k_cache, cache_values)[at / KV_BLOCK]);
+  } else if constexpr (TK == KvType::Q4_0) {
+    const uint2 r = *reinterpret_cast<const uint2*>(kv_q4_values(k_cache) + at / 2);
+    s.kw[0] = r.x; s.kw[1] = r.y;
+    s.ks = __half2float(kv_q4_scales(k_cache, cache_values)[at / KV_BLOCK]);
+  } else {
+    const uint4* p4 = reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(k_cache) + at);
+    const uint4 a = p4[0], b = p4[1];
+    s.kw[0] = a.x; s.kw[1] = a.y; s.kw[2] = a.z; s.kw[3] = a.w;
+    s.kw[4] = b.x; s.kw[5] = b.y; s.kw[6] = b.z; s.kw[7] = b.w;
+  }
+  if constexpr (TV == KvType::Q8_0) {
+    const int4 r = *reinterpret_cast<const int4*>(kv_q8_values(v_cache) + at);
+    s.vw[0] = r.x; s.vw[1] = r.y; s.vw[2] = r.z; s.vw[3] = r.w;
+    s.vs = __half2float(kv_q8_scales(v_cache, cache_values)[at / KV_BLOCK]);
+  } else if constexpr (TV == KvType::Q4_0) {
+    const uint2 r = *reinterpret_cast<const uint2*>(kv_q4_values(v_cache) + at / 2);
+    s.vw[0] = r.x; s.vw[1] = r.y;
+    s.vs = __half2float(kv_q4_scales(v_cache, cache_values)[at / KV_BLOCK]);
+  } else {
+    const uint4* p4 = reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(v_cache) + at);
+    const uint4 a = p4[0], b = p4[1];
+    s.vw[0] = a.x; s.vw[1] = a.y; s.vw[2] = a.z; s.vw[3] = a.w;
+    s.vw[4] = b.x; s.vw[5] = b.y; s.vw[6] = b.z; s.vw[7] = b.w;
+  }
+}
+
+// One position of one lane's two position streams, for every head of the block. The staged K and V are decoded
+// once and used by all HPAIR heads.
+template <KvType TK, KvType TV, int HPAIR, bool GUARD>
+__device__ __forceinline__ void split_step(const KvStage& st_in, int p, int end, SplitHeadState<HPAIR>& st) {
+  // The final step's second stream can be past the end of the column. It must not leave the warp — the score
+  // butterfly is a full-warp shuffle — so it computes from whatever was staged and its contribution is selected
+  // away below: an absent position leaves (m, l, acc) exactly as it found them.
+  const bool live = !GUARD || p < end;
+
+  // The block scale is per lane and applied before the reduction: the sixteen dims of a lane sit in one
+  // 32-value block, but different lanes sit in different blocks, so the scales are not common to the butterfly.
+  const float scale = rsqrtf(float(kDim));
+  float score[HPAIR], corr[HPAIR], px[HPAIR];
+#pragma unroll
+  for (int hh = 0; hh < HPAIR; ++hh) {
+    float dot;
+    if constexpr (TK == KvType::Q8_0) dot = dot_q8<kQ8Words>(st_in.kw, st.q[hh]) * st_in.ks;
+    else if constexpr (TK == KvType::Q4_0) dot = dot_q4<kQ4Words>(st_in.kw, st.q[hh]) * st_in.ks;
+    else dot = dot_bf16<kBfWords>(st_in.kw, st.q[hh]);
+    score[hh] = lane_sum16(dot) * scale;
+  }
+#pragma unroll
+  for (int hh = 0; hh < HPAIR; ++hh) {
+    const float m_new = live ? fmaxf(st.m[hh], score[hh]) : st.m[hh];
+    corr[hh] = live ? expf(st.m[hh] - m_new) : 1.0f;
+    px[hh] = live ? expf(score[hh] - m_new) : 0.0f;
+    st.l[hh] = st.l[hh] * corr[hh] + px[hh];
+    st.m[hh] = m_new;
+  }
+  // The block scale of the V side folds into p, which keeps the value update at one multiply per dim; in the
+  // bf16 instantiation vs is the constant 1.0 and the multiply is not generated at all.
+#pragma unroll
+  for (int hh = 0; hh < HPAIR; ++hh) acc_scale(st.acc[hh], corr[hh]);
+#pragma unroll
+  for (int hh = 0; hh < HPAIR; ++hh) {
+    const float pv = px[hh] * st_in.vs;
+    if constexpr (TV == KvType::Q8_0) acc_add_q8(st.acc[hh], st_in.vw, pv);
+    else if constexpr (TV == KvType::Q4_0) acc_add_q4(st.acc[hh], st_in.vw, pv);
+    else acc_add_bf16(st.acc[hh], st_in.vw, pv);
+  }
+}
+
+// HPAIR query heads per block: grid.x is the head count divided by HPAIR, grid.y the column range.
+template <KvType KTYPE_K, KvType KTYPE_V, int HPAIR>
 __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args) {
-  const int h = args.head_begin + blockIdx.x;
-  const int kh = h / kGroup;
+  const int h0 = args.head_begin + int(blockIdx.x) * HPAIR;
+  const int kh = h0 / kGroup;  // HPAIR divides the group, so every head of the block shares one KV head
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const std::uint64_t cache_values = std::uint64_t(kv_cache_rows(args)) * ATTN_KV_HEADS * kDim;
@@ -391,140 +522,104 @@ __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args)
   const int per_split = (args.pos + 1 + args.splits - 1) / args.splits;
   const int begin = col * per_split;
   const int end = min(args.pos + 1, begin + per_split);
-  const std::size_t slot = std::size_t(blockIdx.x) * std::size_t(args.splits) + std::size_t(col);
+  const std::size_t row0 = std::size_t(blockIdx.x) * HPAIR * std::size_t(args.splits) + std::size_t(col);
   if (begin >= end) {
     if (threadIdx.x == 0) {
-      args.partial[slot].m = -INFINITY;
-      args.partial[slot].l = 0.0f;
+#pragma unroll
+      for (int hh = 0; hh < HPAIR; ++hh) {
+        args.partial[row0 + std::size_t(hh) * std::size_t(args.splits)].m = -INFINITY;
+        args.partial[row0 + std::size_t(hh) * std::size_t(args.splits)].l = 0.0f;
+      }
     }
-    args.partial[slot].acc[threadIdx.x] = 0.0f;
+#pragma unroll
+    for (int hh = 0; hh < HPAIR; ++hh) args.partial[row0 + std::size_t(hh) * std::size_t(args.splits)].acc[threadIdx.x] = 0.0f;
     return;
   }
 
-  __shared__ float s_m[kWarps];
-  __shared__ float s_l[kWarps];
-  __shared__ float s_acc[kWarps][kDim];
-  __shared__ float s_total, s_max;
+  __shared__ float s_m[HPAIR][kWarps];
+  __shared__ float s_l[HPAIR][kWarps];
+  __shared__ float s_max[HPAIR], s_total[HPAIR];  // the block-level state, kept off the per-warp rows
+  __shared__ float s_acc[HPAIR][kWarps][kDim];
 
-  const int sub = lane >> 4;              // which of the warp's two position streams this lane is on
+  const int sub = lane >> 4;                            // which of the warp's two position streams this lane is on
   const int d0 = (lane & (kPosLanes - 1)) * kLaneDims;  // this lane's sixteen dims, the same in both streams
-  // The mask of the half-warp that shares one position: the butterfly and the tail guard are both uniform
-  // inside it, so the shuffles never see a divergent lane.
-  const unsigned hmask = 0x0000ffffu << (sub * kPosLanes);
 
-  float q_reg[kLaneDims];
+  SplitHeadState<HPAIR> st;
 #pragma unroll
-  for (int i = 0; i < kLaneDims; ++i) q_reg[i] = args.q[h * kDim + d0 + i];
-
-  const float scale = rsqrtf(float(kDim));
-  float m = -INFINITY;
-  float l = 0.0f;
-  float acc[kLaneDims];
+  for (int hh = 0; hh < HPAIR; ++hh) {
 #pragma unroll
-  for (int j = 0; j < kLaneDims; ++j) acc[j] = 0.0f;
+    for (int i = 0; i < kLaneDims; ++i) st.q[hh][i] = args.q[(h0 + hh) * kDim + d0 + i];
+    st.m[hh] = -INFINITY;
+    st.l[hh] = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kLaneDims; ++j) st.acc[hh][j] = 0.0f;
+  }
 
-  for (int i0 = begin + warp * kPosPerWarp; i0 < end; i0 += kStepPos) {
-    const int p = i0 + sub;
-    if (p >= end) continue;  // tail step: the second stream runs out first
-    const std::size_t kbase = (std::size_t(p - band) * ATTN_KV_HEADS + kh) * kDim + d0;
-    const std::size_t vbase = kbase;  // K and V share the layout, so the same index addresses both caches
-
-    // Both loads are independent of the score, so they are issued before the reduction. The staging is eight
-    // words, which is the bf16 case; q8_0 uses the first four and q4_0 the first two. The q4_0 read is the
-    // lane's own aligned eight bytes of the block it shares with its neighbour: together the two lanes read
-    // exactly the 16-byte nibble block the layout is built around.
-    std::uint32_t kw[8], vw[8];
-    float ks = 1.0f, vs = 1.0f;
-    if constexpr (KTYPE_K == KvType::Q8_0) {
-      const int4 r = *reinterpret_cast<const int4*>(kv_q8_values(args.k_cache) + kbase);
-      kw[0] = r.x; kw[1] = r.y; kw[2] = r.z; kw[3] = r.w;
-      ks = __half2float(kv_q8_scales(args.k_cache, cache_values)[kbase / KV_BLOCK]);
-    } else if constexpr (KTYPE_K == KvType::Q4_0) {
-      const uint2 r = *reinterpret_cast<const uint2*>(kv_q4_values(args.k_cache) + kbase / 2);
-      kw[0] = r.x; kw[1] = r.y;
-      ks = __half2float(kv_q4_scales(args.k_cache, cache_values)[kbase / KV_BLOCK]);
-    } else {
-      const uint4* p4 = reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(args.k_cache) + kbase);
-      const uint4 a = p4[0], b = p4[1];
-      kw[0] = a.x; kw[1] = a.y; kw[2] = a.z; kw[3] = a.w;
-      kw[4] = b.x; kw[5] = b.y; kw[6] = b.z; kw[7] = b.w;
-    }
-    if constexpr (KTYPE_V == KvType::Q8_0) {
-      const int4 r = *reinterpret_cast<const int4*>(kv_q8_values(args.v_cache) + vbase);
-      vw[0] = r.x; vw[1] = r.y; vw[2] = r.z; vw[3] = r.w;
-      vs = __half2float(kv_q8_scales(args.v_cache, cache_values)[vbase / KV_BLOCK]);
-    } else if constexpr (KTYPE_V == KvType::Q4_0) {
-      const uint2 r = *reinterpret_cast<const uint2*>(kv_q4_values(args.v_cache) + vbase / 2);
-      vw[0] = r.x; vw[1] = r.y;
-      vs = __half2float(kv_q4_scales(args.v_cache, cache_values)[vbase / KV_BLOCK]);
-    } else {
-      const uint4* p4 = reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(args.v_cache) + vbase);
-      const uint4 a = p4[0], b = p4[1];
-      vw[0] = a.x; vw[1] = a.y; vw[2] = a.z; vw[3] = a.w;
-      vw[4] = b.x; vw[5] = b.y; vw[6] = b.z; vw[7] = b.w;
-    }
-
-    // The block scale is per lane and applied before the reduction: the sixteen dims of a lane sit in one
-    // 32-value block, but different lanes sit in different blocks, so the scales are not common to the butterfly.
-    float dot = 0.0f;
-    if constexpr (KTYPE_K == KvType::Q8_0) dot = dot_q8<kQ8Words>(kw, q_reg) * ks;
-    else if constexpr (KTYPE_K == KvType::Q4_0) dot = dot_q4<kQ4Words>(kw, q_reg) * ks;
-    else dot = dot_bf16<kBfWords>(kw, q_reg);
-    for (int off = kPosLanes / 2; off > 0; off >>= 1) dot += __shfl_xor_sync(hmask, dot, off);
-    const float score = dot * scale;
-
-    const float m_new = fmaxf(m, score);
-    const float corr = expf(m - m_new);
-    const float p_ex = expf(score - m_new);
-    l = l * corr + p_ex;
-    m = m_new;
-    // The block scale of the V side folds into p, which keeps the value update at one multiply per dim; in the
-    // bf16 instantiation vs is the constant 1.0 and the multiply is not generated at all.
-    const float pv = p_ex * vs;
-    if constexpr (KTYPE_V == KvType::Q8_0) accum_q8(acc, vw, pv, corr);
-    else if constexpr (KTYPE_V == KvType::Q4_0) accum_q4(acc, vw, pv, corr);
-    else accum_bf16(acc, vw, pv, corr);
+  // The steady-state steps carry no position test, so the hot loop has no divergent branch; only the final step of
+  // a warp is guarded, because its second stream may already be past the end.
+  int i0 = begin + warp * kPosPerWarp;
+  KvStage stage;
+  for (; i0 + kStepPos <= end; i0 += kStepPos) {
+    load_kv<KTYPE_K, KTYPE_V, false>(cache_values, band, kh, d0, i0 + sub, end, args.k_cache, args.v_cache, stage);
+    split_step<KTYPE_K, KTYPE_V, HPAIR, false>(stage, i0 + sub, end, st);
+  }
+  if (i0 < end) {
+    load_kv<KTYPE_K, KTYPE_V, true>(cache_values, band, kh, d0, i0 + sub, end, args.k_cache, args.v_cache, stage);
+    split_step<KTYPE_K, KTYPE_V, HPAIR, true>(stage, i0 + sub, end, st);
   }
 
   // Merge the warp's two streams. The partner half holds the same sixteen dims of the other position, so a
   // lane-width shuffle is enough; an empty stream carries m = -INFINITY and contributes nothing.
-  const float m_p = __shfl_xor_sync(0xffffffffu, m, kPosLanes);
-  const float l_p = __shfl_xor_sync(0xffffffffu, l, kPosLanes);
-  const float m_warp = fmaxf(m, m_p);
-  const float w_own = m_warp == -INFINITY ? 0.0f : expf(m - m_warp);
-  const float w_partner = m_warp == -INFINITY ? 0.0f : expf(m_p - m_warp);
-  const float l_warp = l * w_own + l_p * w_partner;
 #pragma unroll
-  for (int j = 0; j < kLaneDims; ++j) {
-    acc[j] = acc[j] * w_own + __shfl_xor_sync(0xffffffffu, acc[j], kPosLanes) * w_partner;
-  }
-
-  if (lane == 0) {
-    s_m[warp] = m_warp;
-    s_l[warp] = l_warp;
-  }
-  if (sub == 0) {  // one half-warp writes the merged head: 16 lanes x 16 dims = 256
+  for (int hh = 0; hh < HPAIR; ++hh) {
+    const float m_p = __shfl_xor_sync(0xffffffffu, st.m[hh], kPosLanes);
+    const float l_p = __shfl_xor_sync(0xffffffffu, st.l[hh], kPosLanes);
+    const float m_warp = fmaxf(st.m[hh], m_p);
+    const float w_own = m_warp == -INFINITY ? 0.0f : expf(st.m[hh] - m_warp);
+    const float w_partner = m_warp == -INFINITY ? 0.0f : expf(m_p - m_warp);
+    st.m[hh] = m_warp;
+    st.l[hh] = st.l[hh] * w_own + l_p * w_partner;
 #pragma unroll
-    for (int j = 0; j < kLaneDims; ++j) s_acc[warp][d0 + j] = acc[j];
+    for (int j = 0; j < kLaneDims; ++j) {
+      st.acc[hh][j] = st.acc[hh][j] * w_own + __shfl_xor_sync(0xffffffffu, st.acc[hh][j], kPosLanes) * w_partner;
+    }
+    if (lane == 0) {
+      s_m[hh][warp] = st.m[hh];
+      s_l[hh][warp] = st.l[hh];
+    }
+    if (sub == 0) {  // one half-warp writes the merged head: 16 lanes x 16 dims = 256
+#pragma unroll
+      for (int j = 0; j < kLaneDims; ++j) s_acc[hh][warp][d0 + j] = st.acc[hh][j];
+    }
   }
   __syncthreads();
 
+  // The eight warps of every head of the block merge through one log-sum-exp. The per-warp maxima stay where the
+  // warp merge wrote them: the block maximum is its own shared slot, so each warp keeps the weight exp(m_w - M)
+  // it earned.
   if (threadIdx.x == 0) {
-    float M = -INFINITY;
-    for (int w = 0; w < kWarps; ++w) M = fmaxf(M, s_m[w]);
-    float L = 0.0f;
-    for (int w = 0; w < kWarps; ++w) L += s_l[w] * expf(s_m[w] - M);
-    s_max = M;
-    s_total = L;
+#pragma unroll
+    for (int hh = 0; hh < HPAIR; ++hh) {
+      float M = -INFINITY;
+      for (int w = 0; w < kWarps; ++w) M = fmaxf(M, s_m[hh][w]);
+      float L = 0.0f;
+      for (int w = 0; w < kWarps; ++w) L += s_l[hh][w] * expf(s_m[hh][w] - M);
+      s_max[hh] = M;
+      s_total[hh] = L;
+    }
   }
   __syncthreads();
 
-  float total = 0.0f;
-  for (int w = 0; w < kWarps; ++w) total += s_acc[w][threadIdx.x] * expf(s_m[w] - s_max);
-  args.partial[slot].acc[threadIdx.x] = total;
-  if (threadIdx.x == 0) {
-    args.partial[slot].m = s_max;
-    args.partial[slot].l = s_total;
+#pragma unroll
+  for (int hh = 0; hh < HPAIR; ++hh) {
+    float total = 0.0f;
+    for (int w = 0; w < kWarps; ++w) total += s_acc[hh][w][threadIdx.x] * expf(s_m[hh][w] - s_max[hh]);
+    SplitState& out = args.partial[row0 + std::size_t(hh) * std::size_t(args.splits)];
+    out.acc[threadIdx.x] = total;
+    if (threadIdx.x == 0) {
+      out.m = s_max[hh];
+      out.l = s_total[hh];
+    }
   }
 }
 
@@ -558,6 +653,23 @@ __global__ __launch_bounds__(kDim) void combine_splits_kernel(DecodeAttnArgs arg
 
 }  // namespace
 
+namespace {
+
+// Query heads one block serves: the pair path needs both heads of the pair inside one KV group, so the range
+// must start and end on an even boundary. ATTN_HEADS / ATTN_KV_HEADS is 8, so any even pair qualifies.
+int split_pairing(const DecodeAttnArgs& args) {
+  return (args.head_begin % 2 == 0 && args.head_count % 2 == 0) ? 2 : 1;
+}
+
+template <KvType TK, KvType TV>
+cudaError_t launch_split(const DecodeAttnArgs& args, dim3 grid, cudaStream_t stream) {
+  if (split_pairing(args) == 2) decode_split_kernel<TK, TV, 2><<<grid, kDim, 0, stream>>>(args);
+  else decode_split_kernel<TK, TV, 1><<<grid, kDim, 0, stream>>>(args);
+  return cudaGetLastError();
+}
+
+}  // namespace
+
 cudaError_t decode_kv_store(const DecodeAttnArgs& args, cudaStream_t stream) {
   if (!args.k_new || !args.v_new || !args.k_cache || !args.v_cache) return cudaErrorInvalidValue;
   if (!band_valid(args)) return cudaErrorInvalidValue;
@@ -587,25 +699,25 @@ cudaError_t decode_split(const DecodeAttnArgs& args, int band_splits, cudaStream
   const int first = args.col_begin * per_split;
   const int last = std::min(args.pos + 1, first + band_splits * per_split);
   if (first < args.pos_begin || last > args.pos_begin + kv_cache_rows(args)) return cudaErrorInvalidValue;
-  const dim3 grid(args.head_count, band_splits);
+  // One head pair per block shares the K/V decode; a range that cannot be paired keeps the single-head shape.
+  const dim3 grid(args.head_count / split_pairing(args), band_splits);
   // One instantiation per (K, V) pair, so the measured loop carries only its own decode and the register count
   // stays at the four blocks per SM the layout was chosen for.
   const KvType tk = args.kv_type_k;
   const KvType tv = args.kv_type_v;
   if (tk == KvType::Bf16) {
-    if (tv == KvType::Bf16) decode_split_kernel<KvType::Bf16, KvType::Bf16><<<grid, kDim, 0, stream>>>(args);
-    else if (tv == KvType::Q8_0) decode_split_kernel<KvType::Bf16, KvType::Q8_0><<<grid, kDim, 0, stream>>>(args);
-    else decode_split_kernel<KvType::Bf16, KvType::Q4_0><<<grid, kDim, 0, stream>>>(args);
-  } else if (tk == KvType::Q8_0) {
-    if (tv == KvType::Bf16) decode_split_kernel<KvType::Q8_0, KvType::Bf16><<<grid, kDim, 0, stream>>>(args);
-    else if (tv == KvType::Q8_0) decode_split_kernel<KvType::Q8_0, KvType::Q8_0><<<grid, kDim, 0, stream>>>(args);
-    else decode_split_kernel<KvType::Q8_0, KvType::Q4_0><<<grid, kDim, 0, stream>>>(args);
-  } else {
-    if (tv == KvType::Bf16) decode_split_kernel<KvType::Q4_0, KvType::Bf16><<<grid, kDim, 0, stream>>>(args);
-    else if (tv == KvType::Q8_0) decode_split_kernel<KvType::Q4_0, KvType::Q8_0><<<grid, kDim, 0, stream>>>(args);
-    else decode_split_kernel<KvType::Q4_0, KvType::Q4_0><<<grid, kDim, 0, stream>>>(args);
+    if (tv == KvType::Bf16) return launch_split<KvType::Bf16, KvType::Bf16>(args, grid, stream);
+    if (tv == KvType::Q8_0) return launch_split<KvType::Bf16, KvType::Q8_0>(args, grid, stream);
+    return launch_split<KvType::Bf16, KvType::Q4_0>(args, grid, stream);
   }
-  return cudaGetLastError();
+  if (tk == KvType::Q8_0) {
+    if (tv == KvType::Bf16) return launch_split<KvType::Q8_0, KvType::Bf16>(args, grid, stream);
+    if (tv == KvType::Q8_0) return launch_split<KvType::Q8_0, KvType::Q8_0>(args, grid, stream);
+    return launch_split<KvType::Q8_0, KvType::Q4_0>(args, grid, stream);
+  }
+  if (tv == KvType::Bf16) return launch_split<KvType::Q4_0, KvType::Bf16>(args, grid, stream);
+  if (tv == KvType::Q8_0) return launch_split<KvType::Q4_0, KvType::Q8_0>(args, grid, stream);
+  return launch_split<KvType::Q4_0, KvType::Q4_0>(args, grid, stream);
 }
 
 cudaError_t decode_combine(const DecodeAttnArgs& args, cudaStream_t stream) {

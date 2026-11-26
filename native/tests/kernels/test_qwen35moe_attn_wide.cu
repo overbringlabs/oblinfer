@@ -375,13 +375,16 @@ bool invalid_range_case() {
   return clean;
 }
 
-// Manual on the target card: one token's attention pass at the serving depth.
-int bench_mode(int depth, int splits, attn::KvType type) {
+// Manual on the target card: one token's attention pass at the serving depth. `heads` narrows the head range, so
+// the per-head cost of a narrow launch shows whether the cache rows are served from L2 across the query heads
+// that share a KV head, or from DRAM once per head.
+int bench_mode(int depth, int splits, attn::KvType type, int heads) {
   Case c = make_case(depth - 1, depth, type, type, 5);
   DeviceArray<float> dq(c.q), dk(c.k_new), dv(c.v_new), dout(std::size_t(H) * D);
   DeviceArray<std::uint8_t> dkc(c.kc), dvc(c.vc);
   DeviceArray<attn::SplitState> dpart(std::size_t(H) * splits);
   attn::DecodeAttnArgs a = base_args(c, dout.get());
+  a.head_count = heads;
   a.q = dq.get();
   a.k_new = dk.get();
   a.v_new = dv.get();
@@ -406,10 +409,12 @@ int bench_mode(int depth, int splits, attn::KvType type) {
   cudaEventElapsedTime(&ms, e0, e1);
   const double us = ms * 1000.0 / kIters;
   // The eight query heads of a KV group each walk the same rows, so the traffic the kernel asks for is the
-  // cache read once per query head.
-  const double demanded = 2.0 * double(attn::kv_cache_bytes(type, depth)) * (H / KV);
-  std::printf("bench %s depth %d splits %d: %.1f us, %.1f GB/s demanded\n", kv_label(type), depth, splits, us,
-              demanded / (us * 1e-6) / 1e9);
+  // cache read once per query head. `ns/pos-head` is the cost that a narrower head range must not change if the
+  // rows are served once and reused; it falls only when the launch leaves the machine idle.
+  const double demanded = 2.0 * double(attn::kv_cache_bytes(type, depth)) * (double(heads) / KV);
+  std::printf("bench %s depth %d splits %d heads %d: %.1f us, %.1f GB/s demanded, %.3f ns/pos-head\n",
+              kv_label(type), depth, splits, heads, us, demanded / (us * 1e-6) / 1e9,
+              us * 1000.0 / (double(depth) * heads));
   cudaEventDestroy(e0);
   cudaEventDestroy(e1);
   return 0;
@@ -437,7 +442,8 @@ int main(int argc, char** argv) {
     const attn::KvType type = rest.size() > 2 && rest[2] == "bf16"   ? attn::KvType::Bf16
                               : rest.size() > 2 && rest[2] == "q4_0" ? attn::KvType::Q4_0
                                                                      : attn::KvType::Q8_0;
-    return bench_mode(depth, splits, type);
+    const int heads = rest.size() > 3 ? std::atoi(rest[3].c_str()) : H;
+    return bench_mode(depth, splits, type, heads);
   }
 
   bool ok = true;
