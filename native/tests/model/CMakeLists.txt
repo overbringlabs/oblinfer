@@ -64,3 +64,10 @@ ingine_add_test(NAME model_qwen35moe_bench SOURCES test_qwen35moe_bench.cpp
 ingine_add_test(NAME model_qwen35moe_moe_paths SOURCES test_qwen35moe_moe_paths.cpp
                 LIBS qwen35moe_moe qwen35moe_uploader qwen35moe_placement qwen35moe_names
                      ingine_kernels_quant ingine_core CUDA::cudart TIMEOUT 900)
+
+# MTP draft head: the 19 real tensors, an FP64 reference of the whole block in the test, both cache formats, and
+# the per-stage cost at depth (needs QWEN35MOE_SNAPSHOT; ~3 GB of GPU memory on the first card)
+ingine_add_test(NAME model_qwen35moe_mtp SOURCES test_qwen35moe_mtp.cpp
+                LIBS qwen35moe_mtp qwen35moe_mtp_kernels qwen35moe_attn qwen35moe_moe
+                     ingine_kernels_dense_ops ingine_kernels_quant ingine_core CUDA::cudart
+                GPU MODEL ORACLE TIMEOUT 1800)

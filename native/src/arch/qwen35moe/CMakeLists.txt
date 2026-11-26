@@ -61,3 +61,20 @@ ingine_cuda_target(qwen35moe_batch)
 target_include_directories(qwen35moe_batch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(qwen35moe_batch PUBLIC qwen35moe_attn ingine_kernels_quant
                       PRIVATE qwen35moe_data ingine_kernels_gdn CUDA::cudart)
+
+# MTP drafter (spec-decode K4): the head's own Q4_0 K/V cache format on top of the shipped split/combine kernels
+# and the BF16 routed-expert path the NVFP4 trunk kernels do not cover.
+add_library(qwen35moe_mtp_kernels OBJECT kernels/mtp/mtp_attn.cu kernels/mtp/mtp_experts.cu)
+ingine_cuda_target(qwen35moe_mtp_kernels)
+target_include_directories(qwen35moe_mtp_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(qwen35moe_mtp_kernels PUBLIC qwen35moe_attn qwen35moe_moe
+                      PRIVATE qwen35moe_data CUDA::cudart)
+
+# Loader, forward and cache of the MTP head, standalone: it takes the 19 tensors from a snapshot directory and
+# borrows the trunk's embedding table and lm_head.
+add_library(qwen35moe_mtp OBJECT model/mtp.cu)
+ingine_cuda_target(qwen35moe_mtp)
+target_include_directories(qwen35moe_mtp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(qwen35moe_mtp PUBLIC qwen35moe_mtp_kernels qwen35moe_attn qwen35moe_moe
+                      ingine_kernels_dense_ops ingine_kernels_quant ingine_core
+                      PRIVATE qwen35moe_data CUDA::cudart)
