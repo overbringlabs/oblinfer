@@ -16,7 +16,10 @@
 // only those rows of `out`, so ranges on separate devices compose into one output tensor.
 #pragma once
 
+#include <cstdint>
+
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace ingine::arch::qwen35moe::kernels {
@@ -26,12 +29,32 @@ inline constexpr int ATTN_KV_HEADS = 2;
 inline constexpr int ATTN_HEAD_DIM = 256;
 inline constexpr int ATTN_CHUNK = 512;
 
+// KV cache element formats, selectable per side like llama-server's -ctk/-ctv. q8_0 is llama.cpp's block
+// format: 32 int8 values behind one fp16 scale, 34 bytes per block, 8 blocks per 256-dim head.
+enum class KvType : int { Bf16 = 0, Q8_0 = 1 };
+
+inline constexpr int KV_BLOCK = 32;
+inline constexpr int KV_BLOCK_BYTES = 2 + KV_BLOCK;
+
+struct KvBlock {
+  __half d;
+  std::int8_t qs[KV_BLOCK];
+};
+
+// Bytes for a [max_pos, ATTN_KV_HEADS, ATTN_HEAD_DIM] cache per side.
+inline std::uint64_t kv_cache_bytes(KvType type, int max_pos) {
+  const std::uint64_t values = std::uint64_t(max_pos) * ATTN_KV_HEADS * ATTN_HEAD_DIM;
+  return type == KvType::Bf16 ? values * 2 : (values / KV_BLOCK) * KV_BLOCK_BYTES;
+}
+
 struct DecodeAttnArgs {
   const float* q = nullptr;                     // [ATTN_HEADS, ATTN_HEAD_DIM], post q_norm and rotary
   const float* k_new = nullptr;                 // [ATTN_KV_HEADS, ATTN_HEAD_DIM], post k_norm and rotary
   const float* v_new = nullptr;                 // [ATTN_KV_HEADS, ATTN_HEAD_DIM]
-  __nv_bfloat16* k_cache = nullptr;             // [max_pos, ATTN_KV_HEADS, ATTN_HEAD_DIM]
-  __nv_bfloat16* v_cache = nullptr;             // same shape
+  void* k_cache = nullptr;                      // [max_pos, ATTN_KV_HEADS, ATTN_HEAD_DIM] in `kv_type`
+  void* v_cache = nullptr;                      // same layout
+  KvType kv_type_k = KvType::Bf16;
+  KvType kv_type_v = KvType::Bf16;
   float* out = nullptr;                         // [ATTN_HEADS, ATTN_HEAD_DIM], pre output gate and o_proj
   int pos = 0;                                  // position of k_new/v_new; attends over 0..pos
   int max_pos = 0;                              // cache capacity

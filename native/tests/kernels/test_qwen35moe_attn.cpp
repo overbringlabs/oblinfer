@@ -334,10 +334,77 @@ bool closed_form_cpu() {
   return ok;
 }
 
+// q8_0 cache: the reference quantises identically, so agreement is tight; the quality cost is measured by the
+// difference against the BF16 run of the same data.
+bool q8_case() {
+  Case c = make_case(600, 9);
+  std::vector<float> ref_out(H * D, 0.0f);
+  Case cpu = c;
+  attn::DecodeAttnArgs a = host_args(cpu, ref_out);
+  a.kv_type_k = attn::KvType::Q8_0;
+  a.kv_type_v = attn::KvType::Q8_0;
+  const std::size_t bytes = attn::kv_cache_bytes(attn::KvType::Q8_0, c.max_pos);
+  std::vector<std::uint8_t> kc(bytes), vc(bytes);
+  a.k_cache = kc.data();
+  a.v_cache = vc.data();
+  attn::decode_attention_cpu(a);
+
+  Case dev = c;
+  std::vector<float> dev_out(H * D, 0.0f);
+  DeviceArray<float> dq(dev.q), dk(dev.k_new), dv(dev.v_new), dout(dev_out);
+  DeviceArray<std::uint8_t> dkc(bytes), dvc(bytes);
+  attn::DecodeAttnArgs g;
+  g.q = dq.get();
+  g.k_new = dk.get();
+  g.v_new = dv.get();
+  g.k_cache = dkc.get();
+  g.v_cache = dvc.get();
+  g.out = dout.get();
+  g.pos = c.pos;
+  g.max_pos = c.max_pos;
+  g.kv_type_k = attn::KvType::Q8_0;
+  g.kv_type_v = attn::KvType::Q8_0;
+  if (attn::decode_attention(g, nullptr) != cudaSuccess) {
+    std::printf("FAIL q8_0 launch\n");
+    return false;
+  }
+  INGINE_TEST_CUDA(cudaStreamSynchronize(nullptr));
+  dev_out = dout.download();
+  bool ok = close("q8_0 vs reference", dev_out, ref_out);
+
+  // Quality must be measured with a cache both formats filled themselves: at pos 0 the single stored row is the
+  // only content, so the difference is purely the block quantisation. (Comparing at depth against a BF16-filled
+  // history would compare a quantised row against misread BF16 bytes.)
+  Case q0 = make_case(0, 11);
+  std::vector<float> q_out(H * D, 0.0f), b_out(H * D, 0.0f);
+  std::uint8_t qk[attn::kv_cache_bytes(attn::KvType::Q8_0, 1)], qv[attn::kv_cache_bytes(attn::KvType::Q8_0, 1)];
+  Case qc = q0;
+  attn::DecodeAttnArgs qa = host_args(qc, q_out);
+  qa.k_cache = qk;
+  qa.v_cache = qv;
+  qa.kv_type_k = attn::KvType::Q8_0;
+  qa.kv_type_v = attn::KvType::Q8_0;
+  attn::decode_attention_cpu(qa);
+  Case bc = q0;
+  attn::DecodeAttnArgs bargs = host_args(bc, b_out);
+  attn::decode_attention_cpu(bargs);
+  double worst = 0.0, rms = 0.0;
+  for (int i = 0; i < H * D; ++i) {
+    worst = std::max(worst, std::fabs(double(q_out[std::size_t(i)]) - double(b_out[std::size_t(i)])));
+    rms += double(b_out[std::size_t(i)]) * double(b_out[std::size_t(i)]);
+  }
+  rms = std::sqrt(rms / (H * D));
+  std::printf("%s q8_0 vs bf16 at pos 0: max_abs=%.3e rms=%.3e rel=%.3e\n", worst / rms < 5e-2 ? "PASS" : "FAIL",
+              worst, rms, worst / rms);
+  return ok && worst / rms < 5e-2;
+
+}
+
 }  // namespace
 
 int main() {
   bool ok = closed_form_cpu();
+  ok &= q8_case();
   ok &= split_matches_full_cpu(0, 1);
   ok &= split_matches_full_cpu(511, 3);
   ok &= split_matches_full_cpu(600, 4);

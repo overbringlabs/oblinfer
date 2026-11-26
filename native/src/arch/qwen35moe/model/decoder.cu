@@ -167,10 +167,22 @@ bool Decoder::init(const TextArena& arena, int max_pos, std::string* error) {
     logits_ = static_cast<float*>(alloc(std::size_t(VOCAB) * 4));
     logits_host_.resize(VOCAB);
 
-    const std::size_t per_layer_kv = std::size_t(max_pos) * KV_HEADS * HEAD_DIM * sizeof(__nv_bfloat16);
+    // KV element formats, selected like llama-server's -ctk/-ctv. Q8_0 is a quarter of BF16 and is what makes
+    // 262144 fit on two 16 GB cards.
+    auto parse_kv = [](const char* name, kernels::KvType fallback) {
+      const char* v = std::getenv(name);
+      if (!v) return fallback;
+      if (std::string(v) == "q8_0") return kernels::KvType::Q8_0;
+      if (std::string(v) == "bf16" || std::string(v) == "f16") return kernels::KvType::Bf16;
+      throw std::runtime_error(std::string(name) + " must be bf16 or q8_0, got " + v);
+    };
+    kv_type_k_ = parse_kv("QWEN35MOE_CTK", kernels::KvType::Bf16);
+    kv_type_v_ = parse_kv("QWEN35MOE_CT_V", kernels::KvType::Bf16);
+    const std::size_t k_bytes = kernels::kv_cache_bytes(kv_type_k_, max_pos);
+    const std::size_t v_bytes = kernels::kv_cache_bytes(kv_type_v_, max_pos);
     for (int i = 0; i < NUM_FULL_LAYERS; ++i) {
-      kv_k_[i] = static_cast<__nv_bfloat16*>(alloc(per_layer_kv));
-      kv_v_[i] = static_cast<__nv_bfloat16*>(alloc(per_layer_kv));
+      kv_k_[i] = alloc(k_bytes);
+      kv_v_[i] = alloc(v_bytes);
     }
     gdn_state_ = static_cast<float*>(
         alloc(std::size_t(NUM_LINEAR_LAYERS) * LIN_VALUE_HEADS * LIN_KEY_DIM * LIN_VALUE_DIM * 4));
@@ -457,6 +469,8 @@ void Decoder::full_layer(int l, int pos) {
   dec.v_new = v_;
   dec.k_cache = kv_k_[slot];
   dec.v_cache = kv_v_[slot];
+  dec.kv_type_k = kv_type_k_;
+  dec.kv_type_v = kv_type_v_;
   dec.out = attn_;
   dec.pos = pos;
   dec.max_pos = max_pos_;

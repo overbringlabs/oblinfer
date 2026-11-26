@@ -16,6 +16,8 @@
 
 #include <cuda_bf16.h>
 
+#include "arch/qwen35moe/kernels/attn/decode_attn.h"
+
 #include "arch/qwen35moe/kernels/moe/fused_experts.h"
 #include "arch/qwen35moe/model/uploader.h"
 
@@ -103,8 +105,10 @@ class Decoder {
   float* shared_up_ = nullptr;
   float* logits_ = nullptr;
 
-  __nv_bfloat16* kv_k_[NUM_FULL_LAYERS] = {};
-  __nv_bfloat16* kv_v_[NUM_FULL_LAYERS] = {};
+  void* kv_k_[NUM_FULL_LAYERS] = {};
+  void* kv_v_[NUM_FULL_LAYERS] = {};
+  kernels::KvType kv_type_k_ = kernels::KvType::Bf16;  // -ctk
+  kernels::KvType kv_type_v_ = kernels::KvType::Bf16;  // -ctv
   float* gdn_state_ = nullptr;   // [NUM_LINEAR_LAYERS, LIN_VALUE_HEADS, LIN_KEY_DIM, LIN_VALUE_DIM]
   float* conv_state_ = nullptr;  // [NUM_LINEAR_LAYERS, CONV_K - 1, LIN_CONV_DIM]
 

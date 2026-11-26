@@ -45,7 +45,9 @@ int main() {
   }
   const int depth = env_int("QWEN35MOE_DEPTH", 4096);
   const int gen = env_int("QWEN35MOE_GEN", 32);
-  const int max_pos = depth + gen + 8;
+  // QWEN35MOE_MAXPOS allocates a full-context cache while only a few tokens run (allocation proof).
+  const char* maxpos_env = std::getenv("QWEN35MOE_MAXPOS");
+  const int max_pos = maxpos_env ? std::atoi(maxpos_env) : depth + gen + 8;
 
   // Expert split: -1 keeps the uploader's free-memory choice; set QWEN35MOE_SPLIT to A/B a bandwidth split.
   const char* split_env = std::getenv("QWEN35MOE_SPLIT");
