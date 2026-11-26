@@ -105,6 +105,7 @@ class Decoder {
   float* shared_up_ = nullptr;
   float* logits_ = nullptr;
 
+  kernels::SplitState* kv_partial_ = nullptr;  // [ATTN_HEADS * kMaxSplits]
   void* kv_k_[NUM_FULL_LAYERS] = {};
   void* kv_v_[NUM_FULL_LAYERS] = {};
   kernels::KvType kv_type_k_ = kernels::KvType::Bf16;  // -ctk

@@ -1,5 +1,6 @@
 #include "arch/qwen35moe/model/decoder.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -84,6 +85,7 @@ Decoder::~Decoder() {
     if (buffer) cudaFree(buffer);
   }
   if (router_logits_) cudaFree(router_logits_);
+  if (kv_partial_) cudaFree(kv_partial_);
   if (argmax_dev_) cudaFree(argmax_dev_);
   if (dev1_ != dev0_) {
     cudaSetDevice(dev1_);
@@ -194,6 +196,9 @@ bool Decoder::init(const TextArena& arena, int max_pos, std::string* error) {
       kv_k_[i] = alloc(k_bytes);
       kv_v_[i] = alloc(v_bytes);
     }
+    // Flash-decoding scratch: one SplitState per (query head, position split).
+    kv_partial_ = static_cast<kernels::SplitState*>(
+        alloc(std::size_t(HEADS) * kernels::kMaxSplits * sizeof(kernels::SplitState)));
     gdn_state_ = static_cast<float*>(
         alloc(std::size_t(NUM_LINEAR_LAYERS) * LIN_VALUE_HEADS * LIN_KEY_DIM * LIN_VALUE_DIM * 4));
     conv_state_ = static_cast<float*>(alloc(std::size_t(NUM_LINEAR_LAYERS) * (CONV_K - 1) * LIN_CONV_DIM * 4));
@@ -490,6 +495,10 @@ void Decoder::full_layer(int l, int pos) {
   dec.v_cache = kv_v_[slot];
   dec.kv_type_k = kv_type_k_;
   dec.kv_type_v = kv_type_v_;
+  // Split the position range so a long cache keeps the SMs busy: one split per 2048 positions, capped.
+  constexpr int kSplitPositions = 2048;
+  dec.splits = std::max(1, std::min(kernels::kMaxSplits, (pos + kSplitPositions) / kSplitPositions));
+  dec.partial = kv_partial_;
   dec.out = attn_;
   dec.pos = pos;
   dec.max_pos = max_pos_;

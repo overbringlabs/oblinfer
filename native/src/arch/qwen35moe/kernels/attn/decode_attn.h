@@ -28,6 +28,7 @@ inline constexpr int ATTN_HEADS = 16;
 inline constexpr int ATTN_KV_HEADS = 2;
 inline constexpr int ATTN_HEAD_DIM = 256;
 inline constexpr int ATTN_CHUNK = 512;
+inline constexpr int kMaxSplits = 64;
 
 // KV cache element formats, selectable per side like llama-server's -ctk/-ctv. q8_0 is llama.cpp's block
 // format: 32 int8 values behind one fp16 scale, 34 bytes per block, 8 blocks per 256-dim head.
@@ -47,6 +48,13 @@ inline std::uint64_t kv_cache_bytes(KvType type, int max_pos) {
   return type == KvType::Bf16 ? values * 2 : (values / KV_BLOCK) * KV_BLOCK_BYTES;
 }
 
+// One position split's online-softmax state, written by a split block and merged by the combine kernel.
+struct SplitState {
+  float m;                      // running max of the split
+  float l;                      // running denominator
+  float acc[ATTN_HEAD_DIM];     // running numerator, unnormalised
+};
+
 struct DecodeAttnArgs {
   const float* q = nullptr;                     // [ATTN_HEADS, ATTN_HEAD_DIM], post q_norm and rotary
   const float* k_new = nullptr;                 // [ATTN_KV_HEADS, ATTN_HEAD_DIM], post k_norm and rotary
@@ -60,6 +68,11 @@ struct DecodeAttnArgs {
   int max_pos = 0;                              // cache capacity
   int head_begin = 0;                           // first query head this launch handles
   int head_count = ATTN_HEADS;                  // query heads this launch handles
+  // Flash decoding: when `partial` is set the positions are split into `splits` ranges, each block writes its
+  // SplitState to partial[(head - head_begin) * splits + split], and a combine kernel merges them. Leave null
+  // to run the single-block-per-head path (used by the reference tests).
+  SplitState* partial = nullptr;
+  int splits = 0;
 };
 
 // Stores k_new/v_new at `pos`, then attends over 0..pos for the query heads [head_begin, head_begin +
