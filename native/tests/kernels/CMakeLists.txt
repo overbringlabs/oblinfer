@@ -68,3 +68,17 @@ endif()
 if(TARGET ingine_kernels_quant)
   ingine_add_test(NAME bench_gemv SOURCES bench_gemv.cu LIBS CUDA::cudart TIMEOUT 600)
 endif()
+
+# Fused-experts bench (shipped kernels vs the previous launch shapes, all-local and half-remote routing).
+# Run manually on sm_120a; exits with code 77 on any other device.
+if(TARGET qwen35moe_moe)
+  ingine_add_test(NAME bench_fused_experts SOURCES bench_fused_experts.cu
+                  LIBS qwen35moe_moe ingine_kernels_quant CUDA::cudart TIMEOUT 600)
+endif()
+
+# Split (flash-decoding) attention of the Qwen3.6-35B-A3B pack: sixteen dims per lane, two position streams per
+# warp, against the FP64 reference over real q8_0 and bf16 cache bytes. The CUDA comparison runs only on sm_120.
+if(TARGET qwen35moe_attn)
+  ingine_add_test(NAME kernels_qwen35moe_attn_wide SOURCES test_qwen35moe_attn_wide.cu
+                  LIBS qwen35moe_attn CUDA::cudart ORACLE TIMEOUT 300)
+endif()

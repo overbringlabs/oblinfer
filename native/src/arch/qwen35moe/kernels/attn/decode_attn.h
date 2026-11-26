@@ -39,6 +39,8 @@ inline constexpr int KV_BLOCK = 32;
 // Q8_0 keeps two parallel arrays in one allocation: `values` int8 first, then one __half scale per 32-value
 // block. The interleaved 34-byte block put the values at byte offset 2, which forbids 32-bit reads; splitting
 // the arrays keeps both 16-byte aligned (the value count is a multiple of 16 for every supported context).
+// The split kernel loads sixteen bytes per lane, so callers must hand it a 16-byte aligned base for either
+// format; a sub-allocation has to keep that alignment.
 inline std::uint64_t kv_cache_bytes(KvType type, int max_pos) {
   const std::uint64_t values = std::uint64_t(max_pos) * ATTN_KV_HEADS * ATTN_HEAD_DIM;
   return type == KvType::Bf16 ? values * 2 : values + (values / KV_BLOCK) * sizeof(__half);
@@ -49,7 +51,9 @@ __host__ __device__ inline const __half* kv_q8_scales(const void* base, std::uin
   return reinterpret_cast<const __half*>(static_cast<const std::int8_t*>(base) + values);
 }
 
-// One position split's online-softmax state, written by a split block and merged by the combine kernel.
+// One position split's online-softmax state, written by a split block and merged by the combine kernel. A split
+// block runs sixteen dims per lane, so each warp holds two position streams and folds them into one state in
+// registers before the eight warps of the block merge through shared memory: one SplitState per block.
 struct SplitState {
   float m;                      // running max of the split
   float l;                      // running denominator

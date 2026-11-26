@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,6 +48,17 @@ void* alloc(std::size_t bytes) {
 Decoder::Decoder() = default;
 
 Decoder::~Decoder() {
+  // The step graphs before anything they reference: their child nodes clone the per-layer hop graphs, which go
+  // with the rest of device 1 further down.
+  cudaSetDevice(dev0_);
+  for (auto& [splits, graph] : graphs_) {
+    (void)splits;
+    decode_graph_free(&graph);
+  }
+  graphs_.clear();
+  if (cap0_) cudaStreamDestroy(cap0_);
+  if (token_dev_) cudaFree(token_dev_);
+  if (pos_dev_) cudaFree(pos_dev_);
   for (float* p : {x_, h_, h2_, y_, qkv_, qkv2_, z_, a_, b_, beta_, g_, gout_, q_lin_, k_lin_, v_lin_, qgate_,
                    k_, v_, attn_, q_attn_, gate_attn_, moe_out_, shared_out_, shared_h_, shared_up_, logits_, gdn_state_,
                    conv_state_}) {
@@ -89,6 +101,11 @@ Decoder::~Decoder() {
   if (argmax_dev_) cudaFree(argmax_dev_);
   if (dev1_ != dev0_) {
     cudaSetDevice(dev1_);
+    // The hop graphs were captured with device 1 current.
+    for (cudaGraph_t hop : hop_graphs_) {
+      if (hop) cudaGraphDestroy(hop);
+    }
+    hop_graphs_.clear();
     for (float* p : {peer_x_, peer_h_, peer_up_, peer_out_}) {
       if (p) cudaFree(p);
     }
@@ -314,6 +331,18 @@ bool Decoder::init(const TextArena& arena, int max_pos, std::string* error) {
     peer_ids_ = static_cast<int*>(alloc(attn::ROUTER_TOP_K * 4));
     peer_weights_ = static_cast<float*>(alloc(attn::ROUTER_TOP_K * 4));
     check(cudaSetDevice(dev0_), "set device 0");
+
+    use_graph_ = std::getenv("QWEN35MOE_GRAPH") && std::string(std::getenv("QWEN35MOE_GRAPH")) == "1";
+    // Capturing a step cannot coexist with these: SWAP_QG reassigns the query/gate buffers on every call, so a
+    // fixed graph would not follow the layer loop, and the dump and debug paths read activations back to the
+    // host inside the loop.
+    for (const char* forbid : {"QWEN35MOE_SWAP_QG", "QWEN35MOE_DUMP", "QWEN35MOE_DEBUG"}) {
+      if (use_graph_ && std::getenv(forbid)) {
+        std::fprintf(stderr, "[qwen35moe] QWEN35MOE_GRAPH=1 ignored: %s is set\n", forbid);
+        std::fflush(stderr);
+        use_graph_ = false;
+      }
+    }
     return true;
   } catch (const std::exception& e) {
     if (error) *error = e.what();
@@ -329,7 +358,7 @@ void Decoder::fp8_gemv(const std::string& base, const float* x, float* y, int ro
   args.y = y;
   args.rows = rows;
   args.cols = cols;
-  check(quant::fp8_gemv(args, nullptr), "fp8 gemv");
+  check(quant::fp8_gemv(args, s_), "fp8 gemv");
 }
 
 void Decoder::nvfp4_gemv(const std::string& base, const float* x, float* y, int rows, int cols) {
@@ -341,7 +370,7 @@ void Decoder::nvfp4_gemv(const std::string& base, const float* x, float* y, int 
   args.y = y;
   args.rows = rows;
   args.cols = cols;
-  check(quant::nvfp4_gemv(args, nullptr), "nvfp4 gemv");
+  check(quant::nvfp4_gemv(args, s_), "nvfp4 gemv");
 }
 
 void Decoder::linear_layer(int l) {
@@ -356,10 +385,10 @@ void Decoder::linear_layer(int l) {
   }
   fp8_gemv(p + "in_proj_z", h_, z_, LIN_VALUE_DIM_TOT, HIDDEN);
   check(dense::gemv_bf16(static_cast<const __nv_bfloat16*>(ptr(p + "in_proj_a.weight")), h_, a_, LIN_VALUE_HEADS,
-                         HIDDEN, nullptr),
+                         HIDDEN, s_),
         "in_proj_a");
   check(dense::gemv_bf16(static_cast<const __nv_bfloat16*>(ptr(p + "in_proj_b.weight")), h_, b_, LIN_VALUE_HEADS,
-                         HIDDEN, nullptr),
+                         HIDDEN, s_),
         "in_proj_b");
 
   // Conv state per linear layer, in checkpoint order (no active layer index compression).
@@ -374,7 +403,7 @@ void Decoder::linear_layer(int l) {
   conv.history = conv_hist;
   conv.y = qkv2_;
   conv.conv_dim = LIN_CONV_DIM;
-  check(gdn::conv_silu_step(conv, nullptr), "conv");
+  check(gdn::conv_silu_step(conv, s_), "conv");
 
   gdn::GdnGateArgs gates;
   gates.a = a_;
@@ -384,7 +413,7 @@ void Decoder::linear_layer(int l) {
   gates.beta = beta_;
   gates.g = g_;
   gates.heads = LIN_VALUE_HEADS;
-  check(gdn::gdn_gates(gates, nullptr), "gdn gates");
+  check(gdn::gdn_gates(gates, s_), "gdn gates");
 
   const float* q_ptr = qkv2_;
   const float* k_ptr = qkv2_ + LIN_KEY_DIM_TOT;
@@ -399,7 +428,7 @@ void Decoder::linear_layer(int l) {
     g.key_dim = LIN_KEY_DIM;
     g.value_heads = LIN_VALUE_HEADS;
     g.value_dim = LIN_VALUE_DIM;
-    check(gdn::gather_qkv_grouped(g, nullptr), "gather qkv");
+    check(gdn::gather_qkv_grouped(g, s_), "gather qkv");
     q_ptr = q_lin_;
     k_ptr = k_lin_;
     v_ptr = v_lin_;
@@ -414,7 +443,7 @@ void Decoder::linear_layer(int l) {
   step.state = gdn_state_ + std::size_t(slot) * LIN_VALUE_HEADS * LIN_KEY_DIM * LIN_VALUE_DIM;
   step.out = gout_;
   step.v_heads = LIN_VALUE_HEADS;
-  check(gdn::gdn_recurrent_step(step, nullptr), "gdn step");
+  check(gdn::gdn_recurrent_step(step, s_), "gdn step");
 
   gdn::GatedNormArgs norm;
   norm.x = gout_;
@@ -423,9 +452,42 @@ void Decoder::linear_layer(int l) {
   norm.v_heads = LIN_VALUE_HEADS;
   norm.v_dim = LIN_VALUE_DIM;
   norm.eps = EPS;
-  check(gdn::gated_norm(norm, nullptr), "gdn norm");
+  check(gdn::gated_norm(norm, s_), "gdn norm");
 
   fp8_gemv(p + "out_proj", gout_, y_, HIDDEN, LIN_VALUE_DIM_TOT);
+}
+
+// A by-value kernel argument is frozen when the capture ends, so a launch whose argument carries the position
+// has to be found in the graph and rewritten before every replay. Outside a capture this is the plain launch.
+template <typename Args, typename Launch>
+void Decoder::at(const Args& args, std::size_t pos_offset, Launch&& launch) {
+  if (!cap_) {
+    launch();
+    return;
+  }
+  cap_->begin(s_);
+  launch();
+  cap_->end(s_, &args, sizeof(args), pos_offset);
+}
+
+void Decoder::clear(void* p, std::size_t bytes) {
+  // cudaMemset enqueues no node inside a capture and reports no error: the work would simply be missing.
+  check(cudaMemsetAsync(p, 0, bytes, s_), "clear");
+}
+
+void Decoder::copy(void* dst, const void* src, std::size_t bytes, cudaMemcpyKind kind) {
+  check(cudaMemcpyAsync(dst, src, bytes, kind, s_), "copy");
+}
+
+void Decoder::read_back(void* dst, const void* src, std::size_t bytes) {
+  // A synchronous cudaMemcpy orders the legacy stream only, so a replay on the capture stream needs the copy
+  // enqueued there first.
+  if (s_) {
+    check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, s_), "read back");
+    check(cudaStreamSynchronize(s_), "read back sync");
+  } else {
+    check(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost), "read back");
+  }
 }
 
 void Decoder::full_layer(int l, int pos) {
@@ -460,14 +522,14 @@ void Decoder::full_layer(int l, int pos) {
     split.gate = q_attn_;  // first half is the gate
     split.heads = HEADS;
     split.head_dim = HEAD_DIM;
-    check(attn::split_q_gate(split, nullptr), "split q gate");
+    check(attn::split_q_gate(split, s_), "split q gate");
     float* tmp = q_attn_;
     q_attn_ = gate_attn_;
     gate_attn_ = tmp;
   } else if (std::getenv("QWEN35MOE_FLAT_QG")) {
     // Exporter fused q and gate as two contiguous halves instead of per head.
-    check(cudaMemcpy(q_attn_, qgate_, Q_DIM * 4, cudaMemcpyDeviceToDevice), "q half");
-    check(cudaMemcpy(gate_attn_, qgate_ + Q_DIM, Q_DIM * 4, cudaMemcpyDeviceToDevice), "gate half");
+    copy(q_attn_, qgate_, Q_DIM * 4, cudaMemcpyDeviceToDevice);
+    copy(gate_attn_, qgate_ + Q_DIM, Q_DIM * 4, cudaMemcpyDeviceToDevice);
   } else {
     attn::SplitQGateArgs split;
     split.qgate = qgate_;
@@ -475,7 +537,7 @@ void Decoder::full_layer(int l, int pos) {
     split.gate = gate_attn_;
     split.heads = HEADS;
     split.head_dim = HEAD_DIM;
-    check(attn::split_q_gate(split, nullptr), "split q gate");
+    check(attn::split_q_gate(split, s_), "split q gate");
   }
 
   attn::NormRopeArgs rope;
@@ -485,7 +547,7 @@ void Decoder::full_layer(int l, int pos) {
   rope.k_weight = f32(p + "k_norm.weight", true);
   rope.pos = pos;
   rope.eps = EPS;
-  check(attn::qk_norm_rope(rope, nullptr), "qk norm rope");
+  at(rope, offsetof(attn::NormRopeArgs, pos), [&] { check(attn::qk_norm_rope(rope, s_), "qk norm rope"); });
 
   attn::DecodeAttnArgs dec;
   dec.q = q_attn_;
@@ -495,20 +557,19 @@ void Decoder::full_layer(int l, int pos) {
   dec.v_cache = kv_v_[slot];
   dec.kv_type_k = kv_type_k_;
   dec.kv_type_v = kv_type_v_;
-  // Split the position range so a long cache keeps the SMs busy: one split per 2048 positions, capped.
-  constexpr int kSplitPositions = 2048;
-  dec.splits = std::max(1, std::min(kernels::kMaxSplits, (pos + kSplitPositions) / kSplitPositions));
-  dec.partial = kv_partial_;
   dec.out = attn_;
   dec.pos = pos;
   dec.max_pos = max_pos_;
-  check(attn::decode_attention(dec, nullptr), "attention");
+  dec.partial = kv_partial_;
+  // One split per 2048 positions keeps the SMs busy; the count is also the graph bucket.
+  dec.splits = splits_at(pos);
+  at(dec, offsetof(attn::DecodeAttnArgs, pos), [&] { check(attn::decode_attention(dec, s_), "attention"); });
 
   attn::OutputGateArgs gate;
   gate.x = attn_;
   gate.gate = gate_attn_;
   gate.count = Q_DIM;
-  check(attn::output_gate(gate, nullptr), "output gate");
+  check(attn::output_gate(gate, s_), "output gate");
   if (dump_here) dump("/tmp/qwen_attn_out.bin", attn_, Q_DIM);
 
   fp8_gemv(p + "o_proj", attn_, y_, HIDDEN, Q_DIM);
@@ -523,43 +584,50 @@ void Decoder::moe(int l) {
   router.weights = weights_dev_;
   router.logits = router_logits_;
   check(cudaSetDevice(dev0_), "set device 0");
-  check(attn::route(router, nullptr), "router");
+  check(attn::route(router, s_), "router");
 
   exch_ = l & 1;
   Exchange* slot = pinned_ + exch_;
   const bool debug = std::getenv("QWEN35MOE_DEBUG") != nullptr;
+  const bool hop = dev1_ != dev0_;
 
-  if (dev1_ != dev0_) {
-    if (l >= 2) check(cudaStreamWaitEvent(nullptr, ev_x_free_[exch_], 0), "x free");
-    check(cudaMemcpyAsync(slot->x, h2_, HIDDEN * 4, cudaMemcpyDeviceToHost, nullptr), "x out");
-    check(cudaMemcpyAsync(slot->ids, ids_dev_, sizeof(slot->ids), cudaMemcpyDeviceToHost, nullptr), "ids out");
-    check(cudaMemcpyAsync(slot->weights, weights_dev_, sizeof(slot->weights), cudaMemcpyDeviceToHost, nullptr),
+  if (hop) {
+    // The routing reaches card 1 through this pinned slot. Eagerly the four events order it; in a captured step
+    // the edges of the spliced child node do, and they also cover the slot reuse that ev_x_free_ and ev_y_free_
+    // guard between the layer two steps back.
+    if (!cap_ && l >= 2) check(cudaStreamWaitEvent(s_, ev_x_free_[exch_], 0), "x free");
+    check(cudaMemcpyAsync(slot->x, h2_, HIDDEN * 4, cudaMemcpyDeviceToHost, s_), "x out");
+    check(cudaMemcpyAsync(slot->ids, ids_dev_, sizeof(slot->ids), cudaMemcpyDeviceToHost, s_), "ids out");
+    check(cudaMemcpyAsync(slot->weights, weights_dev_, sizeof(slot->weights), cudaMemcpyDeviceToHost, s_),
           "weights out");
-    check(cudaEventRecord(ev_x_[exch_], nullptr), "x ready");
-
-    check(cudaSetDevice(dev1_), "set device 1");
-    check(cudaStreamWaitEvent(s1_, ev_x_[exch_], 0), "wait x");
-    check(cudaMemcpyAsync(peer_x_, slot->x, HIDDEN * 4, cudaMemcpyHostToDevice, s1_), "x in");
-    check(cudaMemcpyAsync(peer_ids_, slot->ids, sizeof(slot->ids), cudaMemcpyHostToDevice, s1_), "ids in");
-    check(cudaMemcpyAsync(peer_weights_, slot->weights, sizeof(slot->weights), cudaMemcpyHostToDevice, s1_),
-          "weights in");
-    kernels::FusedMoeArgs a1;
-    a1.layers = fused_[1].device + std::size_t(l) * EXPERTS;
-    a1.x = peer_x_;
-    a1.ids = peer_ids_;
-    a1.weights = peer_weights_;
-    a1.y = peer_out_;
-    a1.scratch_gate = fscratch_gate_[1];
-    a1.scratch_up = fscratch_up_[1];
-    a1.scratch_down = fscratch_down_[1];
-    check(kernels::fused_moe_apply(a1, s1_), "fused moe dev1");
-    check(cudaEventRecord(ev_x_free_[exch_], s1_), "x consumed");
-    if (l >= 2) check(cudaStreamWaitEvent(s1_, ev_y_free_[exch_], 0), "y free");
-    check(cudaMemcpyAsync(slot->y, peer_out_, HIDDEN * 4, cudaMemcpyDeviceToHost, s1_), "y back");
-    check(cudaEventRecord(ev_y_[exch_], s1_), "y ready");
-    check(cudaSetDevice(dev0_), "set device 0");
+    if (cap_) {
+      cap_->splice(s_, hop_graph(l));  // device 1 stays unbound here: the hop is a node, not a launch
+    } else {
+      check(cudaEventRecord(ev_x_[exch_], s_), "x ready");
+      check(cudaSetDevice(dev1_), "set device 1");
+      check(cudaStreamWaitEvent(s1_, ev_x_[exch_], 0), "wait x");
+      check(cudaMemcpyAsync(peer_x_, slot->x, HIDDEN * 4, cudaMemcpyHostToDevice, s1_), "x in");
+      check(cudaMemcpyAsync(peer_ids_, slot->ids, sizeof(slot->ids), cudaMemcpyHostToDevice, s1_), "ids in");
+      check(cudaMemcpyAsync(peer_weights_, slot->weights, sizeof(slot->weights), cudaMemcpyHostToDevice, s1_),
+            "weights in");
+      kernels::FusedMoeArgs a1;
+      a1.layers = fused_[1].device + std::size_t(l) * EXPERTS;
+      a1.x = peer_x_;
+      a1.ids = peer_ids_;
+      a1.weights = peer_weights_;
+      a1.y = peer_out_;
+      a1.scratch_gate = fscratch_gate_[1];
+      a1.scratch_up = fscratch_up_[1];
+      a1.scratch_down = fscratch_down_[1];
+      check(kernels::fused_moe_apply(a1, s1_), "fused moe dev1");
+      check(cudaEventRecord(ev_x_free_[exch_], s1_), "x consumed");
+      if (l >= 2) check(cudaStreamWaitEvent(s1_, ev_y_free_[exch_], 0), "y free");
+      check(cudaMemcpyAsync(slot->y, peer_out_, HIDDEN * 4, cudaMemcpyDeviceToHost, s1_), "y back");
+      check(cudaEventRecord(ev_y_[exch_], s1_), "y ready");
+      check(cudaSetDevice(dev0_), "set device 0");
+    }
   } else {
-    check(cudaMemset(y_, 0, HIDDEN * 4), "peer y zero");
+    clear(y_, HIDDEN * 4);
   }
 
   kernels::FusedMoeArgs a0;
@@ -571,13 +639,15 @@ void Decoder::moe(int l) {
   a0.scratch_gate = fscratch_gate_[0];
   a0.scratch_up = fscratch_up_[0];
   a0.scratch_down = fscratch_down_[0];
-  check(kernels::fused_moe_apply(a0, nullptr), "fused moe dev0");
+  check(kernels::fused_moe_apply(a0, s_), "fused moe dev0");
 
-  if (dev1_ != dev0_) {
-    check(cudaStreamWaitEvent(nullptr, ev_y_[exch_], 0), "wait y");
-    check(cudaMemcpyAsync(y_, slot->y, HIDDEN * 4, cudaMemcpyHostToDevice, nullptr), "y in");
-    check(attn::axpy(moe_out_, y_, 1.0f, HIDDEN, nullptr), "merge expert partials");
-    check(cudaEventRecord(ev_y_free_[exch_], nullptr), "y consumed");
+  if (hop) {
+    // The join leaves the device-0 experts above running beside the hop, as the eager event pair does.
+    if (cap_) cap_->join(s_);
+    else check(cudaStreamWaitEvent(s_, ev_y_[exch_], 0), "wait y");
+    check(cudaMemcpyAsync(y_, slot->y, HIDDEN * 4, cudaMemcpyHostToDevice, s_), "y in");
+    check(attn::axpy(moe_out_, y_, 1.0f, HIDDEN, s_), "merge expert partials");
+    if (!cap_) check(cudaEventRecord(ev_y_free_[exch_], s_), "y consumed");
   }
 
   if (debug && l == 0) {
@@ -614,130 +684,272 @@ void Decoder::moe(int l) {
   shared.y = shared_out_;
   shared.scratch_h = shared_h_;
   shared.scratch_up = shared_up_;
-  check(attn::shared_expert(shared, nullptr), "shared expert");
+  check(attn::shared_expert(shared, s_), "shared expert");
+}
+
+int Decoder::splits_at(int pos) const {
+  // One flash-decode split per kSplitPositions positions, capped: the bucket the graph is keyed by.
+  return std::max(1, std::min(kernels::kMaxSplits, (pos + kSplitPositions) / kSplitPositions));
+}
+
+int Decoder::capture_pos(int splits) const {
+  // The first position of the bucket. Buckets are [kSplitPositions * (splits - 1), ... ) up to the cap, which
+  // absorbs everything beyond it. Negative when the bucket is out of reach for this context length.
+  const int first = (splits - 1) * kSplitPositions;
+  return first < max_pos_ ? first : -1;
+}
+
+cudaGraph_t Decoder::hop_graph(int l) const {
+  return l >= 0 && l < int(hop_graphs_.size()) ? hop_graphs_[l] : nullptr;
+}
+
+bool Decoder::prepare_graph(std::string* error) {
+  try {
+    if (cap0_ && token_dev_ && pos_dev_ && (dev1_ == dev0_ || !hop_graphs_.empty())) return true;
+    check(cudaSetDevice(dev0_), "set device 0");
+    // The legacy default stream cannot be captured, so the step gets a named non-blocking stream of its own.
+    if (!cap0_) check(cudaStreamCreateWithFlags(&cap0_, cudaStreamNonBlocking), "step stream");
+    if (!token_dev_) token_dev_ = static_cast<int*>(alloc(sizeof(int)));
+    if (!pos_dev_) pos_dev_ = static_cast<int*>(alloc(sizeof(int)));
+    check(cudaMemset(token_dev_, 0, sizeof(int)), "token zero");
+    check(cudaMemset(pos_dev_, 0, sizeof(int)), "pos zero");
+    if (dev1_ != dev0_ && hop_graphs_.empty()) {
+      // Card 1's half of every MoE layer, one graph per layer, captured with device 1 bound outside the capture
+      // (a graph may not switch device inside itself) and with no event in it: the step graph's child node
+      // edges are the hop's fork and join, so the same graphs serve every bucket.
+      check(cudaSetDevice(dev1_), "set device 1");
+      hop_graphs_.assign(LAYERS, nullptr);
+      for (int l = 0; l < LAYERS; ++l) {
+        Exchange* slot = pinned_ + (l & 1);
+        kernels::FusedMoeArgs a1;
+        a1.layers = fused_[1].device + std::size_t(l) * EXPERTS;
+        a1.x = peer_x_;
+        a1.ids = peer_ids_;
+        a1.weights = peer_weights_;
+        a1.y = peer_out_;
+        a1.scratch_gate = fscratch_gate_[1];
+        a1.scratch_up = fscratch_up_[1];
+        a1.scratch_down = fscratch_down_[1];
+        check(cudaStreamBeginCapture(s1_, cudaStreamCaptureModeThreadLocal), "begin hop capture");
+        cudaGraph_t hop = nullptr;
+        try {
+          check(cudaMemcpyAsync(peer_x_, slot->x, HIDDEN * 4, cudaMemcpyHostToDevice, s1_), "x in");
+          check(cudaMemcpyAsync(peer_ids_, slot->ids, sizeof(slot->ids), cudaMemcpyHostToDevice, s1_), "ids in");
+          check(cudaMemcpyAsync(peer_weights_, slot->weights, sizeof(slot->weights), cudaMemcpyHostToDevice, s1_),
+                "weights in");
+          check(kernels::fused_moe_apply(a1, s1_), "fused moe dev1 capture");
+          check(cudaMemcpyAsync(slot->y, peer_out_, HIDDEN * 4, cudaMemcpyDeviceToHost, s1_), "y back");
+          check(cudaStreamEndCapture(s1_, &hop), "end hop capture");
+        } catch (...) {
+          cudaGraph_t discard = nullptr;
+          if (cudaStreamEndCapture(s1_, &discard) == cudaSuccess && discard) cudaGraphDestroy(discard);
+          throw;
+        }
+        hop_graphs_[l] = hop;
+      }
+    }
+    check(cudaSetDevice(dev0_), "set device 0");
+    return true;
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
+
+void Decoder::enqueue_graph(int pos, DecodeGraphCapture* cap) {
+  const cudaStream_t saved_stream = s_;
+  DecodeGraphCapture* const saved_cap = cap_;
+  s_ = cap0_;
+  cap_ = cap;
+  try {
+    // The token id is irrelevant here: the captured embedding node reads token_dev_, and capture runs nothing.
+    body(0, pos, true);
+  } catch (...) {
+    s_ = saved_stream;
+    cap_ = saved_cap;
+    throw;
+  }
+  s_ = saved_stream;
+  cap_ = saved_cap;
+}
+
+DecodeGraph* Decoder::graph_for(int pos) {
+  if (!use_graph_) return nullptr;
+  const int splits = splits_at(pos);
+  const auto hit = graphs_.find(splits);
+  if (hit != graphs_.end()) return &hit->second;
+  if (!primed_) return nullptr;  // the first step of the run goes eager: see the note on body()
+  DecodeGraph& graph = graphs_[splits];
+  std::string why;
+  if (decode_graph_build(&graph, *this, splits, &why)) {
+    std::fprintf(stderr,
+                 "[qwen35moe] captured one token: splits=%d at pos=%d, %d nodes (%d kernels, %d copies, "
+                 "%d memsets, %d second-device hops), %d position nodes patched per replay\n",
+                 splits, capture_pos(splits), graph.stats.nodes, graph.stats.kernels, graph.stats.copies,
+                 graph.stats.memsets, graph.stats.hops, graph.stats.pos_nodes);
+    std::fflush(stderr);
+    return &graph;
+  }
+  graphs_.erase(splits);
+  use_graph_ = false;  // one failed capture is enough: the step stays eager for the rest of the run
+  if (!graph_reported_) {
+    graph_reported_ = true;
+    std::fprintf(stderr, "[qwen35moe] CUDA graph off, stepping eagerly: %s\n", why.c_str());
+    std::fflush(stderr);
+  }
+  return nullptr;
+}
+
+// One token's kernels: the embedding, LAYERS layers, the final norm and the lm_head GEMV, all on `s_`. The
+// host readback stays with step(), outside the graph. `captured` marks the graph form, which differs in two
+// ways: the embedding reads the token id out of token_dev_ because a captured argument cannot vary, and the
+// position-bearing launches are registered with the capture so a replay can rewrite their arguments.
+//
+// Nothing in here may block or allocate. The first step of a run always takes the eager path, which is what
+// loads every module, materialises every cached f32() norm weight and resolves every ptr() name that a later
+// capture would otherwise try to build inside itself.
+void Decoder::body(int token, int pos, bool captured) {
+  const __nv_bfloat16* embed =
+      static_cast<const __nv_bfloat16*>(ptr("model.language_model.embed_tokens.weight"));
+  if (captured) {
+    check(embedding_row_dev(embed, token_dev_, x_, HIDDEN, s_), "embedding");
+  } else {
+    check(dense::embedding_row(embed, token, x_, HIDDEN, s_), "embedding");
+  }
+  if (std::getenv("QWEN35MOE_DUMP") && pos == 0) {
+    std::vector<float> e(HIDDEN);
+    check(cudaMemcpy(e.data(), x_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump embed");
+    std::printf("embed:");
+    for (int i = 0; i < 4; ++i) std::printf(" %.9g", e[std::size_t(i)]);
+    std::printf("\n");
+  }
+  for (int l = 0; l < LAYERS; ++l) {
+    if (std::getenv("QWEN35MOE_DUMP") && pos == 0 && l == 0) {
+      std::vector<float> host(HIDDEN);
+      check(cudaMemcpy(host.data(), x_, HIDDEN * 4, cudaMemcpyDeviceToHost), "save x_in");
+      if (FILE* f = std::fopen("/tmp/qwen_layer0_x.bin", "wb")) {
+        std::fwrite(host.data(), 4, HIDDEN, f);
+        std::fclose(f);
+      }
+    }
+    if (std::getenv("QWEN35MOE_DEBUG")) {
+      std::printf("[step] pos=%d layer=%d\n", pos, l);
+      std::fflush(stdout);
+    }
+    check(dense::rms_norm(x_, f32(layer_name(l, "input_layernorm.weight"), true), h_, HIDDEN, EPS, s_),
+          "input norm");
+    const bool skip_attn = std::getenv("QWEN35MOE_SKIP_ATTN") != nullptr;
+    if (is_full_layer(l) && skip_attn) {
+      clear(y_, HIDDEN * 4);
+    } else if (is_full_layer(l)) {
+      full_layer(l, pos);
+    } else {
+      linear_layer(l);
+    }
+    if (std::getenv("QWEN35MOE_DUMP") && pos == 0 && l == 0) {
+      std::vector<float> h(HIDDEN), out(HIDDEN);
+      check(cudaMemcpy(h.data(), h_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump h");
+      check(cudaMemcpy(out.data(), y_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump y");
+      std::printf("h0:");
+      for (int i = 0; i < 4; ++i) std::printf(" %.9g", h[std::size_t(i)]);
+      std::printf("\n");
+      if (FILE* fh = std::fopen("/tmp/qwen_h0.bin", "wb")) {
+        std::fwrite(h.data(), 4, HIDDEN, fh);
+        std::fclose(fh);
+      }
+      std::printf("qkv0:");
+      for (int i = 0; i < 4; ++i) std::printf(" %.9g", out[std::size_t(i)]);
+      std::printf("\n");
+    }
+    if (std::getenv("QWEN35MOE_DUMP") && pos == 0 && l == 0) {
+      std::vector<float> host(HIDDEN);
+      check(cudaMemcpy(host.data(), y_, HIDDEN * 4, cudaMemcpyDeviceToHost), "save mixer");
+      if (FILE* f = std::fopen("/tmp/qwen_layer0_mixer.bin", "wb")) {
+        std::fwrite(host.data(), 4, HIDDEN, f);
+        std::fclose(f);
+      }
+    }
+    check(attn::axpy(x_, y_, 1.0f, HIDDEN, s_), "residual");
+
+    check(dense::rms_norm(x_, f32(layer_name(l, "post_attention_layernorm.weight"), true), h2_, HIDDEN, EPS, s_),
+          "post norm");
+    if (!std::getenv("QWEN35MOE_SKIP_MOE")) {
+      moe(l);
+    } else {
+      clear(moe_out_, HIDDEN * 4);
+      clear(shared_out_, HIDDEN * 4);
+    }
+    if (std::getenv("QWEN35MOE_DUMP") && pos == 0 && (l < 4 || l == 39)) {
+      std::vector<float> mo(HIDDEN), sh(HIDDEN), hx(HIDDEN);
+      check(cudaMemcpy(mo.data(), moe_out_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump moe");
+      check(cudaMemcpy(sh.data(), shared_out_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump shared");
+      check(cudaMemcpy(hx.data(), x_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump x");
+      auto amax = [](const std::vector<float>& v) {
+        float m = 0;
+        for (float a : v) m = std::max(m, std::fabs(a));
+        return m;
+      };
+      std::printf("[mag] l=%d |moe|=%.4g |shared|=%.4g |x|=%.4g\n", l, amax(mo), amax(sh), amax(hx));
+      if (l == 0) {
+        auto save = [&](const char* file, const float* data, int n) {
+          std::vector<float> host(n);
+          check(cudaMemcpy(host.data(), data, n * 4, cudaMemcpyDeviceToHost), "save");
+          if (FILE* f = std::fopen(file, "wb")) {
+            std::fwrite(host.data(), 4, n, f);
+            std::fclose(f);
+          }
+        };
+        save("/tmp/qwen_layer0_x.bin", x_, HIDDEN);
+        save("/tmp/qwen_layer0_h2.bin", h2_, HIDDEN);
+        save("/tmp/qwen_layer0_moe.bin", moe_out_, HIDDEN);
+        save("/tmp/qwen_layer0_shared.bin", shared_out_, HIDDEN);
+        save("/tmp/qwen_layer0_x_after.bin", x_, HIDDEN);  // x before the MoE residuals; fixed below
+      }
+    }
+    check(attn::axpy(x_, moe_out_, 1.0f, HIDDEN, s_), "moe residual");
+    check(attn::axpy(x_, shared_out_, 1.0f, HIDDEN, s_), "shared residual");
+    if (std::getenv("QWEN35MOE_DUMP") && pos == 0) {
+      std::vector<float> host(HIDDEN);
+      check(cudaMemcpy(host.data(), x_, HIDDEN * 4, cudaMemcpyDeviceToHost), "save x_after");
+      char path[64];
+      std::snprintf(path, sizeof(path), "/tmp/qwen_x_layer_%02d.bin", l);
+      if (FILE* f = std::fopen(path, "wb")) {
+        std::fwrite(host.data(), 4, HIDDEN, f);
+        std::fclose(f);
+      }
+      if (FILE* f = std::fopen("/tmp/qwen_layer0_x_after.bin", "wb")) {
+        std::fwrite(host.data(), 4, HIDDEN, f);
+        std::fclose(f);
+      }
+    }
+  }
+
+  check(dense::rms_norm(x_, f32("model.language_model.norm.weight", true), h_, HIDDEN, EPS, s_), "final norm");
+  nvfp4_gemv("lm_head", h_, logits_, VOCAB, HIDDEN);
 }
 
 bool Decoder::step(int token, int pos, int* next_token, std::string* error) {
   try {
     last_pos_ = pos;
     check(cudaSetDevice(dev0_), "set device 0");
-    check(dense::embedding_row(static_cast<const __nv_bfloat16*>(ptr("model.language_model.embed_tokens.weight")),
-                               token, x_, HIDDEN, nullptr),
-          "embedding");
-    if (std::getenv("QWEN35MOE_DUMP") && pos == 0) {
-      std::vector<float> e(HIDDEN);
-      check(cudaMemcpy(e.data(), x_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump embed");
-      std::printf("embed:");
-      for (int i = 0; i < 4; ++i) std::printf(" %.9g", e[std::size_t(i)]);
-      std::printf("\n");
+    if (DecodeGraph* graph = graph_for(pos)) {
+      std::string why;
+      // The replay goes to the capture stream, so the readback below has to follow it there rather than on the
+      // legacy stream, which shares no ordering with it.
+      s_ = graph->stream;
+      cap_ = nullptr;
+      if (!decode_graph_run(graph, token, pos, &why)) throw std::runtime_error("step graph replay: " + why);
+    } else {
+      s_ = nullptr;
+      cap_ = nullptr;
+      body(token, pos, false);
+      primed_ = true;  // a capture may now assume every module is loaded and every cache warm
     }
-    for (int l = 0; l < LAYERS; ++l) {
-      if (std::getenv("QWEN35MOE_DUMP") && pos == 0 && l == 0) {
-        std::vector<float> host(HIDDEN);
-        check(cudaMemcpy(host.data(), x_, HIDDEN * 4, cudaMemcpyDeviceToHost), "save x_in");
-        if (FILE* f = std::fopen("/tmp/qwen_layer0_x.bin", "wb")) {
-          std::fwrite(host.data(), 4, HIDDEN, f);
-          std::fclose(f);
-        }
-      }
-      if (std::getenv("QWEN35MOE_DEBUG")) {
-        std::printf("[step] pos=%d layer=%d\n", pos, l);
-        std::fflush(stdout);
-      }
-      check(dense::rms_norm(x_, f32(layer_name(l, "input_layernorm.weight"), true), h_, HIDDEN, EPS, nullptr),
-            "input norm");
-      const bool skip_attn = std::getenv("QWEN35MOE_SKIP_ATTN") != nullptr;
-      if (is_full_layer(l) && skip_attn) {
-        check(cudaMemset(y_, 0, HIDDEN * 4), "ablate attn");
-      } else if (is_full_layer(l)) {
-        full_layer(l, pos);
-      } else {
-        linear_layer(l);
-      }
-      if (std::getenv("QWEN35MOE_DUMP") && pos == 0 && l == 0) {
-        std::vector<float> h(HIDDEN), out(HIDDEN);
-        check(cudaMemcpy(h.data(), h_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump h");
-        check(cudaMemcpy(out.data(), y_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump y");
-        std::printf("h0:");
-        for (int i = 0; i < 4; ++i) std::printf(" %.9g", h[std::size_t(i)]);
-        std::printf("\n");
-        if (FILE* fh = std::fopen("/tmp/qwen_h0.bin", "wb")) {
-          std::fwrite(h.data(), 4, HIDDEN, fh);
-          std::fclose(fh);
-        }
-        std::printf("qkv0:");
-        for (int i = 0; i < 4; ++i) std::printf(" %.9g", out[std::size_t(i)]);
-        std::printf("\n");
-      }
-      if (std::getenv("QWEN35MOE_DUMP") && pos == 0 && l == 0) {
-        std::vector<float> host(HIDDEN);
-        check(cudaMemcpy(host.data(), y_, HIDDEN * 4, cudaMemcpyDeviceToHost), "save mixer");
-        if (FILE* f = std::fopen("/tmp/qwen_layer0_mixer.bin", "wb")) {
-          std::fwrite(host.data(), 4, HIDDEN, f);
-          std::fclose(f);
-        }
-      }
-      check(attn::axpy(x_, y_, 1.0f, HIDDEN, nullptr), "residual");
-
-      check(dense::rms_norm(x_, f32(layer_name(l, "post_attention_layernorm.weight"), true), h2_, HIDDEN, EPS, nullptr),
-            "post norm");
-      if (!std::getenv("QWEN35MOE_SKIP_MOE")) {
-        moe(l);
-      } else {
-        check(cudaMemset(moe_out_, 0, HIDDEN * 4), "ablate moe");
-        check(cudaMemset(shared_out_, 0, HIDDEN * 4), "ablate shared");
-      }
-      if (std::getenv("QWEN35MOE_DUMP") && pos == 0 && (l < 4 || l == 39)) {
-        std::vector<float> mo(HIDDEN), sh(HIDDEN), hx(HIDDEN);
-        check(cudaMemcpy(mo.data(), moe_out_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump moe");
-        check(cudaMemcpy(sh.data(), shared_out_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump shared");
-        check(cudaMemcpy(hx.data(), x_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump x");
-        auto amax = [](const std::vector<float>& v) {
-          float m = 0;
-          for (float a : v) m = std::max(m, std::fabs(a));
-          return m;
-        };
-        std::printf("[mag] l=%d |moe|=%.4g |shared|=%.4g |x|=%.4g\n", l, amax(mo), amax(sh), amax(hx));
-        if (l == 0) {
-          auto save = [&](const char* file, const float* data, int n) {
-            std::vector<float> host(n);
-            check(cudaMemcpy(host.data(), data, n * 4, cudaMemcpyDeviceToHost), "save");
-            if (FILE* f = std::fopen(file, "wb")) {
-              std::fwrite(host.data(), 4, n, f);
-              std::fclose(f);
-            }
-          };
-          save("/tmp/qwen_layer0_x.bin", x_, HIDDEN);
-          save("/tmp/qwen_layer0_h2.bin", h2_, HIDDEN);
-          save("/tmp/qwen_layer0_moe.bin", moe_out_, HIDDEN);
-          save("/tmp/qwen_layer0_shared.bin", shared_out_, HIDDEN);
-          save("/tmp/qwen_layer0_x_after.bin", x_, HIDDEN);  // x before the MoE residuals; fixed below
-        }
-      }
-      check(attn::axpy(x_, moe_out_, 1.0f, HIDDEN, nullptr), "moe residual");
-      check(attn::axpy(x_, shared_out_, 1.0f, HIDDEN, nullptr), "shared residual");
-      if (std::getenv("QWEN35MOE_DUMP") && pos == 0) {
-        std::vector<float> host(HIDDEN);
-        check(cudaMemcpy(host.data(), x_, HIDDEN * 4, cudaMemcpyDeviceToHost), "save x_after");
-        char path[64];
-        std::snprintf(path, sizeof(path), "/tmp/qwen_x_layer_%02d.bin", l);
-        if (FILE* f = std::fopen(path, "wb")) {
-          std::fwrite(host.data(), 4, HIDDEN, f);
-          std::fclose(f);
-        }
-        if (FILE* f = std::fopen("/tmp/qwen_layer0_x_after.bin", "wb")) {
-          std::fwrite(host.data(), 4, HIDDEN, f);
-          std::fclose(f);
-        }
-      }
-    }
-
-    check(dense::rms_norm(x_, f32("model.language_model.norm.weight", true), h_, HIDDEN, EPS, nullptr), "final norm");
-    nvfp4_gemv("lm_head", h_, logits_, VOCAB, HIDDEN);
-    check(dense::argmax(logits_, VOCAB, argmax_dev_, nullptr, nullptr), "argmax");
+    // Outside the graph: the argmax reads the logits and the host reads both back.
+    check(dense::argmax(logits_, VOCAB, argmax_dev_, nullptr, s_), "argmax");
     int index = 0;
-    check(cudaMemcpy(&index, argmax_dev_, 4, cudaMemcpyDeviceToHost), "argmax copy");
-    check(cudaMemcpy(logits_host_.data(), logits_, std::size_t(VOCAB) * 4, cudaMemcpyDeviceToHost), "logits copy");
+    read_back(&index, argmax_dev_, 4);
+    read_back(logits_host_.data(), logits_, std::size_t(VOCAB) * 4);
     if (std::getenv("QWEN35MOE_DUMP") && pos == 4) {
       auto dump = [&](const char* file, const float* buffer, int count) {
         std::vector<float> host(count);

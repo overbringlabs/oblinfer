@@ -43,11 +43,17 @@ bool have_matching_gpu() {
   if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) return false;
   cudaDeviceProp p{};
   if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) return false;
-  if (p.major != 12 || p.minor != 0) {
-    std::printf("skip CUDA comparison: %s is sm_%d%d, the kernel builds for sm_120a\n", p.name, p.major, p.minor);
-    return false;
+  if (p.major == 12 && p.minor == 0) return true;  // the production sm_120a build, hardware e2m1 decode
+  if (p.major > 8 || (p.major == 8 && p.minor >= 9)) {
+    // Non-120a builds compile the shared-table e2m1 decoder, which yields the same exact f16 pairs as the
+    // sm_120a cvt, so the comparison is still meaningful; only the instruction mix differs.
+    std::printf("note: %s is sm_%d%d, exercising the fallback e2m1 table path of the kernel\n", p.name, p.major,
+                p.minor);
+    return true;
   }
-  return true;
+  std::printf("skip CUDA comparison: %s is sm_%d%d, below the FP8/FP4 decode instructions\n", p.name, p.major,
+              p.minor);
+  return false;
 }
 
 struct Scale2 {
@@ -104,7 +110,8 @@ std::vector<moe::FusedExpertLayer> make_layers(const std::uint8_t* w, const std:
 std::vector<double> reference(const Pack& p, const std::vector<float>& x, const std::vector<int>& ids,
                               const std::vector<float>& w) {
   std::vector<double> y(std::size_t(HID), 0.0);
-  for (int k = 0; k < K; ++k) {
+  const int n = int(ids.size());  // remote_case passes the short local-slot list
+  for (int k = 0; k < n; ++k) {
     const int e = ids[std::size_t(k)];
     const std::size_t wb = std::size_t(e) * W_STRIDE;
     const std::size_t sb = std::size_t(e) * S_STRIDE;
@@ -285,10 +292,84 @@ bool cuda_case(const Pack& p, const std::vector<float>& x, const std::vector<int
   return ok && moved;
 }
 
+// Experts hosted on the other card carry stride_bytes == 0 and must contribute exactly zeros: the gate/up
+// kernel writes zero rows, the down kernel skips the slot. Half the slots remote, checked on both halves.
+bool remote_case(const Pack& p, const std::vector<float>& x, const std::vector<int>& ids,
+                 const std::vector<float>& w) {
+  std::vector<int> local_ids, remote_ids;
+  std::vector<float> local_w;
+  for (int k = 0; k < K; ++k) {
+    if (k % 2) {
+      remote_ids.push_back(ids[std::size_t(k)]);
+    } else {
+      local_ids.push_back(ids[std::size_t(k)]);
+      local_w.push_back(w[std::size_t(k)]);
+    }
+  }
+  const std::vector<double> want = reference(p, x, local_ids, local_w);
+
+  std::vector<moe::FusedExpertLayer> layers = make_layers(p.w.data(), p.s.data(), p.scale2);
+  for (int e : remote_ids) layers[std::size_t(e)].stride_bytes = 0;
+
+  bool ok = true;
+
+  std::vector<float> y_cpu(std::size_t(HID), -1.0f), sg_cpu(std::size_t(K) * INTER), su_cpu(std::size_t(K) * INTER),
+      sd_cpu(std::size_t(K) * HID, 1.0f);
+  moe::FusedMoeArgs ca;
+  ca.layers = layers.data();
+  ca.x = x.data();
+  ca.ids = const_cast<int*>(ids.data());
+  ca.weights = w.data();
+  ca.y = y_cpu.data();
+  ca.scratch_gate = sg_cpu.data();
+  ca.scratch_up = su_cpu.data();
+  ca.scratch_down = sd_cpu.data();
+  moe::fused_moe_apply_cpu(ca);
+  ok &= report("cpu fused_moe y, half experts remote", compare(y_cpu.data(), want.data(), want.size()), 1e-3);
+  bool zeroed = true;
+  for (int k = 1; k < K; k += 2) {
+    for (int i = 0; i < INTER; ++i)
+      zeroed &= sg_cpu[std::size_t(k) * INTER + i] == 0.0f && su_cpu[std::size_t(k) * INTER + i] == 0.0f;
+    for (int i = 0; i < HID; ++i) zeroed &= sd_cpu[std::size_t(k) * HID + i] == 0.0f;
+  }
+  std::printf("%s cpu fused remote slots zeroed\n", zeroed ? "PASS" : "FAIL");
+  ok &= zeroed;
+
+  if (have_matching_gpu()) {
+    DeviceArray<std::uint8_t> dw(p.w), ds(p.s);
+    std::vector<moe::FusedExpertLayer> dev_layers = layers;
+    for (auto& L : dev_layers) {
+      L.w_base = dw.get();
+      L.s_base = ds.get();
+    }
+    DeviceArray<moe::FusedExpertLayer> dlayers(dev_layers);
+    DeviceArray<float> dx(x), dy(HID), dsg(std::size_t(K) * INTER), dsu(std::size_t(K) * INTER),
+        dsd(std::size_t(K) * HID);
+    DeviceArray<int> dids(ids);
+    DeviceArray<float> dwt(w);
+    moe::FusedMoeArgs a;
+    a.layers = dlayers.get();
+    a.x = dx.get();
+    a.ids = dids.get();
+    a.weights = dwt.get();
+    a.y = dy.get();
+    a.scratch_gate = dsg.get();
+    a.scratch_up = dsu.get();
+    a.scratch_down = dsd.get();
+    if (moe::fused_moe_apply(a, nullptr) != cudaSuccess) {
+      std::printf("FAIL fused remote launch\n");
+      return false;
+    }
+    INGINE_TEST_CUDA(cudaStreamSynchronize(nullptr));
+    const std::vector<float> got = dy.download();
+    ok &= check("cuda fused_moe y, half experts remote", got, want);
+  }
+  return ok;
+}
+
 }  // namespace
 
-int main() {
-  INGINE_CHECK(W_STRIDE < (1 << 30) && S_STRIDE < (1 << 30));  // the stride fields are ints
+int main() {  INGINE_CHECK(W_STRIDE < (1 << 30) && S_STRIDE < (1 << 30));  // the stride fields are ints
   Rng rng(41);
   const Pack p = make_pack(rng);
   std::vector<float> x(HID);
@@ -303,10 +384,11 @@ int main() {
   const std::vector<double> ref_b = reference(p, x, ids_b, w_b);
 
   bool ok = cpu_case(p, x, ids, w, ref);
+  ok &= remote_case(p, x, ids, w);
   if (have_matching_gpu()) {
     ok &= cuda_case(p, x, ids, w, ids_b, w_b, ref, ref_b);
   } else {
-    std::printf("skip CUDA comparison: needs sm_120\n");
+    std::printf("skip CUDA comparison: needs sm_89 or newer\n");
   }
   if (ok) std::printf("ALL PASS\n");
   return ok ? 0 : 1;

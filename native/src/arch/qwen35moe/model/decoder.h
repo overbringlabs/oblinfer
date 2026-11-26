@@ -9,6 +9,7 @@
 // MoE driver takes host arrays. The speed pass removes that with a device-side routing loop.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -19,6 +20,7 @@
 #include "arch/qwen35moe/kernels/attn/decode_attn.h"
 
 #include "arch/qwen35moe/kernels/moe/fused_experts.h"
+#include "arch/qwen35moe/model/decode_graph.h"
 #include "arch/qwen35moe/model/uploader.h"
 
 namespace ingine::arch::qwen35moe {
@@ -38,6 +40,25 @@ class Decoder {
 
   // Host copy of the last step's logits.
   const std::vector<float>& logits() const { return logits_host_; }
+
+  // ---- the per-token graph of decode_graph.h: one captured step per attention-split bucket ----
+
+  // Allocates what a capture needs (the two step-input ints, the card-0 capture stream) and captures the
+  // card-1 halves of every MoE layer once. Idempotent; a graph bucket is built from it.
+  bool prepare_graph(std::string* error);
+  int max_pos() const { return max_pos_; }
+  // The bucket `pos` falls in, and one position inside a bucket to capture the step at.
+  int splits_at(int pos) const;
+  int capture_pos(int splits) const;
+  // Card 1's half of MoE layer `l`: H2D of the staged routing, the local experts, D2H of the result. Null on a
+  // single card, or before prepare_graph.
+  cudaGraph_t hop_graph(int l) const;
+  cudaStream_t graph_stream() const { return cap0_; }
+  int* token_dev() const { return token_dev_; }
+  int* pos_dev() const { return pos_dev_; }
+  // The graph body: one token from the embedding read out of token_dev_ through the lm_head GEMV, enqueued on
+  // the capture stream with the position-bearing launches registered.
+  void enqueue_graph(int pos, DecodeGraphCapture* cap);
 
  private:
   struct ExpertRow {
@@ -67,6 +88,27 @@ class Decoder {
   void linear_layer(int l);
   void full_layer(int l, int pos);
   void moe(int l);
+
+  // One token's kernels on `s_`: the embedding, the LAYERS layers, the final norm and the lm_head GEMV. The
+  // eager path passes the token id as an argument; a capture reads it from token_dev_ so one graph serves every
+  // token, and registers the position-bearing launches so the replay can rewrite them. Both issue the same
+  // kernels in the same order. The host readback stays in step().
+  void body(int token, int pos, bool captured);
+  // Wraps a launch whose by-value argument carries the position: a plain call when not capturing.
+  template <typename Args, typename Launch>
+  void at(const Args& args, std::size_t pos_offset, Launch&& launch);
+  // Stream-ordered equivalents of the synchronous CUDA calls. A cudaMemset or cudaMemcpy issued during a
+  // capture enqueues nothing and reports no error, so the captured path must not use them.
+  void clear(void* p, std::size_t bytes);
+  void copy(void* dst, const void* src, std::size_t bytes, cudaMemcpyKind kind);
+  // Blocking device-to-host read of the step outputs, ordered against `s_`.
+  void read_back(void* dst, const void* src, std::size_t bytes);
+  // The captured step for `pos`'s bucket, building it on first use. Null when the graph is off, not yet
+  // primed, or unavailable for this bucket.
+  DecodeGraph* graph_for(int pos);
+
+  // One flash-decode split per this many positions; `splits` caps it and decides the graph bucket.
+  static constexpr int kSplitPositions = 2048;
 
   const TextArena* arena_ = nullptr;
   std::unordered_map<std::string, const PlacedTensor*> placed_;
@@ -150,6 +192,19 @@ class Decoder {
   float* weights_dev_ = nullptr;
   int* argmax_dev_ = nullptr;
   std::vector<float> logits_host_;
+
+  // Graph decode. `s_` is the stream the step's kernels go to: the legacy default stream for the eager path,
+  // cap0_ while capturing and replaying. `cap_` is non-null only inside a capture.
+  bool use_graph_ = false;     // QWEN35MOE_GRAPH=1; cleared for good by the first capture failure
+  bool graph_reported_ = false;
+  bool primed_ = false;  // one eager step first: it loads every module a capture is not allowed to load
+  cudaStream_t s_ = nullptr;
+  cudaStream_t cap0_ = nullptr;
+  DecodeGraphCapture* cap_ = nullptr;
+  int* token_dev_ = nullptr;
+  int* pos_dev_ = nullptr;
+  std::vector<cudaGraph_t> hop_graphs_;  // [LAYERS], captured on device 1
+  std::unordered_map<int, DecodeGraph> graphs_;
 };
 
 }  // namespace ingine::arch::qwen35moe

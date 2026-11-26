@@ -21,8 +21,8 @@
 namespace ingine::arch::qwen35moe::kernels {
 
 // One expert's artifacts inside a packed block. Offsets are relative to the start of that expert's stride
-// and must be 4-byte aligned: the kernels read the weights as uint32 (four e2m1 bytes) and the activations
-// as float2.
+// and must be 4-byte aligned: the kernels read the weights as uint32/uint2 (e2m1 byte groups) and the
+// activations as float2/float4.
 struct FusedExpertLayer {
   const std::uint8_t* w_base = nullptr;  // start of this layer's packed expert block (weights)
   const std::uint8_t* s_base = nullptr;  // start of this layer's block scales (same stride layout)

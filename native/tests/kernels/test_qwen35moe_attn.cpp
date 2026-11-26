@@ -349,39 +349,43 @@ bool q8_case() {
   a.v_cache = vc.data();
   attn::decode_attention_cpu(a);
 
-  Case dev = c;
-  std::vector<float> dev_out(H * D, 0.0f);
-  DeviceArray<float> dq(dev.q), dk(dev.k_new), dv(dev.v_new), dout(dev_out);
-  DeviceArray<std::uint8_t> dkc(bytes), dvc(bytes);
-  attn::DecodeAttnArgs g;
-  g.q = dq.get();
-  g.k_new = dk.get();
-  g.v_new = dv.get();
-  g.k_cache = dkc.get();
-  g.v_cache = dvc.get();
-  g.out = dout.get();
-  g.pos = c.pos;
-  g.max_pos = c.max_pos;
-  g.kv_type_k = attn::KvType::Q8_0;
-  g.kv_type_v = attn::KvType::Q8_0;
-  if (attn::decode_attention(g, nullptr) != cudaSuccess) {
-    std::printf("FAIL q8_0 launch\n");
-    return false;
+  bool ok = true;
+  if (have_matching_gpu()) {
+    Case dev = c;
+    std::vector<float> dev_out(H * D, 0.0f);
+    DeviceArray<float> dq(dev.q), dk(dev.k_new), dv(dev.v_new), dout(dev_out);
+    DeviceArray<std::uint8_t> dkc(bytes), dvc(bytes);
+    attn::DecodeAttnArgs g;
+    g.q = dq.get();
+    g.k_new = dk.get();
+    g.v_new = dv.get();
+    g.k_cache = dkc.get();
+    g.v_cache = dvc.get();
+    g.out = dout.get();
+    g.pos = c.pos;
+    g.max_pos = c.max_pos;
+    g.kv_type_k = attn::KvType::Q8_0;
+    g.kv_type_v = attn::KvType::Q8_0;
+    if (attn::decode_attention(g, nullptr) != cudaSuccess) {
+      std::printf("FAIL q8_0 launch\n");
+      return false;
+    }
+    INGINE_TEST_CUDA(cudaStreamSynchronize(nullptr));
+    dev_out = dout.download();
+    ok = close("q8_0 vs reference", dev_out, ref_out);
   }
-  INGINE_TEST_CUDA(cudaStreamSynchronize(nullptr));
-  dev_out = dout.download();
-  bool ok = close("q8_0 vs reference", dev_out, ref_out);
 
   // Quality must be measured with a cache both formats filled themselves: at pos 0 the single stored row is the
   // only content, so the difference is purely the block quantisation. (Comparing at depth against a BF16-filled
   // history would compare a quantised row against misread BF16 bytes.)
   Case q0 = make_case(0, 11);
   std::vector<float> q_out(H * D, 0.0f), b_out(H * D, 0.0f);
-  std::uint8_t qk[attn::kv_cache_bytes(attn::KvType::Q8_0, 1)], qv[attn::kv_cache_bytes(attn::KvType::Q8_0, 1)];
+  std::vector<std::uint8_t> qk(attn::kv_cache_bytes(attn::KvType::Q8_0, q0.max_pos));
+  std::vector<std::uint8_t> qv(qk.size());
   Case qc = q0;
   attn::DecodeAttnArgs qa = host_args(qc, q_out);
-  qa.k_cache = qk;
-  qa.v_cache = qv;
+  qa.k_cache = qk.data();
+  qa.v_cache = qv.data();
   qa.kv_type_k = attn::KvType::Q8_0;
   qa.kv_type_v = attn::KvType::Q8_0;
   attn::decode_attention_cpu(qa);
