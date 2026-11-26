@@ -109,3 +109,41 @@ speculation helps least there; at depth it is the whole game.
   not correctness. K0 should measure α1 at K4V4 as well as BF16 if the PyTorch harness can emulate it.
 - **Prefill** stays at 78 tok/s until `step_batch` is reused for it. K2 unlocks that; it is not in this plan's
   gates but it is the next cheapest win after spec decode.
+
+## K0 result: the acceptance rate (measured 2026-11-26, supra, HEAD `a8d18e3`)
+
+6 prompts (4 prose, 2 code), 112-160 tokens of context, 32 greedy tokens each, Q4_0 drafter cache, real trunk and
+real drafter, depth 4096.
+
+| region | α1 | α2 | α3 | E(n=2) | E(n=3) | E(n=4) |
+|---|---|---|---|---|---|---|
+| all positions, pooled | 0.596 (589/989) | 0.613 (359/586) | 0.646 (230/356) | 1.60 | 1.96 | **2.20** |
+| generated positions, pooled | **0.758** (150/198) | **0.728** (110/151) | **0.736** (81/110) | 1.76 | 2.31 | **2.72** |
+| code only (generated) | 0.85-0.88 | 0.83-0.96 | 0.75-0.92 | 1.85-1.88 | 2.6-2.7 | **3.1-3.4** |
+| prose only (generated) | 0.49-0.94 | 0.36-0.94 | 0.18-0.97 | 1.48-1.94 | 1.8-2.8 | 2.0-3.7 |
+
+The abort condition (α1 < 0.5) does not fire. The plan's 0.8-α arithmetic was optimistic by about 8%, and the
+number that matters for a coding workhorse — Ornith — is the code row, at 3.1-3.4 tokens per step.
+
+The Q4_0 cache costs nothing measurable: BF16 gives 0.598/0.616/0.662 all-positions and 0.758/0.755/0.735
+generated, i.e. within 0.02 of the chain above. The drafter's own attention is 0.015 ms at this depth, so K4V4
+stays the default.
+
+Cost side: one draft is 0.829 ms (mean over 1,931 chain calls), of which the trunk's `lm_head` is 0.608 — 72%.
+Three drafts are 2.54-2.69 ms, about 38% of a trunk token before the verify step. A batched M-row head is the
+obvious next cut, and it is K2/K3's business.
+
+Sample size, honestly: 989 draft-1 samples pooled, but the prompt is the sampling unit and the spread across
+prompts is 0.43-0.88. Six prompts is six samples, and the two easy ones (a verbatim paragraph restart, a
+boilerplate `main()`) sit at the top of the range. Depth 144 only; acceptance at 258k is unmeasured.
+
+## Ornith-1.5-35B-A3B is ready to load
+
+Its published index has **94,393 tensor names, 23.407 GB**, including a 333-tensor vision tower, and 785 MTP
+tensors in the per-expert dialect. The classifier takes every one of them (0 rejected), and the dialect detector
+now finds `ornith` where it previously said `nvidia`: both exports number the trunk's routed experts, and Ornith's
+real export carries 130 `input_scale` tensors on the dense projections, contrary to what `docs/checkpoints.md`
+claimed. The MTP block is the discriminator — NVIDIA packs it, Ornith numbers it.
+
+Nothing in the pack needs a new code path for Ornith beyond that detection fix, so every speed win in this plan
+lands on Ornith-1.5 unchanged. The checkpoint itself is not downloaded on supra; the check ran on metadata only.
