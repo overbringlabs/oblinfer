@@ -1078,6 +1078,19 @@ bool Decoder::step(int token, int pos, int* next_token, std::string* error) {
       body(token, pos, false);
       primed_ = true;  // a capture may now assume every module is loaded and every cache warm
     }
+    // Measurement hook for the drafter's acceptance rate: append one record per step, {pos, token} then the
+    // pre-final-norm residual, so an offline drafter can be fed exactly what the trunk saw. Off unless asked for,
+    // and it forces a host copy per step, so it is a measurement path and not a serving path.
+    if (const char* state_path = std::getenv("QWEN35MOE_DUMP_STATE")) {
+      std::vector<float> host(HIDDEN);
+      check(cudaMemcpy(host.data(), x_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump state");
+      if (FILE* f = std::fopen(state_path, "ab")) {
+        const int header[2] = {pos, token};
+        std::fwrite(header, sizeof(int), 2, f);
+        std::fwrite(host.data(), sizeof(float), HIDDEN, f);
+        std::fclose(f);
+      }
+    }
     // Outside the graph: the argmax reads the logits and the host reads both back.
     check(dense::argmax(logits_, VOCAB, argmax_dev_, nullptr, s_), "argmax");
     int index = 0;
