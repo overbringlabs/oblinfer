@@ -47,7 +47,9 @@ int main() {
   const int gen = env_int("QWEN35MOE_GEN", 32);
   // QWEN35MOE_MAXPOS allocates a full-context cache while only a few tokens run (allocation proof).
   const char* maxpos_env = std::getenv("QWEN35MOE_MAXPOS");
-  const int max_pos = maxpos_env ? std::atoi(maxpos_env) : depth + gen + 8;
+  const char* fake_max = std::getenv("QWEN35MOE_FAKE_DEPTH");
+  const int max_pos = fake_max ? std::atoi(fake_max) + gen + 8
+                               : (maxpos_env ? std::atoi(maxpos_env) : depth + gen + 8);
 
   // Expert split: -1 keeps the uploader's free-memory choice; set QWEN35MOE_SPLIT to A/B a bandwidth split.
   const char* split_env = std::getenv("QWEN35MOE_SPLIT");
@@ -73,6 +75,27 @@ int main() {
   cudaEvent_t t0, t1;
   cudaEventCreate(&t0);
   cudaEventCreate(&t1);
+  // QWEN35MOE_FAKE_DEPTH=D: skip prefill and decode at position D against a zeroed cache. Decode cost depends
+  // on how many KV rows are read, not on their values, so this measures depth without an hour of prefill.
+  const char* fake_env = std::getenv("QWEN35MOE_FAKE_DEPTH");
+  if (fake_env) {
+    const int start = std::atoi(fake_env);
+    cudaEventRecord(t0);
+    for (int j = 0; j < gen; ++j) {
+      if (!decoder.step(base[std::size_t(j) % base.size()], start + j, &next, &error)) {
+        std::printf("FAIL decode: %s\n", error.c_str());
+        return 1;
+      }
+    }
+    cudaEventRecord(t1);
+    cudaEventSynchronize(t1);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, t0, t1);
+    std::printf("depth %d (synthetic) gen %d: decode %.2f tok/s (%.2f ms/token)\n", start, gen,
+                gen / (ms / 1000.0), ms / gen);
+    qwen::free_text_arena(&arena);
+    return 0;
+  }
 
   cudaEventRecord(t0);
   for (int i = 0; i < depth; ++i) {
