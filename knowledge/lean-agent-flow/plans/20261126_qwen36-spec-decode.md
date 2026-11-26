@@ -147,3 +147,40 @@ claimed. The MTP block is the discriminator — NVIDIA packs it, Ornith numbers 
 
 Nothing in the pack needs a new code path for Ornith beyond that detection fix, so every speed win in this plan
 lands on Ornith-1.5 unchanged. The checkpoint itself is not downloaded on supra; the check ran on metadata only.
+
+## Phase A result (2026-11-26): two of three pieces landed, K3 does not pass yet
+
+**Attention is instruction-bound, not bandwidth-bound.** A head-range sweep on the committed kernel showed
+per-head cost flat out to four heads (0.227 ns/pos-head at 16 heads, 0.260 at 4), so the eight query heads
+re-reading the same rows were served from L2 for free. SASS: 170 warp instructions per two positions, 56 of them
+`PRMT`/`I2F` on the half-rate conversion pipe against 58 `FFMA`/`FMUL` of real arithmetic. Pairing two query heads
+per block amortises the decode across two dots. One layer at 258048, q8_0: 936.8 → 693.7 µs (1.35×); attention
+term 7.87 → 6.39 ms; **258k decode 68.2 → 76.3 tok/s (13.11 ms)**, 98304 92.6 → 98.3.
+
+What is left in that term is not the loop: card 0 does two thirds of the positions at 694 µs/layer and card 1 one
+third at 1317 µs (1.90× for 36/70 SMs, SM-proportional), so a perfectly overlapped term would be 4.63 ms against
+the measured 6.39. The 1.7 ms gap is pinned staging, 30 launches and per-layer events, and it is now 27% of the
+attention term. It needs its own chunk.
+
+**`step_batch` works and is 1.85× at 1k**, but K3's gate (a 258k verify step ≤ 1.6× one token) fails: n=4 costs
+3.1×. The batch attention pays the cache about once per query at depth, 9.7 ms of marginal cost per query, even
+though the kernel reads the rows once. The cause is register pressure: at the shipped 16-dim shape, n × (16
+accumulators + 16 q) costs 181 registers, one block per SM, against the shipped kernel's four. At 8 dims per lane
+it is 104 registers, two blocks, and the pass got ~3× cheaper — which is the shape that shipped. The fix, measured
+not guessed: run the verify block as **groups of two queries at the shipped 16-dim, two-stream shape**, so n=4
+costs two cache passes rather than four passes' worth of time. `redux.sync.add.f32` for the score reduction is the
+second candidate (five shuffles saved per row-query).
+
+**The drafter is no longer linear in draft count.** One batched head pass per chain instead of one per draft:
+3 drafts 1.41 ms against 2.66 serial (−47% at 1k, −24% at 262k where the drafter's own attention dominates at 0.92
+of 1.33 ms). The batched head also beats the shipped single-row head at one row — 0.370 against 0.608 ms for the
+same 286 MB, 773 against 470 GB/s — so **routing the trunk's own head through it is 0.24 ms off every token**.
+
+**α does not decay.** Generated-text pooled: 0.758, 0.728, 0.736, 0.779, 0.797, 0.826, 0.889, 0.900 for α1..α8.
+The drafts that survive rejection are the easy stretches. So the count is set by content: code n=8 (E = 5.65 on one
+prompt, 3.85 on the other), prose saturates near E = 2.0 by n=4 (three of four prompts have α4 = 0.0–0.4), and a
+single setting lands flat at n=5-6. A draft pays for itself while α_i > 0.15-0.16, which argues for an adaptive
+count driven by the drafter's own confidence rather than a constant.
+
+Verified together on a clean build of HEAD plus all three units: eleven gates pass, ids unchanged, step_batch and
+the drafter chain both pass, `258048` at **76.30 / 76.27 / 76.36 tok/s** over three runs, 1k 144.8, 32k 126.1.
