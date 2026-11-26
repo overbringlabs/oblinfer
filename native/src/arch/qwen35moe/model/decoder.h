@@ -1,9 +1,9 @@
 // Decoder of the Qwen3.6-35B-A3B pack: one token per step, greedy sampling.
 //
 // Weights come from a loaded TextArena (uploader.h): the `placed` table gives every tensor's device span and
-// offset, so the driver only resolves names once at init. Activations are FP32; KV caches are BF16 in a
-// position-major layout per full-attention layer; the GDN state and conv history live on the device for the
-// linear layers.
+// offset, so the driver only resolves names once at init. Activations are FP32; KV caches are BF16, q8_0 or
+// q4_0 (selectable per side) in a position-major layout per full-attention layer; the GDN state and conv
+// history live on the device for the linear layers.
 //
 // This is the correctness path: the router ids and weights are copied to the host each layer because the
 // MoE driver takes host arrays. The speed pass removes that with a device-side routing loop.
@@ -48,6 +48,12 @@ class Decoder {
   // card-1 halves of every MoE layer once. Idempotent; a graph bucket is built from it.
   bool prepare_graph(std::string* error);
   int max_pos() const { return max_pos_; }
+  // KV cache formats per cache: trunk (-ctk/-ctv) and drafter (-ctkd/-ctvd). The drafter module does not exist
+  // yet, so its pair carries only the setting and its default (K4V4); no drafter cache is allocated.
+  kernels::KvType kv_type_k() const { return kv_type_k_; }
+  kernels::KvType kv_type_v() const { return kv_type_v_; }
+  kernels::KvType kv_type_k_drafter() const { return kv_type_k_drafter_; }
+  kernels::KvType kv_type_v_drafter() const { return kv_type_v_drafter_; }
   // The bucket `pos` falls in, and one position inside a bucket to capture the step at.
   int splits_at(int pos) const;
   int capture_pos(int splits) const;
@@ -160,6 +166,8 @@ class Decoder {
   bool attn_splits_depth_ = false;       // QWEN35MOE_ATTN_SPLITS_DEPTH=1: depth-scaled column width
   kernels::KvType kv_type_k_ = kernels::KvType::Bf16;  // -ctk
   kernels::KvType kv_type_v_ = kernels::KvType::Bf16;  // -ctv
+  kernels::KvType kv_type_k_drafter_ = kernels::KvType::Q4_0;  // -ctkd, for the drafter's own cache
+  kernels::KvType kv_type_v_drafter_ = kernels::KvType::Q4_0;  // -ctvd
   float* gdn_state_ = nullptr;   // [NUM_LINEAR_LAYERS, LIN_VALUE_HEADS, LIN_KEY_DIM, LIN_VALUE_DIM]
   float* conv_state_ = nullptr;  // [NUM_LINEAR_LAYERS, CONV_K - 1, LIN_CONV_DIM]
 

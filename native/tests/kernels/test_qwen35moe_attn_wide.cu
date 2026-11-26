@@ -4,7 +4,7 @@
 // the *same cache bytes*, history included, so the q8_0 decode and its per-block scales are exercised with
 // real data rather than a zeroed cache.
 //
-// Covered: both KvType selections per side (the kernel is instantiated once per pair), head ranges, splits
+// Covered: every KvType pair, one instantiation each (BF16, q8_0 and q4_0 on either side), head ranges, splits
 // larger than the position count (the empty-split early return), and split lengths that are not a multiple of
 // the sixteen-position block step — the cases where one of a warp's two streams, or a whole warp, gets no
 // position at all.
@@ -81,6 +81,24 @@ std::vector<std::uint8_t> fill_cache(const std::vector<float>& src, int max_pos,
     for (std::size_t i = 0; i < std::size_t(pos) * KV * D; ++i) as_bf[i] = __float2bfloat16(src[i]);
     return bytes;
   }
+  if (type == attn::KvType::Q4_0) {
+    // Byte j of a block holds values 2j and 2j + 1, low nibble first, behind one scale per 32 values.
+    auto* vals4 = attn::kv_q4_values(bytes.data());
+    auto* scales4 = const_cast<__half*>(attn::kv_q4_scales(bytes.data(), values));
+    const std::size_t blocks = std::size_t(pos) * KV * D / attn::KV_BLOCK;
+    for (std::size_t blk = 0; blk < blocks; ++blk) {
+      const float* row = src.data() + blk * attn::KV_BLOCK;
+      float amax = 0.0f;
+      for (int i = 0; i < attn::KV_BLOCK; ++i) amax = std::max(amax, std::fabs(row[i]));
+      const float d = amax > 0.0f ? amax / 8.0f : 1.0f;
+      scales4[blk] = __float2half(d);
+      for (int i = 0; i < attn::KV_BLOCK / 2; ++i) {
+        vals4[blk * (attn::KV_BLOCK / 2) + i] = std::uint8_t(attn::kv_q4_nibble(row[2 * i], d) |
+                                                             attn::kv_q4_nibble(row[2 * i + 1], d) << 4);
+      }
+    }
+    return bytes;
+  }
   auto* vals = attn::kv_q8_values(bytes.data());
   auto* scales = const_cast<__half*>(attn::kv_q8_scales(bytes.data(), values));
   const std::size_t blocks = std::size_t(pos) * KV * D / attn::KV_BLOCK;
@@ -141,9 +159,15 @@ attn::DecodeAttnArgs base_args(Case& c, float* out) {
   return a;
 }
 
+const char* kv_label(attn::KvType t) {
+  return t == attn::KvType::Q8_0 ? "q8_0" : t == attn::KvType::Q4_0 ? "q4_0" : "bf16";
+}
+
 const char* cache_name(attn::KvType tk, attn::KvType tv) {
-  if (tk == tv) return tk == attn::KvType::Q8_0 ? "q8_0" : "bf16";
-  return tk == attn::KvType::Q8_0 ? "q8_0 K, bf16 V" : "bf16 K, q8_0 V";
+  static char buf[64];  // the test is single-threaded
+  if (tk == tv) return kv_label(tk);
+  std::snprintf(buf, sizeof buf, "%s K, %s V", kv_label(tk), kv_label(tv));
+  return buf;
 }
 
 // One split launch on the device against the FP64 reference over the same bytes. The reference stores the new
@@ -384,8 +408,8 @@ int bench_mode(int depth, int splits, attn::KvType type) {
   // The eight query heads of a KV group each walk the same rows, so the traffic the kernel asks for is the
   // cache read once per query head.
   const double demanded = 2.0 * double(attn::kv_cache_bytes(type, depth)) * (H / KV);
-  std::printf("bench %s depth %d splits %d: %.1f us, %.1f GB/s demanded\n",
-              type == attn::KvType::Q8_0 ? "q8_0" : "bf16", depth, splits, us, demanded / (us * 1e-6) / 1e9);
+  std::printf("bench %s depth %d splits %d: %.1f us, %.1f GB/s demanded\n", kv_label(type), depth, splits, us,
+              demanded / (us * 1e-6) / 1e9);
   cudaEventDestroy(e0);
   cudaEventDestroy(e1);
   return 0;
@@ -410,7 +434,9 @@ int main(int argc, char** argv) {
   if (bench) {
     const int depth = rest.size() > 0 ? std::atoi(rest[0].c_str()) : 262144;
     const int splits = rest.size() > 1 ? std::atoi(rest[1].c_str()) : attn::kMaxSplits;
-    const attn::KvType type = rest.size() > 2 && rest[2] == "bf16" ? attn::KvType::Bf16 : attn::KvType::Q8_0;
+    const attn::KvType type = rest.size() > 2 && rest[2] == "bf16"   ? attn::KvType::Bf16
+                              : rest.size() > 2 && rest[2] == "q4_0" ? attn::KvType::Q4_0
+                                                                     : attn::KvType::Q8_0;
     return bench_mode(depth, splits, type);
   }
 
@@ -419,23 +445,20 @@ int main(int argc, char** argv) {
   // streams get no position (33 -> two steps minus one, 32 -> exact, 31, 17, 1).
   const int positions[] = {1, 16, 17, 31, 32, 33, 600, 1023, 2049};
   const int splits[] = {2, 3, 16, 32, attn::kMaxSplits};
-  const attn::KvType pairs[][2] = {
-      {attn::KvType::Q8_0, attn::KvType::Q8_0},
-      {attn::KvType::Bf16, attn::KvType::Bf16},
-      {attn::KvType::Q8_0, attn::KvType::Bf16},
-      {attn::KvType::Bf16, attn::KvType::Q8_0},
-  };
+  const attn::KvType types[] = {attn::KvType::Bf16, attn::KvType::Q8_0, attn::KvType::Q4_0};
   char tag[96];
-  for (const auto& pr : pairs) {
-    for (int pos : positions) {
-      for (int s : splits) {
-        if (pos < s && s != attn::kMaxSplits) continue;  // keep the empty-range mix manageable
-        const int max_pos = pos + 8 > 64 ? pos + 8 : 64;
-        std::snprintf(tag, sizeof tag, "pos %d", pos);
-        ok &= run_split_case(tag, pos, max_pos, s, pr[0], pr[1], unsigned(pos * 7 + s));
+  for (attn::KvType tk : types) {
+    for (attn::KvType tv : types) {
+      for (int pos : positions) {
+        for (int s : splits) {
+          if (pos < s && s != attn::kMaxSplits) continue;  // keep the empty-range mix manageable
+          const int max_pos = pos + 8 > 64 ? pos + 8 : 64;
+          std::snprintf(tag, sizeof tag, "pos %d", pos);
+          ok &= run_split_case(tag, pos, max_pos, s, tk, tv, unsigned(pos * 7 + s));
+        }
       }
+      ok &= run_split_case("long tail of one split", 4095, 4104, 2, tk, tv, 77);
     }
-    ok &= run_split_case("long tail of one split", 4095, 4104, 2, pr[0], pr[1], 77);
   }
   ok &= empty_range_case();
   ok &= head_range_case(1023, attn::kMaxSplits, attn::KvType::Q8_0, attn::KvType::Q8_0);

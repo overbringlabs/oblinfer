@@ -4,8 +4,8 @@
 // dimension.
 //
 // The kernel boundary is after q/k norm and rotary: callers pass q [HEADS, HEAD_DIM] and the new k/v
-// [KV_HEADS, HEAD_DIM] in FP32, and the cache stores them as BF16 in a position-major layout
-// [max_pos, KV_HEADS, HEAD_DIM]. FP8 caches follow once this path is verified.
+// [KV_HEADS, HEAD_DIM] in FP32, and the cache stores them in a position-major layout
+// [max_pos, KV_HEADS, HEAD_DIM] in one of the KvType formats below.
 //
 // One block per query head in the requested head range, one thread per output dimension. Within a chunk,
 // one warp computes one position's score by a 32-lane reduction over the head dimension; the block then
@@ -16,6 +16,7 @@
 // only those rows of `out`, so ranges on separate devices compose into one output tensor.
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 
 #include <cuda_bf16.h>
@@ -31,24 +32,53 @@ inline constexpr int ATTN_CHUNK = 512;
 inline constexpr int kMaxSplits = 64;
 
 // KV cache element formats, selectable per side like llama-server's -ctk/-ctv. q8_0 is llama.cpp's block
-// format: 32 int8 values behind one fp16 scale, 34 bytes per block, 8 blocks per 256-dim head.
-enum class KvType : int { Bf16 = 0, Q8_0 = 1 };
+// format: 32 int8 values behind one fp16 scale, 8 blocks per 256-dim head. q4_0 is the same 32-value block at
+// four bits: sixteen bytes of unsigned nibbles with llama.cpp's -8 offset, so a stored value reconstructs as
+// `d * (q - 8)`, behind the same one fp16 scale per block.
+enum class KvType : int { Bf16 = 0, Q8_0 = 1, Q4_0 = 2 };
 
 inline constexpr int KV_BLOCK = 32;
 
-// Q8_0 keeps two parallel arrays in one allocation: `values` int8 first, then one __half scale per 32-value
-// block. The interleaved 34-byte block put the values at byte offset 2, which forbids 32-bit reads; splitting
-// the arrays keeps both 16-byte aligned (the value count is a multiple of 16 for every supported context).
-// The split kernel loads sixteen bytes per lane, so callers must hand it a 16-byte aligned base for either
-// format; a sub-allocation has to keep that alignment.
+// Every block format keeps two parallel arrays in one allocation: the values first, then one __half scale per
+// 32-value block. The interleaved block llama.cpp ships put the scale between two runs of values, which
+// forbids wide aligned reads; splitting the arrays keeps both 16-byte aligned (the value count is a multiple
+// of 16 for every supported context). q4_0's value array is half as long as q8_0's, one byte per two values.
+// The split kernel reads aligned 8- or 16-byte windows per lane, so callers must hand it a 16-byte aligned
+// base for every format; a sub-allocation (a band) has to keep that alignment, which block-aligned rows do.
 inline std::uint64_t kv_cache_bytes(KvType type, int max_pos) {
   const std::uint64_t values = std::uint64_t(max_pos) * ATTN_KV_HEADS * ATTN_HEAD_DIM;
-  return type == KvType::Bf16 ? values * 2 : values + (values / KV_BLOCK) * sizeof(__half);
+  const std::uint64_t scales = (values / KV_BLOCK) * sizeof(__half);
+  if (type == KvType::Bf16) return values * 2;
+  if (type == KvType::Q4_0) return values / 2 + scales;
+  return values + scales;
+}
+
+// Bytes the value array occupies for `values` values; the block scales start right after it.
+__host__ __device__ inline std::uint64_t kv_value_bytes(KvType type, std::uint64_t values) {
+  return type == KvType::Q4_0 ? values / 2 : values;
 }
 
 __host__ __device__ inline std::int8_t* kv_q8_values(void* base) { return static_cast<std::int8_t*>(base); }
 __host__ __device__ inline const __half* kv_q8_scales(const void* base, std::uint64_t values) {
   return reinterpret_cast<const __half*>(static_cast<const std::int8_t*>(base) + values);
+}
+// q4_0: byte j of a block holds values 2j (low nibble) and 2j + 1 (high nibble), so a lane's sixteen dims are
+// eight consecutive bytes and the pair of lanes that share one 32-value block read one aligned 16-byte
+// window between them.
+__host__ __device__ inline std::uint8_t* kv_q4_values(void* base) { return static_cast<std::uint8_t*>(base); }
+__host__ __device__ inline std::uint8_t* kv_q4_values(const void* base) {
+  return const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(base));
+}
+__host__ __device__ inline const __half* kv_q4_scales(const void* base, std::uint64_t values) {
+  return reinterpret_cast<const __half*>(static_cast<const std::uint8_t*>(base) + values / 2);
+}
+
+// One value's unsigned nibble, llama.cpp's convention: q = clamp(rn(v / d) + 8, 0, 15) and the value reads
+// back as d * (q - 8). Round-to-nearest-even is deliberate: it is what the store kernel's __float2int_rn
+// does, so a host-encoded row is byte-identical to the row the device writes.
+__host__ __device__ inline int kv_q4_nibble(float v, float d) {
+  const int q = (d > 0.0f ? int(::rintf(v / d)) : 0) + 8;
+  return q < 0 ? 0 : (q > 15 ? 15 : q);
 }
 
 // One position split's online-softmax state, written by a split block and merged by the combine kernel. A split
@@ -92,8 +122,9 @@ struct DecodeAttnArgs {
   int col_begin = 0;
 };
 
-// Rows the cache pointers span: the band width when a band is set, otherwise the whole capacity. The q8_0
-// scale array starts after exactly this many values, so every cache read needs it.
+// Rows the cache pointers span: the band width when a band is set, otherwise the whole capacity. The scale
+// array of a block format starts after the value array of exactly these rows, and q4_0 packs two values per
+// byte, so every cache read derives its scale base from this count and kv_value_bytes of its type.
 __host__ __device__ inline int kv_cache_rows(const DecodeAttnArgs& args) {
   return args.pos_end >= 0 ? args.pos_end - args.pos_begin : args.max_pos;
 }

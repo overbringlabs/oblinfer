@@ -22,9 +22,10 @@ constexpr int kPosLanes = kDim / kLaneDims;               // 16 lanes per positi
 constexpr int kPosPerWarp = 32 / kPosLanes;               // 2 position streams per warp
 constexpr int kStepPos = kWarps * kPosPerWarp;            // 16 positions per block step
 constexpr int kQ8Words = kLaneDims / 4;                   // int32 words of q8 values per lane
+constexpr int kQ4Words = kLaneDims / 8;                   // uint32 words of q4 nibbles per lane
 constexpr int kBfWords = kLaneDims / 2;                   // uint32 words of bf16 values per lane
 static_assert(kLaneDims * kPosLanes == kDim, "sixteen dims over sixteen lanes must cover the head");
-static_assert(kBfWords <= 8 && kQ8Words <= 8, "the load staging holds the wider bf16 case");
+static_assert(kBfWords <= 8 && kQ8Words <= 8 && kQ4Words <= 8, "the load staging holds the wider bf16 case");
 
 // head_count > 0, so ATTN_HEADS - head_begin bounds the largest legal range without overflowing.
 bool head_range_valid(const DecodeAttnArgs& args) {
@@ -46,6 +47,11 @@ __device__ __forceinline__ float warp_sum(float v) {
 // Element decode of one 32-bit load. The shift is always a compile-time constant after unrolling, so the byte
 // select folds into the conversion.
 __device__ __forceinline__ float q8_byte(std::uint32_t w, int shift) { return float(std::int8_t(w >> shift)); }
+// q4_0: one nibble, shifted by the -8 offset the format stores. `shift` is a compile-time constant per
+// unrolled step, so the extract is a single bitfield instruction.
+__device__ __forceinline__ float q4_nibble(std::uint32_t w, int shift) {
+  return float(int((w >> shift) & 0xFu)) - 8.0f;
+}
 __device__ __forceinline__ float bf16_lo(std::uint32_t w) {
   return __bfloat162float(__ushort_as_bfloat16(std::uint16_t(w & 0xFFFFu)));
 }
@@ -53,8 +59,8 @@ __device__ __forceinline__ float bf16_hi(std::uint32_t w) {
   return __bfloat162float(__ushort_as_bfloat16(std::uint16_t(w >> 16)));
 }
 
-// Partial dot of one lane's value words against its q registers. `used` is the word count for the format:
-// four int32 words of q8_0, eight of bf16, both read out of the same eight-word staging.
+// Partial dot of one lane's value words against its q registers. `USED` is the word count for the format: four
+// int32 words of q8_0, two of q4_0's nibbles, eight of bf16, all read out of the same eight-word staging.
 template <int USED>
 __device__ __forceinline__ float dot_q8(const std::uint32_t (&w)[8], const float (&q)[kLaneDims]) {
   float dot = 0.0f;
@@ -72,6 +78,17 @@ __device__ __forceinline__ float dot_bf16(const std::uint32_t (&w)[8], const flo
   for (int u = 0; u < USED; ++u) {
     dot = fmaf(q[u * 2], bf16_lo(w[u]), dot);
     dot = fmaf(q[u * 2 + 1], bf16_hi(w[u]), dot);
+  }
+  return dot;
+}
+// q4_0's sixteen dims are two words of eight nibbles, low nibble first, so the unrolled shift is 4 * b.
+template <int USED>
+__device__ __forceinline__ float dot_q4(const std::uint32_t (&w)[8], const float (&q)[kLaneDims]) {
+  float dot = 0.0f;
+#pragma unroll
+  for (int u = 0; u < USED; ++u) {
+#pragma unroll
+    for (int b = 0; b < 8; ++b) dot = fmaf(q[u * 8 + b], q4_nibble(w[u], 4 * b), dot);
   }
   return dot;
 }
@@ -95,10 +112,26 @@ __device__ __forceinline__ void accum_bf16(float (&acc)[kLaneDims], const std::u
     acc[u * 2 + 1] = fmaf(p, bf16_hi(w[u]), acc[u * 2 + 1] * corr);
   }
 }
+__device__ __forceinline__ void accum_q4(float (&acc)[kLaneDims], const std::uint32_t (&w)[8], float p,
+                                         float corr) {
+#pragma unroll
+  for (int u = 0; u < kQ4Words; ++u) {
+#pragma unroll
+    for (int b = 0; b < 8; ++b) {
+      const int j = u * 8 + b;
+      acc[j] = fmaf(p, q4_nibble(w[u], 4 * b), acc[j] * corr);
+    }
+  }
+}
 
 __device__ __forceinline__ float kv_at(const void* base, KvType type, std::size_t index, std::uint64_t values) {
   if (type == KvType::Bf16) {
     return __bfloat162float(static_cast<const __nv_bfloat16*>(base)[index]);
+  }
+  if (type == KvType::Q4_0) {
+    const std::uint8_t packed = kv_q4_values(base)[index / 2];
+    const float q = float(int((packed >> (4 * (index & 1))) & 0xFu)) - 8.0f;
+    return q * __half2float(kv_q4_scales(base, values)[index / KV_BLOCK]);
   }
   return float(kv_q8_values(const_cast<void*>(base))[index]) *
          __half2float(kv_q8_scales(base, values)[index / KV_BLOCK]);
@@ -143,6 +176,45 @@ __global__ __launch_bounds__(256) void kv_store_q8_kernel(DecodeAttnArgs args) {
   }
   kv_q8_values(args.k_cache)[at + lane] = std::int8_t(__float2int_rn(k / kd));
   kv_q8_values(args.v_cache)[at + lane] = std::int8_t(__float2int_rn(v / vd));
+}
+
+// q4_0 store: one warp per 32-value block, one byte per lane of the low half-warp (values 2j and 2j + 1), so
+// the block's sixteen bytes leave in one coalesced store. The high half-warp contributes 0 to the max, which
+// cannot change a maximum of absolute values.
+__global__ __launch_bounds__(256) void kv_store_q4_kernel(DecodeAttnArgs args) {
+  const int h = blockIdx.x;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  if (h >= ATTN_KV_HEADS || warp >= kDim / KV_BLOCK) return;
+  const int base_d = warp * KV_BLOCK;
+  const bool packs = lane < KV_BLOCK / 2;
+  float k0 = 0.0f, k1 = 0.0f, v0 = 0.0f, v1 = 0.0f;
+  if (packs) {
+    k0 = args.k_new[h * kDim + base_d + 2 * lane];
+    k1 = args.k_new[h * kDim + base_d + 2 * lane + 1];
+    v0 = args.v_new[h * kDim + base_d + 2 * lane];
+    v1 = args.v_new[h * kDim + base_d + 2 * lane + 1];
+  }
+  float kmax = fmaxf(fabsf(k0), fabsf(k1)), vmax = fmaxf(fabsf(v0), fabsf(v1));
+  for (int off = 16; off > 0; off >>= 1) {
+    kmax = fmaxf(kmax, __shfl_down_sync(0xffffffffu, kmax, off));
+    vmax = fmaxf(vmax, __shfl_down_sync(0xffffffffu, vmax, off));
+  }
+  kmax = __shfl_sync(0xffffffffu, kmax, 0);
+  vmax = __shfl_sync(0xffffffffu, vmax, 0);
+  const float kd = kmax > 0.0f ? kmax / 8.0f : 1.0f;
+  const float vd = vmax > 0.0f ? vmax / 8.0f : 1.0f;
+
+  const std::uint64_t values = std::uint64_t(kv_cache_rows(args)) * ATTN_KV_HEADS * kDim;
+  const std::size_t at = (std::size_t(args.pos - args.pos_begin) * ATTN_KV_HEADS + h) * kDim + base_d;
+  if (lane == 0) {
+    const_cast<__half*>(kv_q4_scales(args.k_cache, values))[at / KV_BLOCK] = __float2half(kd);
+    const_cast<__half*>(kv_q4_scales(args.v_cache, values))[at / KV_BLOCK] = __float2half(vd);
+  }
+  if (packs) {
+    kv_q4_values(args.k_cache)[at / 2 + lane] = std::uint8_t(kv_q4_nibble(k0, kd) | kv_q4_nibble(k1, kd) << 4);
+    kv_q4_values(args.v_cache)[at / 2 + lane] = std::uint8_t(kv_q4_nibble(v0, vd) | kv_q4_nibble(v1, vd) << 4);
+  }
 }
 
 __global__ __launch_bounds__(kDim) void decode_kernel(DecodeAttnArgs args) {
@@ -233,8 +305,8 @@ __global__ __launch_bounds__(kDim) void decode_kernel(DecodeAttnArgs args) {
   args.out[h * kDim + d] = acc / run_sum;
 }
 
-// Mixed K/V types: the first half of the block handles K's q8_0 blocks, the second half V's. Only used when the
-// two sides differ; the uniform cases take the simpler kernels above.
+// Mixed K/V types: the first half of the block stores K, the second half V, each in its own format. Only used
+// when the two sides differ; the uniform cases take the simpler kernels above.
 __global__ __launch_bounds__(512) void kv_store_mixed_kernel(DecodeAttnArgs args) {
   const int half = threadIdx.x / 256;
   const int t = threadIdx.x % 256;
@@ -256,16 +328,31 @@ __global__ __launch_bounds__(512) void kv_store_mixed_kernel(DecodeAttnArgs args
   }
   if (warp >= kDim / KV_BLOCK) return;
   const int base_d = warp * KV_BLOCK;
-  float v = src[h * kDim + base_d + lane];
-  float vmax = fabsf(v);
-  for (int off = 16; off > 0; off >>= 1) vmax = fmaxf(vmax, __shfl_down_sync(0xffffffffu, vmax, off));
-  vmax = __shfl_sync(0xffffffffu, vmax, 0);
-  const float d = vmax > 0.0f ? vmax / 127.0f : 1.0f;
   const std::size_t at = (std::size_t(row) * ATTN_KV_HEADS + h) * kDim + base_d;
   const std::size_t block = at / KV_BLOCK;
   const std::uint64_t values = std::uint64_t(kv_cache_rows(args)) * ATTN_KV_HEADS * kDim;
-  if (lane == 0) const_cast<__half*>(kv_q8_scales(dst, values))[block] = __float2half(d);
-  kv_q8_values(dst)[at + lane] = std::int8_t(__float2int_rn(v / d));
+  if (type == KvType::Q8_0) {
+    float v = src[h * kDim + base_d + lane];
+    float vmax = fabsf(v);
+    for (int off = 16; off > 0; off >>= 1) vmax = fmaxf(vmax, __shfl_down_sync(0xffffffffu, vmax, off));
+    vmax = __shfl_sync(0xffffffffu, vmax, 0);
+    const float d = vmax > 0.0f ? vmax / 127.0f : 1.0f;
+    if (lane == 0) const_cast<__half*>(kv_q8_scales(dst, values))[block] = __float2half(d);
+    kv_q8_values(dst)[at + lane] = std::int8_t(__float2int_rn(v / d));
+    return;
+  }
+  const bool packs = lane < KV_BLOCK / 2;
+  float v0 = 0.0f, v1 = 0.0f;
+  if (packs) {
+    v0 = src[h * kDim + base_d + 2 * lane];
+    v1 = src[h * kDim + base_d + 2 * lane + 1];
+  }
+  float vmax = fmaxf(fabsf(v0), fabsf(v1));
+  for (int off = 16; off > 0; off >>= 1) vmax = fmaxf(vmax, __shfl_down_sync(0xffffffffu, vmax, off));
+  vmax = __shfl_sync(0xffffffffu, vmax, 0);
+  const float d = vmax > 0.0f ? vmax / 8.0f : 1.0f;
+  if (lane == 0) const_cast<__half*>(kv_q4_scales(dst, values))[block] = __float2half(d);
+  if (packs) kv_q4_values(dst)[at / 2 + lane] = std::uint8_t(kv_q4_nibble(v0, d) | kv_q4_nibble(v1, d) << 4);
 }
 
 // Flash decode: one warp walks a strided subset of the split's positions and keeps its running softmax state in
@@ -277,13 +364,14 @@ __global__ __launch_bounds__(512) void kv_store_mixed_kernel(DecodeAttnArgs args
 // sixteen K multiplies and sixteen fused value updates. The 16-byte value read is the widest the q8_0 layout
 // allows — sixteen dims always sit inside one 32-value block, so one scale covers them — and it halves the
 // load-instruction count of the eight-dims-per-lane mapping. This is what the depth cost needs: 2.85 GB of
-// cache per token at 262k.
+// cache per token at 262k. q4_0 keeps the same mapping: the lane's sixteen dims are eight bytes, the aligned
+// half of the 32-value block it shares with its neighbour lane, so the pair still reads one 16-byte block.
 //
 // The two positions a warp handles are two independent streams, one per half-warp, each with its own (m, l);
 // the halves hold the same sixteen dims, so they merge through a lane-width shuffle before the block merge,
 // which stays eight-wide and keeps the 8 KB shared stage.
 //
-// The two cache formats are template arguments, not a runtime test: the measured loop is 1.2-1.4x faster for
+// The cache formats are template arguments, not a runtime test: the measured loop is 1.2-1.4x faster for
 // q8_0 and no slower for bf16 when each instantiation carries only its own decode, and it keeps the register
 // count at the 64 that holds four blocks per SM.
 template <KvType KTYPE_K, KvType KTYPE_V>
@@ -342,13 +430,19 @@ __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args)
     const std::size_t vbase = kbase;  // K and V share the layout, so the same index addresses both caches
 
     // Both loads are independent of the score, so they are issued before the reduction. The staging is eight
-    // words, which is the bf16 case; q8_0 uses the first four.
+    // words, which is the bf16 case; q8_0 uses the first four and q4_0 the first two. The q4_0 read is the
+    // lane's own aligned eight bytes of the block it shares with its neighbour: together the two lanes read
+    // exactly the 16-byte nibble block the layout is built around.
     std::uint32_t kw[8], vw[8];
     float ks = 1.0f, vs = 1.0f;
     if constexpr (KTYPE_K == KvType::Q8_0) {
       const int4 r = *reinterpret_cast<const int4*>(kv_q8_values(args.k_cache) + kbase);
       kw[0] = r.x; kw[1] = r.y; kw[2] = r.z; kw[3] = r.w;
       ks = __half2float(kv_q8_scales(args.k_cache, cache_values)[kbase / KV_BLOCK]);
+    } else if constexpr (KTYPE_K == KvType::Q4_0) {
+      const uint2 r = *reinterpret_cast<const uint2*>(kv_q4_values(args.k_cache) + kbase / 2);
+      kw[0] = r.x; kw[1] = r.y;
+      ks = __half2float(kv_q4_scales(args.k_cache, cache_values)[kbase / KV_BLOCK]);
     } else {
       const uint4* p4 = reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(args.k_cache) + kbase);
       const uint4 a = p4[0], b = p4[1];
@@ -359,6 +453,10 @@ __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args)
       const int4 r = *reinterpret_cast<const int4*>(kv_q8_values(args.v_cache) + vbase);
       vw[0] = r.x; vw[1] = r.y; vw[2] = r.z; vw[3] = r.w;
       vs = __half2float(kv_q8_scales(args.v_cache, cache_values)[vbase / KV_BLOCK]);
+    } else if constexpr (KTYPE_V == KvType::Q4_0) {
+      const uint2 r = *reinterpret_cast<const uint2*>(kv_q4_values(args.v_cache) + vbase / 2);
+      vw[0] = r.x; vw[1] = r.y;
+      vs = __half2float(kv_q4_scales(args.v_cache, cache_values)[vbase / KV_BLOCK]);
     } else {
       const uint4* p4 = reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(args.v_cache) + vbase);
       const uint4 a = p4[0], b = p4[1];
@@ -366,10 +464,11 @@ __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args)
       vw[4] = b.x; vw[5] = b.y; vw[6] = b.z; vw[7] = b.w;
     }
 
-    // The q8_0 row scale is per lane and applied before the reduction: the sixteen dims of a lane sit in one
+    // The block scale is per lane and applied before the reduction: the sixteen dims of a lane sit in one
     // 32-value block, but different lanes sit in different blocks, so the scales are not common to the butterfly.
     float dot = 0.0f;
     if constexpr (KTYPE_K == KvType::Q8_0) dot = dot_q8<kQ8Words>(kw, q_reg) * ks;
+    else if constexpr (KTYPE_K == KvType::Q4_0) dot = dot_q4<kQ4Words>(kw, q_reg) * ks;
     else dot = dot_bf16<kBfWords>(kw, q_reg);
     for (int off = kPosLanes / 2; off > 0; off >>= 1) dot += __shfl_xor_sync(hmask, dot, off);
     const float score = dot * scale;
@@ -379,10 +478,11 @@ __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args)
     const float p_ex = expf(score - m_new);
     l = l * corr + p_ex;
     m = m_new;
-    // The q8_0 row scale folds into p, which keeps the value update at one multiply per dim; in the bf16
-    // instantiation vs is the constant 1.0 and the multiply is not generated at all.
+    // The block scale of the V side folds into p, which keeps the value update at one multiply per dim; in the
+    // bf16 instantiation vs is the constant 1.0 and the multiply is not generated at all.
     const float pv = p_ex * vs;
     if constexpr (KTYPE_V == KvType::Q8_0) accum_q8(acc, vw, pv, corr);
+    else if constexpr (KTYPE_V == KvType::Q4_0) accum_q4(acc, vw, pv, corr);
     else accum_bf16(acc, vw, pv, corr);
   }
 
@@ -467,6 +567,8 @@ cudaError_t decode_kv_store(const DecodeAttnArgs& args, cudaStream_t stream) {
     kv_store_bf16_kernel<<<ATTN_KV_HEADS, kDim, 0, stream>>>(args);
   } else if (args.kv_type_k == KvType::Q8_0 && args.kv_type_v == KvType::Q8_0) {
     kv_store_q8_kernel<<<ATTN_KV_HEADS, 256, 0, stream>>>(args);
+  } else if (args.kv_type_k == KvType::Q4_0 && args.kv_type_v == KvType::Q4_0) {
+    kv_store_q4_kernel<<<ATTN_KV_HEADS, 256, 0, stream>>>(args);
   } else {
     kv_store_mixed_kernel<<<ATTN_KV_HEADS, 2 * 256, 0, stream>>>(args);
   }
@@ -486,11 +588,23 @@ cudaError_t decode_split(const DecodeAttnArgs& args, int band_splits, cudaStream
   const int last = std::min(args.pos + 1, first + band_splits * per_split);
   if (first < args.pos_begin || last > args.pos_begin + kv_cache_rows(args)) return cudaErrorInvalidValue;
   const dim3 grid(args.head_count, band_splits);
-  const bool q8_k = args.kv_type_k == KvType::Q8_0, q8_v = args.kv_type_v == KvType::Q8_0;
-  if (q8_k && q8_v) decode_split_kernel<KvType::Q8_0, KvType::Q8_0><<<grid, kDim, 0, stream>>>(args);
-  else if (q8_k) decode_split_kernel<KvType::Q8_0, KvType::Bf16><<<grid, kDim, 0, stream>>>(args);
-  else if (q8_v) decode_split_kernel<KvType::Bf16, KvType::Q8_0><<<grid, kDim, 0, stream>>>(args);
-  else decode_split_kernel<KvType::Bf16, KvType::Bf16><<<grid, kDim, 0, stream>>>(args);
+  // One instantiation per (K, V) pair, so the measured loop carries only its own decode and the register count
+  // stays at the four blocks per SM the layout was chosen for.
+  const KvType tk = args.kv_type_k;
+  const KvType tv = args.kv_type_v;
+  if (tk == KvType::Bf16) {
+    if (tv == KvType::Bf16) decode_split_kernel<KvType::Bf16, KvType::Bf16><<<grid, kDim, 0, stream>>>(args);
+    else if (tv == KvType::Q8_0) decode_split_kernel<KvType::Bf16, KvType::Q8_0><<<grid, kDim, 0, stream>>>(args);
+    else decode_split_kernel<KvType::Bf16, KvType::Q4_0><<<grid, kDim, 0, stream>>>(args);
+  } else if (tk == KvType::Q8_0) {
+    if (tv == KvType::Bf16) decode_split_kernel<KvType::Q8_0, KvType::Bf16><<<grid, kDim, 0, stream>>>(args);
+    else if (tv == KvType::Q8_0) decode_split_kernel<KvType::Q8_0, KvType::Q8_0><<<grid, kDim, 0, stream>>>(args);
+    else decode_split_kernel<KvType::Q8_0, KvType::Q4_0><<<grid, kDim, 0, stream>>>(args);
+  } else {
+    if (tv == KvType::Bf16) decode_split_kernel<KvType::Q4_0, KvType::Bf16><<<grid, kDim, 0, stream>>>(args);
+    else if (tv == KvType::Q8_0) decode_split_kernel<KvType::Q4_0, KvType::Q8_0><<<grid, kDim, 0, stream>>>(args);
+    else decode_split_kernel<KvType::Q4_0, KvType::Q4_0><<<grid, kDim, 0, stream>>>(args);
+  }
   return cudaGetLastError();
 }
 
@@ -532,6 +646,22 @@ void store_side_cpu(const float* src, void* dst, KvType type, int pos, int h, in
     }
     return;
   }
+  if (type == KvType::Q4_0) {
+    const std::uint64_t values = std::uint64_t(max_pos) * ATTN_KV_HEADS * kDim;
+    for (int block = 0; block < kDim / KV_BLOCK; ++block) {
+      const int base = h * kDim + block * KV_BLOCK;
+      float amax = 0.0f;
+      for (int i = 0; i < KV_BLOCK; ++i) amax = std::max(amax, std::fabs(src[base + i]));
+      const float d = amax > 0.0f ? amax / 8.0f : 1.0f;
+      const std::size_t at = (std::size_t(pos) * ATTN_KV_HEADS + h) * kDim + block * KV_BLOCK;
+      const_cast<__half*>(kv_q4_scales(dst, values))[at / KV_BLOCK] = __float2half(d);
+      for (int i = 0; i < KV_BLOCK / 2; ++i) {
+        kv_q4_values(dst)[at / 2 + i] = std::uint8_t(kv_q4_nibble(src[base + 2 * i], d) |
+                                                     kv_q4_nibble(src[base + 2 * i + 1], d) << 4);
+      }
+    }
+    return;
+  }
   for (int block = 0; block < kDim / KV_BLOCK; ++block) {
     float vmax = 0.0f;
     for (int i = 0; i < KV_BLOCK; ++i) {
@@ -556,6 +686,11 @@ void store_cpu(const DecodeAttnArgs& args) {
 
 float read_cpu(const void* base, KvType type, std::size_t index, std::uint64_t values) {
   if (type == KvType::Bf16) return __bfloat162float(static_cast<const __nv_bfloat16*>(base)[index]);
+  if (type == KvType::Q4_0) {
+    const std::uint8_t packed = kv_q4_values(base)[index / 2];
+    const float q = float(int((packed >> (4 * (index & 1))) & 0xFu)) - 8.0f;
+    return q * __half2float(kv_q4_scales(base, values)[index / KV_BLOCK]);
+  }
   return float(kv_q8_values(const_cast<void*>(base))[index]) *
          __half2float(kv_q8_scales(base, values)[index / KV_BLOCK]);
 }

@@ -43,6 +43,10 @@ void* alloc(std::size_t bytes) {
   return p;
 }
 
+const char* kv_name(attn::KvType type) {
+  return type == attn::KvType::Q8_0 ? "q8_0" : type == attn::KvType::Q4_0 ? "q4_0" : "bf16";
+}
+
 }  // namespace
 
 Decoder::Decoder() = default;
@@ -200,17 +204,28 @@ bool Decoder::init(const TextArena& arena, int max_pos, std::string* error) {
     logits_ = static_cast<float*>(alloc(std::size_t(VOCAB) * 4));
     logits_host_.resize(VOCAB);
 
-    // KV element formats, selected like llama-server's -ctk/-ctv. Q8_0 is a quarter of BF16 and is what makes
-    // 262144 fit on two 16 GB cards.
-    auto parse_kv = [](const char* name, kernels::KvType fallback) {
+    // KV element formats, selected per cache like llama-server's -ctk/-ctv/-ctkd/-ctvd. q8_0 is a quarter of
+    // BF16 and is what makes 262144 fit on two 16 GB cards; q4_0 is half of q8_0 again and stays available per
+    // side, but it is not the trunk default (K8V8 loses nothing against what supra runs today).
+    auto parse_kv = [](const char* name, attn::KvType fallback) {
       const char* v = std::getenv(name);
       if (!v) return fallback;
-      if (std::string(v) == "q8_0") return kernels::KvType::Q8_0;
-      if (std::string(v) == "bf16" || std::string(v) == "f16") return kernels::KvType::Bf16;
-      throw std::runtime_error(std::string(name) + " must be bf16 or q8_0, got " + v);
+      if (std::string(v) == "q8_0") return attn::KvType::Q8_0;
+      if (std::string(v) == "q4_0") return attn::KvType::Q4_0;
+      if (std::string(v) == "bf16" || std::string(v) == "f16") return attn::KvType::Bf16;
+      throw std::runtime_error(std::string(name) + " must be bf16, q8_0 or q4_0, got " + v);
     };
-    kv_type_k_ = parse_kv("QWEN35MOE_CTK", kernels::KvType::Bf16);
-    kv_type_v_ = parse_kv("QWEN35MOE_CT_V", kernels::KvType::Bf16);
+    kv_type_k_ = parse_kv("QWEN35MOE_CTK", attn::KvType::Bf16);
+    kv_type_v_ = parse_kv("QWEN35MOE_CT_V", attn::KvType::Bf16);
+    // The drafter's own cache is the -ctkd/-ctvd of the speculation plan. It only has to propose tokens, so a
+    // coarse cache costs acceptance rather than correctness and K4V4 is its default. No drafter module exists
+    // yet: the pair carries the setting and its default, and allocates nothing.
+    kv_type_k_drafter_ = parse_kv("QWEN35MOE_CTKD", attn::KvType::Q4_0);
+    kv_type_v_drafter_ = parse_kv("QWEN35MOE_CT_VD", attn::KvType::Q4_0);
+    std::fprintf(stderr, "[qwen35moe] KV cache: trunk K=%s V=%s, drafter K=%s V=%s (drafter cache not built)\n",
+                 kv_name(kv_type_k_), kv_name(kv_type_v_), kv_name(kv_type_k_drafter_),
+                 kv_name(kv_type_v_drafter_));
+    std::fflush(stderr);
     // Position bands: on by default, because the capacity gate below keeps them dormant under 98304 positions
     // and from there up they are a measured 9% (258048: 20.99 -> 19.28 ms/token). QWEN35MOE_KV_BANDS=0 pins the
     // single cache; with bands off the plan is one band covering the whole capacity on card 0, same allocation
@@ -402,6 +417,9 @@ bool Decoder::init(const TextArena& arena, int max_pos, std::string* error) {
       const KvBands& b = kv_bands_[0];
       const int top = splits_at(max_pos - 1);
       const int c1 = kv_band_columns(b, max_pos - 1, top);
+      // Bytes one token reads per position in the cache's own formats (both sides, all full layers).
+      const double per_pos = double(attn::kv_cache_bytes(kv_type_k_, 32) + attn::kv_cache_bytes(kv_type_v_, 32)) /
+                             32.0 * NUM_FULL_LAYERS / 1e6;
       std::fprintf(stderr,
                    "[qwen35moe] banded KV on: %d layers, boundary at %d/%d positions (%.4f), mirror %d rows; "
                    "%.0f MB on card %d plus %.0f MB on card %d; at the top of the cache card 1 runs %d of %d "
@@ -413,8 +431,7 @@ bool Decoder::init(const TextArena& arena, int max_pos, std::string* error) {
                    (kv_band_bytes(b.bands[1].pos_end - b.bands[1].pos_begin, kv_type_k_) +
                     kv_band_bytes(b.bands[1].pos_end - b.bands[1].pos_begin, kv_type_v_)) * NUM_FULL_LAYERS / 1e6,
                    b.bands[1].device, c1 >= 0 ? top - c1 : 0, top,
-                   double(b.max_pos - b.cut) * kernels::ATTN_KV_HEADS * kernels::ATTN_HEAD_DIM * 2.0625 *
-                       NUM_FULL_LAYERS / 1e6);
+                   double(b.max_pos - b.cut) * per_pos);
       std::fflush(stderr);
     }
 

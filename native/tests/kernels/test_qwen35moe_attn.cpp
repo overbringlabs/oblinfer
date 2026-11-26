@@ -336,72 +336,147 @@ bool closed_form_cpu() {
 
 // q8_0 cache: the reference quantises identically, so agreement is tight; the quality cost is measured by the
 // difference against the BF16 run of the same data.
-bool q8_case() {
+const char* kv_label(attn::KvType type) {
+  return type == attn::KvType::Q8_0 ? "q8_0" : type == attn::KvType::Q4_0 ? "q4_0" : "bf16";
+}
+
+// One block-cache format on the device against the FP64 reference over the same bytes. Skipped without an
+// sm_120 card; every host half still runs.
+bool quantised_device_case(attn::KvType type) {
+  if (!have_matching_gpu()) return true;
   Case c = make_case(600, 9);
   std::vector<float> ref_out(H * D, 0.0f);
   Case cpu = c;
   attn::DecodeAttnArgs a = host_args(cpu, ref_out);
-  a.kv_type_k = attn::KvType::Q8_0;
-  a.kv_type_v = attn::KvType::Q8_0;
-  const std::size_t bytes = attn::kv_cache_bytes(attn::KvType::Q8_0, c.max_pos);
+  a.kv_type_k = type;
+  a.kv_type_v = type;
+  const std::size_t bytes = attn::kv_cache_bytes(type, c.max_pos);
   std::vector<std::uint8_t> kc(bytes), vc(bytes);
   a.k_cache = kc.data();
   a.v_cache = vc.data();
   attn::decode_attention_cpu(a);
 
-  bool ok = true;
-  if (have_matching_gpu()) {
-    Case dev = c;
-    std::vector<float> dev_out(H * D, 0.0f);
-    DeviceArray<float> dq(dev.q), dk(dev.k_new), dv(dev.v_new), dout(dev_out);
-    DeviceArray<std::uint8_t> dkc(bytes), dvc(bytes);
-    attn::DecodeAttnArgs g;
-    g.q = dq.get();
-    g.k_new = dk.get();
-    g.v_new = dv.get();
-    g.k_cache = dkc.get();
-    g.v_cache = dvc.get();
-    g.out = dout.get();
-    g.pos = c.pos;
-    g.max_pos = c.max_pos;
-    g.kv_type_k = attn::KvType::Q8_0;
-    g.kv_type_v = attn::KvType::Q8_0;
-    if (attn::decode_attention(g, nullptr) != cudaSuccess) {
-      std::printf("FAIL q8_0 launch\n");
-      return false;
-    }
-    INGINE_TEST_CUDA(cudaStreamSynchronize(nullptr));
-    dev_out = dout.download();
-    ok = close("q8_0 vs reference", dev_out, ref_out);
+  Case dev = c;
+  std::vector<float> dev_out(H * D, 0.0f);
+  DeviceArray<float> dq(dev.q), dk(dev.k_new), dv(dev.v_new), dout(dev_out);
+  DeviceArray<std::uint8_t> dkc(bytes), dvc(bytes);
+  attn::DecodeAttnArgs g;
+  g.q = dq.get();
+  g.k_new = dk.get();
+  g.v_new = dv.get();
+  g.k_cache = dkc.get();
+  g.v_cache = dvc.get();
+  g.out = dout.get();
+  g.pos = c.pos;
+  g.max_pos = c.max_pos;
+  g.kv_type_k = type;
+  g.kv_type_v = type;
+  if (attn::decode_attention(g, nullptr) != cudaSuccess) {
+    std::printf("FAIL %s launch\n", kv_label(type));
+    return false;
   }
+  INGINE_TEST_CUDA(cudaStreamSynchronize(nullptr));
+  dev_out = dout.download();
+  char tag[64];
+  std::snprintf(tag, sizeof tag, "%s vs reference", kv_label(type));
+  return close(tag, dev_out, ref_out);
+}
 
-  // Quality must be measured with a cache both formats filled themselves: at pos 0 the single stored row is the
-  // only content, so the difference is purely the block quantisation. (Comparing at depth against a BF16-filled
-  // history would compare a quantised row against misread BF16 bytes.)
+// Bars for the BF16 comparison. q8_0's are the ones its case has always used; q4_0 is eight times coarser per
+// value, so its worst value may sit at half the output rms and its rms at 15%, which is what four bits with one
+// scale per 32 values costs on normal data.
+double cache_max_rel(attn::KvType type) { return type == attn::KvType::Q4_0 ? 5e-1 : 5e-2; }
+double cache_rms_rel(attn::KvType type) { return type == attn::KvType::Q4_0 ? 1.5e-1 : 1e-2; }
+
+struct CacheError {
+  double max_rel;  // worst value difference over the rms of the BF16 output
+  double rms_rel;  // rms difference over the rms of the BF16 output
+};
+
+// Output-level cost of a cache format against BF16 on the same data, both as the worst value and as the rms.
+// At pos 0 the single stored row is the only content, so the difference is purely the block quantisation.
+// (Comparing at depth against a BF16-filled history would compare a quantised row against misread BF16 bytes.)
+CacheError pos0_error_vs_bf16(attn::KvType type) {
   Case q0 = make_case(0, 11);
   std::vector<float> q_out(H * D, 0.0f), b_out(H * D, 0.0f);
-  std::vector<std::uint8_t> qk(attn::kv_cache_bytes(attn::KvType::Q8_0, q0.max_pos));
+  std::vector<std::uint8_t> qk(attn::kv_cache_bytes(type, q0.max_pos));
   std::vector<std::uint8_t> qv(qk.size());
   Case qc = q0;
   attn::DecodeAttnArgs qa = host_args(qc, q_out);
   qa.k_cache = qk.data();
   qa.v_cache = qv.data();
-  qa.kv_type_k = attn::KvType::Q8_0;
-  qa.kv_type_v = attn::KvType::Q8_0;
+  qa.kv_type_k = type;
+  qa.kv_type_v = type;
   attn::decode_attention_cpu(qa);
   Case bc = q0;
   attn::DecodeAttnArgs bargs = host_args(bc, b_out);
   attn::decode_attention_cpu(bargs);
-  double worst = 0.0, rms = 0.0;
+  double worst = 0.0, err2 = 0.0, rms = 0.0;
   for (int i = 0; i < H * D; ++i) {
-    worst = std::max(worst, std::fabs(double(q_out[std::size_t(i)]) - double(b_out[std::size_t(i)])));
+    const double e = double(q_out[std::size_t(i)]) - double(b_out[std::size_t(i)]);
+    worst = std::max(worst, std::fabs(e));
+    err2 += e * e;
     rms += double(b_out[std::size_t(i)]) * double(b_out[std::size_t(i)]);
   }
   rms = std::sqrt(rms / (H * D));
-  std::printf("%s q8_0 vs bf16 at pos 0: max_abs=%.3e rms=%.3e rel=%.3e\n", worst / rms < 5e-2 ? "PASS" : "FAIL",
-              worst, rms, worst / rms);
-  return ok && worst / rms < 5e-2;
+  const CacheError got{worst / rms, std::sqrt(err2 / (H * D)) / rms};
+  std::printf("%s %s vs bf16 at pos 0: max_abs=%.3e rel=%.3e rms_rel=%.3e\n",
+              got.max_rel < cache_max_rel(type) && got.rms_rel < cache_rms_rel(type) ? "PASS" : "FAIL",
+              kv_label(type), worst, got.max_rel, got.rms_rel);
+  return got;
+}
 
+// Value-level cost of a block format, independent of the attention arithmetic: one 512-value row through the
+// quantiser and back, against the BF16 rounding of the same value. Informational, and the number the format
+// choice is about — the output-level figure above also carries the softmax's averaging.
+void report_quantiser_error(unsigned seed) {
+  Rng rng(seed);
+  std::vector<float> v(std::size_t(KV) * D);
+  for (auto& x : v) x = float(rng.normal());
+  double bf_rms = 0.0;
+  for (float x : v) {
+    const double e = double(x) - double(__bfloat162float(__float2bfloat16(x)));
+    bf_rms += e * e;
+  }
+  bf_rms = std::sqrt(bf_rms / double(v.size()));
+  std::printf("[values] bf16 rounding: rms=%.3e\n", bf_rms);
+  for (attn::KvType type : {attn::KvType::Q8_0, attn::KvType::Q4_0}) {
+    double sum2 = 0.0, worst = 0.0, ref2 = 0.0;
+    for (int block = 0; block < KV * D / attn::KV_BLOCK; ++block) {
+      const float* src = v.data() + block * attn::KV_BLOCK;
+      float amax = 0.0f;
+      for (int i = 0; i < attn::KV_BLOCK; ++i) amax = std::max(amax, std::fabs(src[i]));
+      const float d = type == attn::KvType::Q4_0 ? (amax > 0.0f ? amax / 8.0f : 1.0f)
+                                                 : (amax > 0.0f ? amax / 127.0f : 1.0f);
+      for (int i = 0; i < attn::KV_BLOCK; ++i) {
+        const double back = type == attn::KvType::Q4_0 ? double(d) * double(attn::kv_q4_nibble(src[i], d) - 8)
+                                                      : double(std::lround(src[i] / d)) * double(d);
+        const double want = double(__bfloat162float(__float2bfloat16(src[i])));
+        const double e = back - want;
+        sum2 += e * e;
+        ref2 += want * want;
+        worst = std::max(worst, std::fabs(e));
+      }
+    }
+    const double rms = std::sqrt(sum2 / double(v.size()));
+    std::printf("[values] %s round trip vs bf16: max_abs=%.3e rms=%.3e rel=%.3e\n", kv_label(type), worst, rms,
+                rms / std::sqrt(ref2 / double(v.size())));
+  }
+}
+
+bool q8_case() {
+  bool ok = quantised_device_case(attn::KvType::Q8_0);
+  // Quality must be measured with a cache both formats filled themselves.
+  const CacheError err = pos0_error_vs_bf16(attn::KvType::Q8_0);
+  return ok && err.max_rel < cache_max_rel(attn::KvType::Q8_0) && err.rms_rel < cache_rms_rel(attn::KvType::Q8_0);
+}
+
+// q4_0 is the drafter's default and the option for a wider V cache: four bits per value behind the same block
+// scale, so the same device-versus-reference and BF16-quality checks apply.
+bool q4_case() {
+  bool ok = quantised_device_case(attn::KvType::Q4_0);
+  const CacheError err = pos0_error_vs_bf16(attn::KvType::Q4_0);
+  return ok && err.max_rel < cache_max_rel(attn::KvType::Q4_0) && err.rms_rel < cache_rms_rel(attn::KvType::Q4_0);
 }
 
 }  // namespace
@@ -409,6 +484,8 @@ bool q8_case() {
 int main() {
   bool ok = closed_form_cpu();
   ok &= q8_case();
+  ok &= q4_case();
+  report_quantiser_error(13);
   ok &= split_matches_full_cpu(0, 1);
   ok &= split_matches_full_cpu(511, 3);
   ok &= split_matches_full_cpu(600, 4);

@@ -7,7 +7,7 @@
 // same cache bytes within tolerance. Depths 1k and 32k are the ones the decoder runs at; the rest are the
 // shapes that decide whether the arithmetic is right at all - a query below the boundary, one inside the
 // mirror, one exactly on it, the last position, a query-head range, the widest and narrowest column grids, and
-// both cache formats.
+// all three cache formats (bf16, q8_0 and q4_0).
 //
 // A two-band plan with both bands on one device (an explicit cut, no staging) covers the band arithmetic on
 // any sm_120; the cross-card shape adds the pinned exchange and the event chain and needs two, so it is
@@ -79,13 +79,17 @@ bool band_math() {
                   aligned, leaves_room, mirror_in_range);
       ok = false;
     }
-    // Band bytes are slices: the two bands hold exactly what one cache of max_pos holds, plus the mirror.
-    const std::size_t whole = kva::kv_band_bytes(max_pos, attn::KvType::Q8_0);
-    const std::size_t split = kva::kv_band_bytes(cut, attn::KvType::Q8_0) +
-                              kva::kv_band_bytes(max_pos - cut + overlap, attn::KvType::Q8_0);
-    if (splittable && split != whole + kva::kv_band_bytes(overlap, attn::KvType::Q8_0)) {
-      std::printf("FAIL cut %d: bands %zu vs whole %zu plus mirror\n", max_pos, split, whole);
-      ok = false;
+    // Band bytes are slices: the two bands hold exactly what one cache of max_pos holds, plus the mirror. Both
+    // block formats are checked, because q4_0's value array is half as long and its slice boundary depends on
+    // that.
+    for (attn::KvType type : {attn::KvType::Q8_0, attn::KvType::Q4_0}) {
+      const std::size_t whole = kva::kv_band_bytes(max_pos, type);
+      const std::size_t split =
+          kva::kv_band_bytes(cut, type) + kva::kv_band_bytes(max_pos - cut + overlap, type);
+      if (splittable && split != whole + kva::kv_band_bytes(overlap, type)) {
+        std::printf("FAIL cut %d (type %d): bands %zu vs whole %zu plus mirror\n", max_pos, int(type), split, whole);
+        ok = false;
+      }
     }
     // The decoder's own depth rule must always be placeable on this plan: no query at any position may
     // reach a geometry the launcher would refuse.
@@ -246,12 +250,15 @@ std::vector<std::uint8_t> pack_band(attn::KvType type, const std::vector<std::ui
     out.assign(whole.begin() + std::ptrdiff_t(2 * voff), whole.begin() + std::ptrdiff_t(2 * (voff + vlen)));
     return out;
   }
+  // The value array is vlen bytes for q8_0 and vlen / 2 for q4_0, and the band's scales follow its own values.
   const std::size_t values_all = std::size_t(max_pos) * kValuesPerPos;
+  const std::size_t vbytes = attn::kv_value_bytes(type, vlen);
+  const std::size_t voff_bytes = attn::kv_value_bytes(type, voff);
   const std::size_t sc_bytes = vlen / attn::KV_BLOCK * sizeof(__half);
-  const std::size_t sc_off = values_all + voff / attn::KV_BLOCK * sizeof(__half);
-  out.resize(vlen + sc_bytes);
-  std::memcpy(out.data(), whole.data() + voff, vlen);
-  std::memcpy(out.data() + vlen, whole.data() + sc_off, sc_bytes);
+  const std::size_t sc_off = attn::kv_value_bytes(type, values_all) + voff / attn::KV_BLOCK * sizeof(__half);
+  out.resize(vbytes + sc_bytes);
+  std::memcpy(out.data(), whole.data() + voff_bytes, vbytes);
+  std::memcpy(out.data() + vbytes, whole.data() + sc_off, sc_bytes);
   return out;
 }
 
@@ -263,6 +270,13 @@ std::vector<std::uint8_t> fill_cache(attn::KvType type, int max_pos, Rng& rng) {
   if (type == attn::KvType::Bf16) {
     auto* p = reinterpret_cast<__nv_bfloat16*>(buf.data());
     for (std::size_t i = 0; i < values; ++i) p[i] = __float2bfloat16(float(rng.normal()) * 0.3f);
+    return buf;
+  }
+  if (type == attn::KvType::Q4_0) {
+    auto* v4 = attn::kv_q4_values(buf.data());
+    for (std::size_t i = 0; i < values / 2; ++i) v4[i] = std::uint8_t(rng.next() % 256);
+    auto* s4 = const_cast<__half*>(attn::kv_q4_scales(buf.data(), values));
+    for (std::size_t b = 0; b < values / attn::KV_BLOCK; ++b) s4[b] = __float2half(0.002f + 0.001f * float(b % 13));
     return buf;
   }
   auto* v = attn::kv_q8_values(buf.data());
@@ -279,6 +293,33 @@ bool band_bytes_match(attn::KvType type, const std::vector<std::uint8_t>& got,
   if (got.size() != want.size()) {
     std::printf("FAIL band bytes: size %zu vs %zu\n", got.size(), want.size());
     return false;
+  }
+  if (type == attn::KvType::Q4_0) {
+    // Two values per byte, so the written row is half as many bytes; its nibbles may be one step off.
+    const std::size_t vbytes = std::size_t(end - begin) * kValuesPerPos / 2;
+    for (std::size_t i = 0; i < vbytes; ++i) {
+      const int row = begin + int(2 * i / kValuesPerPos);
+      if (row == written_row) {
+        const int lo = std::abs(int(got[i] & 0xFu) - int(want[i] & 0xFu));
+        const int hi = std::abs(int(got[i] >> 4) - int(want[i] >> 4));
+        if (lo > 1 || hi > 1) {
+          std::printf("FAIL band bytes: nibble at row %d byte %zu differs by %d/%d\n", row, i, lo, hi);
+          return false;
+        }
+        continue;
+      }
+      if (got[i] != want[i]) {
+        std::printf("FAIL band bytes: byte %zu (row %d) is %02x want %02x\n", i, row, got[i], want[i]);
+        return false;
+      }
+    }
+    for (std::size_t i = vbytes; i < got.size(); ++i) {
+      if (got[i] != want[i]) {
+        std::printf("FAIL band bytes: scale byte %zu differs\n", i);
+        return false;
+      }
+    }
+    return true;
   }
   const std::size_t vlen = std::size_t(end - begin) * kValuesPerPos;
   for (std::size_t i = 0; i < vlen; ++i) {
@@ -501,7 +542,8 @@ bool run_banded_case(const char* tag, const Case& c, const std::vector<int>& dev
   std::printf("[%s] max_pos=%d pos=%d heads=[%d,%d) type=%s bands=%d cut=%d mirror=%d splits=%d -> card 0 runs "
               "columns [0,%d), card 1 [%d,%d)\n",
               tag, c.max_pos, c.pos, c.head_begin, c.head_begin + c.head_count,
-              c.type == attn::KvType::Q8_0 ? "q8_0" : "bf16", bands.count, bands.cut, bands.overlap, splits, c1, c1,
+              c.type == attn::KvType::Q8_0 ? "q8_0" : c.type == attn::KvType::Q4_0 ? "q4_0" : "bf16", bands.count,
+              bands.cut, bands.overlap, splits, c1, c1,
               splits);
   if (c1 < 0) {
     std::printf("FAIL %s: no column boundary fits (cut %d mirror %d)\n", tag, bands.cut, bands.overlap);
@@ -622,9 +664,9 @@ bool run_banded_case(const char* tag, const Case& c, const std::vector<int>& dev
 
 // Informational, not asserted: the split kernel's realised cache bandwidth per card. The boundary is placed
 // by a bandwidth ratio, so this is the number behind the choice. Timing lines never fail a case.
-void bandwidth_probe(int depth, const std::vector<int>& devs) {
-  const Case c = make_case(depth, depth - 1, 0, H, attn::KvType::Q8_0, 91, attn::kMaxSplits);
-  const double bytes = double(attn::kv_cache_bytes(attn::KvType::Q8_0, depth)) * 2.0;
+void bandwidth_probe(int depth, const std::vector<int>& devs, attn::KvType type = attn::KvType::Q8_0) {
+  const Case c = make_case(depth, depth - 1, 0, H, type, 91, attn::kMaxSplits);
+  const double bytes = double(attn::kv_cache_bytes(type, depth)) * 2.0;
   std::vector<double> rates;
   for (int dev : devs) {
     kva::KvBands plan{};
@@ -661,8 +703,8 @@ void bandwidth_probe(int depth, const std::vector<int>& devs) {
       const double per_call = ms / rounds;
       const double gbs = bytes / (per_call / 1000.0) / 1e9;
       rates.push_back(gbs);
-      std::printf("[bw] dev %d: %d positions, %.1f MB of K+V per launch, %.3f ms -> %.0f GB/s\n", dev, depth,
-                  bytes / 1e6, per_call, gbs);
+      std::printf("[bw] dev %d (%s): %d positions, %.1f MB of K+V per launch, %.3f ms -> %.0f GB/s\n", dev,
+                  type == attn::KvType::Q4_0 ? "q4_0" : "q8_0", depth, bytes / 1e6, per_call, gbs);
     }
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
@@ -702,6 +744,10 @@ int main() {
                                                             attn::kMaxSplits),
                          one);
   ok &= run_banded_case("local q8_0 pos 0", make_case(6144, 0, 0, H, attn::KvType::Q8_0, 49, 2), one);
+  ok &= run_banded_case("local q4_0 1k", make_case(1024, 1000, 0, H, attn::KvType::Q4_0, 51, 8), one);
+  ok &= run_banded_case("local q4_0 32k", make_case(32768, 32000, 0, H, attn::KvType::Q4_0, 52), one);
+  ok &= run_banded_case("local q4_0 on the boundary", make_case(6144, 4096, 0, H, attn::KvType::Q4_0, 53), one);
+  ok &= run_banded_case("local q4_0 in the mirror", make_case(6144, 3000, 0, H, attn::KvType::Q4_0, 54), one);
 
   if (devs.size() < 2) {
     std::printf("skip cross-card cases and the bandwidth probe: %zu sm_120 device(s), they need two\n",
@@ -723,8 +769,14 @@ int main() {
   ok &= run_banded_case("cross q8_0 all columns", make_case(6144, 6000, 0, H, attn::KvType::Q8_0, 39,
                                                             attn::kMaxSplits),
                          pair);
+  ok &= run_banded_case("cross q4_0 32k", make_case(32768, 32000, 0, H, attn::KvType::Q4_0, 55), pair);
+  ok &= run_banded_case("cross q4_0 in the mirror", make_case(6144, 3000, 0, H, attn::KvType::Q4_0, 56), pair);
+  ok &= run_banded_case("cross q4_0 all columns", make_case(6144, 6000, 0, H, attn::KvType::Q4_0, 57,
+                                                            attn::kMaxSplits),
+                         pair);
 
   bandwidth_probe(32768, pair);
+  bandwidth_probe(32768, pair, attn::KvType::Q4_0);
 
   if (ok) std::printf("ALL PASS\n");
   return ok ? 0 : 1;

@@ -7,7 +7,8 @@
 // both read their own bytes at their own rate in parallel.
 //
 // A band is a complete cache of its own length in the layout decode_attn.h defines, addressed band-local:
-// global position p is row p - pos_begin, and the band's q8_0 scale array starts after its own value count.
+// global position p is row p - pos_begin, and the band's block-scale array starts after its own value array
+// (at that many bytes for q8_0, half as many for q4_0).
 //
 // The band boundary does not cut a flash-decode column. Columns are cut from (pos, splits) alone, so the
 // column that straddles the boundary would otherwise need rows from both cards; instead band 1 mirrors the
@@ -68,7 +69,7 @@ int kv_band_overlap(int max_pos, int cut, int split_positions = KV_BAND_SPLIT_PO
 
 // Bytes of one cache side of `positions` positions, i.e. of one band. A row is ATTN_KV_HEADS *
 // ATTN_HEAD_DIM = 512 values, a whole number of KV_BLOCK blocks, so a band that starts and ends on a row
-// holds a contiguous slice of the un-banded cache in both arrays (values, then scales).
+// holds a contiguous slice of the un-banded cache in both arrays (values, then scales), in every format.
 std::size_t kv_band_bytes(int positions, kernels::KvType type);
 
 // Allocates the bands on `dev0`/`dev1`. With two different devices band 0 owns [0, cut) and band 1 owns
