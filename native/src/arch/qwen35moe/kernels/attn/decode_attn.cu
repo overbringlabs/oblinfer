@@ -193,12 +193,16 @@ __global__ __launch_bounds__(512) void kv_store_mixed_kernel(DecodeAttnArgs args
   kv_q8_values(dst)[at + lane] = std::int8_t(__float2int_rn(v / d));
 }
 
-// One block per (query head, position split). Same inner maths as the single-block kernel, but the position range
-// is a slice, so a 262k cache is covered by hundreds of blocks instead of 16.
+// Flash decode: one warp walks a strided subset of the split's positions and keeps its own running softmax
+// state in registers — eight output dims per lane — so the score and the value update happen in the same pass
+// with no shared score array and no per-chunk barriers. The eight warps of the block merge at the end.
+//
+// Per position a lane does two aligned 4-byte reads of K, one scale read, eight K multiplies for the score, then
+// the same two reads and eight fused updates for V. That is the widest access the q8_0 layout allows, and it is
+// what the depth cost needs: 2.85 GB of cache per token at 262k.
 __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args) {
   const int split = blockIdx.y;
   const int h = args.head_begin + blockIdx.x;
-  const int d = threadIdx.x;
   const int kh = h / kGroup;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
@@ -209,89 +213,123 @@ __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args)
   const int end = min(args.pos + 1, begin + per_split);
   const std::size_t slot = std::size_t(blockIdx.x) * std::size_t(args.splits) + std::size_t(split);
   if (begin >= end) {
-    if (d == 0) {
+    if (threadIdx.x == 0) {
       args.partial[slot].m = -INFINITY;
       args.partial[slot].l = 0.0f;
     }
-    for (int i = 0; i < kDim; i += kDim) args.partial[slot].acc[d] = 0.0f;
+    args.partial[slot].acc[threadIdx.x] = 0.0f;
     return;
   }
 
-  __shared__ float scores[ATTN_CHUNK];
-  __shared__ float warp_sums[kWarps];
-  __shared__ float run_max, run_sum, chunk_max, chunk_sum;
+  __shared__ float s_m[kWarps];
+  __shared__ float s_l[kWarps];
+  __shared__ float s_acc[kWarps][kDim];
+  __shared__ float s_total, s_max;
 
+  const int d0 = lane * 8;  // this lane carries eight dims of the head
   float q_reg[8];
 #pragma unroll
-  for (int i = 0; i < 8; ++i) q_reg[i] = args.q[h * kDim + lane + i * 32];
+  for (int i = 0; i < 8; ++i) q_reg[i] = args.q[h * kDim + d0 + i];
+
+  const float scale = rsqrtf(float(kDim));
+  float m = -INFINITY;
+  float l = 0.0f;
+  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+  for (int i = begin + warp; i < end; i += kWarps) {
+    const std::size_t kbase = (std::size_t(i) * ATTN_KV_HEADS + kh) * kDim + d0;
+    float dot = 0.0f;
+    float v[8];
+    if (args.kv_type_k == KvType::Q8_0) {
+      const float ks = __half2float(kv_q8_scales(args.k_cache, cache_values)[kbase / KV_BLOCK]);
+      const std::int8_t* kp = kv_q8_values(args.k_cache) + kbase;
+      const std::int32_t a = *reinterpret_cast<const std::int32_t*>(kp);
+      const std::int32_t b = *reinterpret_cast<const std::int32_t*>(kp + 4);
+      dot = q_reg[0] * float(std::int8_t(a & 0xFF)) + q_reg[1] * float(std::int8_t((a >> 8) & 0xFF)) +
+            q_reg[2] * float(std::int8_t((a >> 16) & 0xFF)) + q_reg[3] * float(std::int8_t((a >> 24) & 0xFF)) +
+            q_reg[4] * float(std::int8_t(b & 0xFF)) + q_reg[5] * float(std::int8_t((b >> 8) & 0xFF)) +
+            q_reg[6] * float(std::int8_t((b >> 16) & 0xFF)) + q_reg[7] * float(std::int8_t((b >> 24) & 0xFF));
+      dot *= ks;
+    } else {
+      const auto* kp = static_cast<const __nv_bfloat16*>(args.k_cache) + kbase;
+      const uint2 a = *reinterpret_cast<const uint2*>(kp);
+      const uint2 b = *reinterpret_cast<const uint2*>(kp + 4);
+      const float kv[8] = {__bfloat162float(__ushort_as_bfloat16(std::uint16_t(a.x & 0xFFFFu))),
+                           __bfloat162float(__ushort_as_bfloat16(std::uint16_t(a.x >> 16))),
+                           __bfloat162float(__ushort_as_bfloat16(std::uint16_t(a.y & 0xFFFFu))),
+                           __bfloat162float(__ushort_as_bfloat16(std::uint16_t(a.y >> 16))),
+                           __bfloat162float(__ushort_as_bfloat16(std::uint16_t(b.x & 0xFFFFu))),
+                           __bfloat162float(__ushort_as_bfloat16(std::uint16_t(b.x >> 16))),
+                           __bfloat162float(__ushort_as_bfloat16(std::uint16_t(b.y & 0xFFFFu))),
+                           __bfloat162float(__ushort_as_bfloat16(std::uint16_t(b.y >> 16)))};
+#pragma unroll
+      for (int j = 0; j < 8; ++j) dot += q_reg[j] * kv[j];
+    }
+    for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+    const float score = dot * scale;
+
+    const std::size_t vbase = (std::size_t(i) * ATTN_KV_HEADS + kh) * kDim + d0;
+    if (args.kv_type_v == KvType::Q8_0) {
+      const float vs = __half2float(kv_q8_scales(args.v_cache, cache_values)[vbase / KV_BLOCK]);
+      const std::int8_t* vp = kv_q8_values(args.v_cache) + vbase;
+      const std::int32_t a = *reinterpret_cast<const std::int32_t*>(vp);
+      const std::int32_t b = *reinterpret_cast<const std::int32_t*>(vp + 4);
+      v[0] = vs * float(std::int8_t(a & 0xFF));
+      v[1] = vs * float(std::int8_t((a >> 8) & 0xFF));
+      v[2] = vs * float(std::int8_t((a >> 16) & 0xFF));
+      v[3] = vs * float(std::int8_t((a >> 24) & 0xFF));
+      v[4] = vs * float(std::int8_t(b & 0xFF));
+      v[5] = vs * float(std::int8_t((b >> 8) & 0xFF));
+      v[6] = vs * float(std::int8_t((b >> 16) & 0xFF));
+      v[7] = vs * float(std::int8_t((b >> 24) & 0xFF));
+    } else {
+      const auto* vp = static_cast<const __nv_bfloat16*>(args.v_cache) + vbase;
+      const uint2 a = *reinterpret_cast<const uint2*>(vp);
+      const uint2 b = *reinterpret_cast<const uint2*>(vp + 4);
+      v[0] = __bfloat162float(__ushort_as_bfloat16(std::uint16_t(a.x & 0xFFFFu)));
+      v[1] = __bfloat162float(__ushort_as_bfloat16(std::uint16_t(a.x >> 16)));
+      v[2] = __bfloat162float(__ushort_as_bfloat16(std::uint16_t(a.y & 0xFFFFu)));
+      v[3] = __bfloat162float(__ushort_as_bfloat16(std::uint16_t(a.y >> 16)));
+      v[4] = __bfloat162float(__ushort_as_bfloat16(std::uint16_t(b.x & 0xFFFFu)));
+      v[5] = __bfloat162float(__ushort_as_bfloat16(std::uint16_t(b.x >> 16)));
+      v[6] = __bfloat162float(__ushort_as_bfloat16(std::uint16_t(b.y & 0xFFFFu)));
+      v[7] = __bfloat162float(__ushort_as_bfloat16(std::uint16_t(b.y >> 16)));
+    }
+
+    const float m_new = fmaxf(m, score);
+    const float corr = expf(m - m_new);
+    const float p = expf(score - m_new);
+    l = l * corr + p;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = acc[j] * corr + p * v[j];
+    m = m_new;
+  }
+
+  if (lane == 0) {
+    s_m[warp] = m;
+    s_l[warp] = l;
+  }
+#pragma unroll
+  for (int j = 0; j < 8; ++j) s_acc[warp][d0 + j] = acc[j];
+  __syncthreads();
 
   if (threadIdx.x == 0) {
-    run_max = -INFINITY;
-    run_sum = 0.0f;
+    float M = -INFINITY;
+    for (int w = 0; w < kWarps; ++w) M = fmaxf(M, s_m[w]);
+    float L = 0.0f;
+    for (int w = 0; w < kWarps; ++w) L += s_l[w] * expf(s_m[w] - M);
+    s_max = M;
+    s_total = L;
   }
   __syncthreads();
 
-  const float scale = rsqrtf(float(kDim));
-  float acc = 0.0f;
-  for (int base = begin; base < end; base += ATTN_CHUNK) {
-    const int len = min(ATTN_CHUNK, end - base);
-    for (int i = warp; i < len; i += kWarps) {
-      const std::size_t kbase = (std::size_t(base + i) * ATTN_KV_HEADS + kh) * kDim;
-      float dot = 0.0f;
-#pragma unroll
-      for (int r = 0; r < 8; ++r) dot += q_reg[r] * kv_at(args.k_cache, args.kv_type_k, kbase + lane + r * 32, cache_values);
-      dot = warp_sum(dot);
-      if (lane == 0) scores[i] = dot * scale;
-    }
-    __syncthreads();
-
-    float local_max = -INFINITY;
-    for (int i = d; i < len; i += kDim) local_max = fmaxf(local_max, scores[i]);
-    for (int off = 16; off > 0; off >>= 1) local_max = fmaxf(local_max, __shfl_down_sync(0xffffffffu, local_max, off));
-    if (lane == 0) warp_sums[warp] = local_max;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      float m = -INFINITY;
-#pragma unroll
-      for (int w = 0; w < kWarps; ++w) m = fmaxf(m, warp_sums[w]);
-      chunk_max = m;
-    }
-    __syncthreads();
-
-    const float m_new = fmaxf(run_max, chunk_max);
-    const float rescale = expf(run_max - m_new);
-
-    float local_sum = 0.0f;
-    for (int i = d; i < len; i += kDim) local_sum += expf(scores[i] - m_new);
-    for (int off = 16; off > 0; off >>= 1) local_sum += __shfl_down_sync(0xffffffffu, local_sum, off);
-    __syncthreads();
-    if (lane == 0) warp_sums[warp] = local_sum;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      float s = 0.0f;
-#pragma unroll
-      for (int w = 0; w < kWarps; ++w) s += warp_sums[w];
-      chunk_sum = s;
-    }
-    __syncthreads();
-
-    acc *= rescale;
-    for (int i = 0; i < len; ++i) {
-      const float p = expf(scores[i] - m_new);
-      acc += p * kv_at(args.v_cache, args.kv_type_v, (std::size_t(base + i) * ATTN_KV_HEADS + kh) * kDim + d, cache_values);
-    }
-    if (threadIdx.x == 0) {
-      run_sum = run_sum * rescale + chunk_sum;
-      run_max = m_new;
-    }
-    __syncthreads();
+  float total = 0.0f;
+  for (int w = 0; w < kWarps; ++w) total += s_acc[w][threadIdx.x] * expf(s_m[w] - s_max);
+  args.partial[slot].acc[threadIdx.x] = total;
+  if (threadIdx.x == 0) {
+    args.partial[slot].m = s_max;
+    args.partial[slot].l = s_total;
   }
-
-  if (d == 0) {
-    args.partial[slot].m = run_max;
-    args.partial[slot].l = run_sum;
-  }
-  args.partial[slot].acc[d] = acc;
 }
 
 // Merge the splits per head: log-sum-exp over the split maxima, then normalise.
