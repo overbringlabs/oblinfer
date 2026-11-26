@@ -71,3 +71,13 @@ ingine_add_test(NAME model_qwen35moe_mtp SOURCES test_qwen35moe_mtp.cpp
                 LIBS qwen35moe_mtp qwen35moe_mtp_kernels qwen35moe_attn qwen35moe_moe
                      ingine_kernels_dense_ops ingine_kernels_quant ingine_core CUDA::cudart
                 GPU MODEL ORACLE TIMEOUT 1800)
+
+# MTP acceptance (K0 of plans/20261126_qwen36-spec-decode.md): the real trunk records its residual per step, the
+# real drafter is replayed along those tokens in the MTP chain, and alpha1/2/3 come out with their counts and the
+# expected tokens per verify step, per prompt and pooled (needs QWEN35MOE_SNAPSHOT; ~23 GB of GPU memory)
+ingine_add_test(NAME model_qwen35moe_mtp_accept SOURCES test_qwen35moe_mtp_accept.cpp
+                LIBS qwen35moe_decoder qwen35moe_uploader qwen35moe_mtp qwen35moe_mtp_kernels
+                     qwen35moe_moe qwen35moe_attn qwen35moe_placement qwen35moe_names
+                     ingine_kernels_gdn ingine_kernels_quant ingine_kernels_dense_ops ingine_core
+                     CUDA::cudart
+                GPU MODEL TIMEOUT 3600)
