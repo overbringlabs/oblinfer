@@ -20,7 +20,7 @@ constexpr int kDownSteps = MOE_INTER / kWarpCols;
 
 // Gate and up share a launch: one warp takes the same row of both projections, so each x window is loaded
 // once and used by both dot products.
-constexpr int kRowsPerBlock = 64;
+constexpr int kRowsPerBlock = 8;
 constexpr int kGateUpGroups = MOE_INTER / kRowsPerBlock;
 constexpr int kGateUpBlocks = MOE_TOP_K * kGateUpGroups;
 constexpr int kGateUpRowsPerWarp = kRowsPerBlock / kWarps;
