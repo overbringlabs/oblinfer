@@ -24,12 +24,12 @@ __device__ __forceinline__ float warp_sum(float v) {
   return v;
 }
 
-__device__ __forceinline__ float kv_at(const void* base, KvType type, std::size_t index) {
+__device__ __forceinline__ float kv_at(const void* base, KvType type, std::size_t index, std::uint64_t values) {
   if (type == KvType::Bf16) {
     return __bfloat162float(static_cast<const __nv_bfloat16*>(base)[index]);
   }
-  const auto* block = static_cast<const KvBlock*>(base) + index / KV_BLOCK;
-  return float(block->qs[index % KV_BLOCK]) * __half2float(block->d);
+  return float(kv_q8_values(const_cast<void*>(base))[index]) *
+         __half2float(kv_q8_scales(base, values)[index / KV_BLOCK]);
 }
 
 __global__ void kv_store_bf16_kernel(DecodeAttnArgs args) {
@@ -63,13 +63,14 @@ __global__ __launch_bounds__(256) void kv_store_q8_kernel(DecodeAttnArgs args) {
   const float kd = kmax > 0.0f ? kmax / 127.0f : 1.0f;
   const float vd = vmax > 0.0f ? vmax / 127.0f : 1.0f;
 
+  const std::uint64_t values = std::uint64_t(args.max_pos) * ATTN_KV_HEADS * kDim;
   const std::size_t block = at / KV_BLOCK;
   if (lane == 0) {
-    static_cast<KvBlock*>(args.k_cache)[block].d = __float2half(kd);
-    static_cast<KvBlock*>(args.v_cache)[block].d = __float2half(vd);
+    const_cast<__half*>(kv_q8_scales(args.k_cache, values))[block] = __float2half(kd);
+    const_cast<__half*>(kv_q8_scales(args.v_cache, values))[block] = __float2half(vd);
   }
-  static_cast<KvBlock*>(args.k_cache)[block].qs[lane] = std::int8_t(__float2int_rn(k / kd));
-  static_cast<KvBlock*>(args.v_cache)[block].qs[lane] = std::int8_t(__float2int_rn(v / vd));
+  kv_q8_values(args.k_cache)[at + lane] = std::int8_t(__float2int_rn(k / kd));
+  kv_q8_values(args.v_cache)[at + lane] = std::int8_t(__float2int_rn(v / vd));
 }
 
 __global__ __launch_bounds__(kDim) void decode_kernel(DecodeAttnArgs args) {
@@ -78,6 +79,7 @@ __global__ __launch_bounds__(kDim) void decode_kernel(DecodeAttnArgs args) {
   const int kh = h / kGroup;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
+  const std::uint64_t cache_values = std::uint64_t(args.max_pos) * ATTN_KV_HEADS * kDim;
 
   __shared__ float scores[ATTN_CHUNK];
   __shared__ float warp_sums[kWarps];
@@ -104,7 +106,7 @@ __global__ __launch_bounds__(kDim) void decode_kernel(DecodeAttnArgs args) {
       const std::size_t kbase = (std::size_t(base + i) * ATTN_KV_HEADS + kh) * kDim;
       float dot = 0.0f;
 #pragma unroll
-      for (int r = 0; r < 8; ++r) dot += q_reg[r] * kv_at(args.k_cache, args.kv_type_k, kbase + lane + r * 32);
+      for (int r = 0; r < 8; ++r) dot += q_reg[r] * kv_at(args.k_cache, args.kv_type_k, kbase + lane + r * 32, cache_values);
       dot = warp_sum(dot);
       if (lane == 0) scores[i] = dot * scale;
     }
@@ -145,7 +147,7 @@ __global__ __launch_bounds__(kDim) void decode_kernel(DecodeAttnArgs args) {
     acc *= rescale;
     for (int i = 0; i < len; ++i) {
       const float p = expf(scores[i] - m_new);
-      acc += p * kv_at(args.v_cache, args.kv_type_v, (std::size_t(base + i) * ATTN_KV_HEADS + kh) * kDim + d);
+      acc += p * kv_at(args.v_cache, args.kv_type_v, (std::size_t(base + i) * ATTN_KV_HEADS + kh) * kDim + d, cache_values);
     }
 
     if (threadIdx.x == 0) {
@@ -186,8 +188,9 @@ __global__ __launch_bounds__(512) void kv_store_mixed_kernel(DecodeAttnArgs args
   const float d = vmax > 0.0f ? vmax / 127.0f : 1.0f;
   const std::size_t at = (std::size_t(args.pos) * ATTN_KV_HEADS + h) * kDim + base_d;
   const std::size_t block = at / KV_BLOCK;
-  if (lane == 0) static_cast<KvBlock*>(dst)[block].d = __float2half(d);
-  static_cast<KvBlock*>(dst)[block].qs[lane] = std::int8_t(__float2int_rn(v / d));
+  const std::uint64_t values = std::uint64_t(args.max_pos) * ATTN_KV_HEADS * kDim;
+  if (lane == 0) const_cast<__half*>(kv_q8_scales(dst, values))[block] = __float2half(d);
+  kv_q8_values(dst)[at + lane] = std::int8_t(__float2int_rn(v / d));
 }
 
 // One block per (query head, position split). Same inner maths as the single-block kernel, but the position range
@@ -199,6 +202,7 @@ __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args)
   const int kh = h / kGroup;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
+  const std::uint64_t cache_values = std::uint64_t(args.max_pos) * ATTN_KV_HEADS * kDim;
 
   const int per_split = (args.pos + 1 + args.splits - 1) / args.splits;
   const int begin = split * per_split;
@@ -235,7 +239,7 @@ __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args)
       const std::size_t kbase = (std::size_t(base + i) * ATTN_KV_HEADS + kh) * kDim;
       float dot = 0.0f;
 #pragma unroll
-      for (int r = 0; r < 8; ++r) dot += q_reg[r] * kv_at(args.k_cache, args.kv_type_k, kbase + lane + r * 32);
+      for (int r = 0; r < 8; ++r) dot += q_reg[r] * kv_at(args.k_cache, args.kv_type_k, kbase + lane + r * 32, cache_values);
       dot = warp_sum(dot);
       if (lane == 0) scores[i] = dot * scale;
     }
@@ -274,7 +278,7 @@ __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args)
     acc *= rescale;
     for (int i = 0; i < len; ++i) {
       const float p = expf(scores[i] - m_new);
-      acc += p * kv_at(args.v_cache, args.kv_type_v, (std::size_t(base + i) * ATTN_KV_HEADS + kh) * kDim + d);
+      acc += p * kv_at(args.v_cache, args.kv_type_v, (std::size_t(base + i) * ATTN_KV_HEADS + kh) * kDim + d, cache_values);
     }
     if (threadIdx.x == 0) {
       run_sum = run_sum * rescale + chunk_sum;
@@ -348,7 +352,7 @@ cudaError_t decode_attention(const DecodeAttnArgs& args, cudaStream_t stream) {
 namespace {
 
 // Host mirror of the store kernels, per side, so the reference sees exactly the bytes the device wrote.
-void store_side_cpu(const float* src, void* dst, KvType type, int pos, int h) {
+void store_side_cpu(const float* src, void* dst, KvType type, int pos, int h, int max_pos) {
   if (type == KvType::Bf16) {
     for (int d = 0; d < kDim; ++d) {
       const std::size_t at = (std::size_t(pos) * ATTN_KV_HEADS + h) * kDim + d;
@@ -362,26 +366,26 @@ void store_side_cpu(const float* src, void* dst, KvType type, int pos, int h) {
       vmax = std::max(vmax, std::fabs(src[h * kDim + block * KV_BLOCK + i]));
     }
     const float d = vmax > 0.0f ? vmax / 127.0f : 1.0f;
-    const std::size_t kb = ((std::size_t(pos) * ATTN_KV_HEADS + h) * kDim) / KV_BLOCK + block;
-    auto* blk = static_cast<KvBlock*>(dst) + kb;
-    blk->d = __float2half(d);
+    const std::size_t at = (std::size_t(pos) * ATTN_KV_HEADS + h) * kDim + block * KV_BLOCK;
+    const std::uint64_t values = std::uint64_t(max_pos) * ATTN_KV_HEADS * kDim;
+    const_cast<__half*>(kv_q8_scales(dst, values))[at / KV_BLOCK] = __float2half(d);
     for (int i = 0; i < KV_BLOCK; ++i) {
-      blk->qs[i] = std::int8_t(std::lround(src[h * kDim + block * KV_BLOCK + i] / d));
+      kv_q8_values(dst)[at + i] = std::int8_t(std::lround(src[h * kDim + block * KV_BLOCK + i] / d));
     }
   }
 }
 
 void store_cpu(const DecodeAttnArgs& args) {
   for (int h = 0; h < ATTN_KV_HEADS; ++h) {
-    store_side_cpu(args.k_new, args.k_cache, args.kv_type_k, args.pos, h);
-    store_side_cpu(args.v_new, args.v_cache, args.kv_type_v, args.pos, h);
+    store_side_cpu(args.k_new, args.k_cache, args.kv_type_k, args.pos, h, args.max_pos);
+    store_side_cpu(args.v_new, args.v_cache, args.kv_type_v, args.pos, h, args.max_pos);
   }
 }
 
-float read_cpu(const void* base, KvType type, std::size_t index) {
+float read_cpu(const void* base, KvType type, std::size_t index, std::uint64_t values) {
   if (type == KvType::Bf16) return __bfloat162float(static_cast<const __nv_bfloat16*>(base)[index]);
-  const auto* block = static_cast<const KvBlock*>(base) + index / KV_BLOCK;
-  return float(block->qs[index % KV_BLOCK]) * __half2float(block->d);
+  return float(kv_q8_values(const_cast<void*>(base))[index]) *
+         __half2float(kv_q8_scales(base, values)[index / KV_BLOCK]);
 }
 
 }  // namespace
@@ -394,6 +398,7 @@ void decode_attention_cpu(const DecodeAttnArgs& args) {
   std::vector<double> q(ATTN_HEADS * kDim);
   for (int i = 0; i < ATTN_HEADS * kDim; ++i) q[std::size_t(i)] = double(args.q[i]);
   std::vector<double> score(args.pos + 1);
+  const std::uint64_t cpu_values = std::uint64_t(args.max_pos) * ATTN_KV_HEADS * kDim;
   for (int hh = 0; hh < args.head_count; ++hh) {
     const int h = args.head_begin + hh;
     const int kh = h / kGroup;
@@ -401,7 +406,7 @@ void decode_attention_cpu(const DecodeAttnArgs& args) {
     for (int i = 0; i <= args.pos; ++i) {
       double dot = 0.0;
       for (int d = 0; d < kDim; ++d) {
-        dot += q[h * kDim + d] * double(read_cpu(args.k_cache, args.kv_type_k, (std::size_t(i) * ATTN_KV_HEADS + kh) * kDim + d));
+        dot += q[h * kDim + d] * double(read_cpu(args.k_cache, args.kv_type_k, (std::size_t(i) * ATTN_KV_HEADS + kh) * kDim + d, cpu_values));
       }
       score[i] = dot * scale;
       m = std::max(m, score[i]);
@@ -415,7 +420,7 @@ void decode_attention_cpu(const DecodeAttnArgs& args) {
       double acc = 0.0;
       for (int i = 0; i <= args.pos; ++i) {
         const std::size_t at = (std::size_t(i) * ATTN_KV_HEADS + kh) * kDim + d;
-        acc += score[i] * double(read_cpu(args.v_cache, args.kv_type_v, at));
+        acc += score[i] * double(read_cpu(args.v_cache, args.kv_type_v, at, cpu_values));
       }
       args.out[h * kDim + d] = float(acc / sum);
     }
