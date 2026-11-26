@@ -35,13 +35,16 @@ struct TextArena {
   std::vector<PlacedTensor> placed;  // one entry per source tensor, unmatched names excluded
   PlacementPlan plan;
   int experts_on_first = 0;
+  ExpertSplit split_policy;  // the numbers behind the split; `ideal` is 0 for an explicit override
   int tensors = 0;          // source tensors enqueued
   std::uint64_t uploaded_bytes = 0;
   double seconds = 0;
 };
 
-// `experts_on_first`: routed experts of each layer packed onto span 0; negative picks a split from the free
-// memory of devices 0 and 1 after the dense and model areas. Returns false and fills `error` when the
+// `experts_on_first`: routed experts of each layer packed onto span 0. Negative picks the split from the read
+// bandwidth of the two devices, clamped to what their free memory holds after the dense weights, the cache and
+// the workspace; the free-memory proportion stands in when the devices read alike. An explicit value is used
+// as given, so a split that does not fit fails at the allocation. Returns false and fills `error` when the
 // directory is not a safetensors checkpoint, a tensor name is unknown, the placement is malformed, or an
 // allocation fails.
 bool upload_text_model(const std::filesystem::path& snapshot_dir, bool include_mtp, int experts_on_first,

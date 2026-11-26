@@ -3,10 +3,12 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <vector>
 
+#include "arch/qwen35moe/kernels/attn/kv_bands.h"
 #include "core/safetensors.h"
 
 namespace ingine::arch::qwen35moe {
@@ -27,6 +29,38 @@ std::size_t expert_digits_end(const std::string& name, std::size_t* digits_begin
 bool is_per_expert(const std::string& name) {
   std::size_t begin = 0;
   return expert_digits_end(name, &begin) != std::string::npos;
+}
+
+// A packed expert block holds every expert in one tensor, so it goes to span 0 whole and no split can shrink it.
+bool packed_block(const ExpertBlockPlan& block) {
+  return block.slots.empty() || !is_per_expert(block.slots.front().source);
+}
+
+// What each span must still hold when the upload ends: the decoder's workspace, plus its share of the cache. A
+// split chosen only against free memory fills a span to the brim, and the decoder's first cache allocation then
+// fails long after the upload looked healthy.
+//
+// The workspace is the decoder's scratch, state, tables and logits: 85 MiB beyond the arena on span 0 and under
+// 10 MiB on span 1 when measured after init on supra, so 512 MiB covers both with room for the graph path.
+constexpr std::uint64_t kWorkspaceBytes = 512ull << 20;
+// The cache is the serving profile's: K and V of KV_HEADS x HEAD_DIM for each of the ten full-attention layers at
+// MAX_POS. q8_0 stores one byte per value plus a half-precision scale per 32 values, so 17/16 of the value
+// count; it measures 1,786 MiB on span 0 and 894 MiB on span 1 at 258048 positions.
+constexpr std::uint64_t kKvValues = std::uint64_t(NUM_FULL_LAYERS) * KV_HEADS * HEAD_DIM * 2 * MAX_POS;
+constexpr std::uint64_t kKvBytesAtMaxPos = kKvValues * 17 / 16;
+// Band ratio 2 puts two thirds of the cache on span 0. Below the banding break-even the whole cache stays on
+// span 0, but 1.0 GB at 98304 positions is less than that share, so the worst case is the banded one.
+constexpr std::uint64_t kKvBytesOnFirst = static_cast<std::uint64_t>(
+    static_cast<double>(kKvBytesAtMaxPos) * KV_BAND_RATIO / (1.0 + KV_BAND_RATIO));
+
+// Theoretical read bandwidth of `device` in bytes/s: the driver's peak memory clock (kHz) times the bus width,
+// two transfers per clock. Zero when the driver reports neither, which sends the split back to free memory.
+std::uint64_t device_bandwidth(int cuda_device) {
+  int clock_khz = 0, bus_bits = 0;
+  if (cudaDeviceGetAttribute(&clock_khz, cudaDevAttrMemoryClockRate, cuda_device) != cudaSuccess) return 0;
+  if (cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, cuda_device) != cudaSuccess) return 0;
+  if (clock_khz <= 0 || bus_bits <= 0) return 0;
+  return std::uint64_t(clock_khz) * 1000ull * 2ull * std::uint64_t(bus_bits) / 8ull;
 }
 
 }  // namespace
@@ -74,31 +108,53 @@ bool upload_text_model(const std::filesystem::path& snapshot_dir, bool include_m
   }
 
   constexpr int kSpans = 2;
-  int split = experts_on_first;
-  if (split < 0) {
-    // Reserve 1 GiB of slack on each card, put the model and dense areas on device 0, and divide the expert
-    // bytes by the remaining free memory.
-    std::uint64_t free_bytes[kSpans] = {0, 0};
-    std::uint64_t expert_bytes = 0;
-    std::uint64_t dense_bytes = 0;
-    for (const LayerPlan& lp : plan.layers) {
-      dense_bytes += lp.dense_bytes;
-      if (lp.has_experts) expert_bytes += lp.experts.bytes;
+  std::uint64_t expert_stride_sum = 0;  // bytes one expert adds to a span, every per-expert layer summed
+  std::uint64_t packed_expert_bytes = 0;
+  std::uint64_t dense_bytes = 0;
+  for (const LayerPlan& lp : plan.layers) {
+    dense_bytes += lp.dense_bytes;
+    if (!lp.has_experts) continue;
+    if (packed_block(lp.experts)) {
+      packed_expert_bytes += lp.experts.bytes;
+    } else {
+      expert_stride_sum += lp.experts.stride;
     }
+  }
+
+  int split = experts_on_first;
+  ExpertSplit decision;
+  if (split < 0) {
+    // The step waits for the slower card, so the split that finishes both together is proportional to their
+    // read bandwidth; the free memory decides only how far the fit allows it to go.
+    ExpertFit fit;
+    fit.per_expert_bytes = expert_stride_sum;
+    fit.packed_bytes = packed_expert_bytes;
     for (int d = 0; d < kSpans; ++d) {
       std::size_t free_b = 0, total_b = 0;
       if (cudaSetDevice(d) != cudaSuccess || cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
         return fail("cannot query the free memory of device " + std::to_string(d));
       }
-      free_bytes[d] = free_b > (1ull << 30) ? free_b - (1ull << 30) : 0;
+      const std::uint64_t reserve =
+          kWorkspaceBytes + (d == 0 ? kKvBytesOnFirst : kKvBytesAtMaxPos - kKvBytesOnFirst);
+      const std::uint64_t needed = (d == 0 ? model_bytes + dense_bytes : 0) + reserve;
+      fit.room[d] = std::uint64_t(free_b) > needed ? std::uint64_t(free_b) - needed : 0;
+      fit.bandwidth[d] = device_bandwidth(d);
     }
-    const std::uint64_t needed0 = model_bytes + dense_bytes;
-    const std::uint64_t room0 = free_bytes[0] > needed0 ? free_bytes[0] - needed0 : 0;
-    const std::uint64_t room1 = free_bytes[1];
-    const std::uint64_t total_room = room0 + room1;
-    split = total_room == 0 ? 0 : int(std::min<std::uint64_t>(
-        EXPERTS, (std::uint64_t(EXPERTS) * room0 + total_room - 1) / std::max<std::uint64_t>(1, total_room)));
-    if (expert_bytes > total_room) return fail("the expert blocks do not fit the free memory of both cards");
+    decision = plan_expert_split(fit);
+    if (!decision.fits) {
+      return fail("the routed experts do not fit both cards: " + std::to_string(fit.room[0] >> 20) +
+                  " MiB free for experts on device 0 and " + std::to_string(fit.room[1] >> 20) +
+                  " MiB on device 1, each expert " + std::to_string(fit.per_expert_bytes >> 20) + " MiB");
+    }
+    split = decision.experts_on_first;
+    std::fprintf(stderr,
+                 "[qwen35moe] expert split %d/%d: bandwidth %.0f/%.0f GB/s, %.0f/%.0f MiB free for experts, "
+                 "bandwidth split %d, fit range %d..%d%s\n",
+                 split, EXPERTS - split, double(fit.bandwidth[0]) / 1e9, double(fit.bandwidth[1]) / 1e9,
+                 double(fit.room[0]) / (1u << 20), double(fit.room[1]) / (1u << 20), decision.ideal,
+                 decision.fit_low, decision.fit_high,
+                 decision.bandwidth_balanced ? "" : " (the fit holds it below the bandwidth split)");
+    std::fflush(stderr);
   }
   split = std::clamp(split, 0, EXPERTS);
 
@@ -116,8 +172,7 @@ bool upload_text_model(const std::filesystem::path& snapshot_dir, bool include_m
     layout[i].dense = cursor[0];
     cursor[0] += lp.dense_bytes;
     if (!lp.has_experts) continue;
-    const bool packed = lp.experts.slots.empty() ? true : !is_per_expert(lp.experts.slots.front().source);
-    if (packed) {
+    if (packed_block(lp.experts)) {
       layout[i].experts[0] = cursor[0];
       layout[i].experts_per_span[0] = 1;
       cursor[0] += lp.experts.bytes;
@@ -134,6 +189,8 @@ bool upload_text_model(const std::filesystem::path& snapshot_dir, bool include_m
   TextArena arena;
   arena.plan = plan;
   arena.experts_on_first = split;
+  arena.split_policy = decision;
+  arena.split_policy.experts_on_first = split;
   for (int d = 0; d < kSpans; ++d) {
     DeviceSpan span;
     span.cuda_device = d;
@@ -170,8 +227,7 @@ bool upload_text_model(const std::filesystem::path& snapshot_dir, bool include_m
       }
     }
     if (!lp.has_experts) continue;
-    const bool packed = !is_per_expert(lp.experts.slots.front().source);
-    if (packed) {
+    if (packed_block(lp.experts)) {
       for (const TensorSlot& slot : lp.experts.slots) {
         if (!enqueue(0, slot.source, base(0) + layout[i].experts[0] + slot.offset)) {
           return fail("missing tensor: " + slot.source);

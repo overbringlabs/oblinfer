@@ -172,4 +172,33 @@ std::optional<PlacementPlan> plan_placement(std::span<const TensorSize> tensors,
   return plan;
 }
 
+ExpertSplit plan_expert_split(const ExpertFit& fit) {
+  ExpertSplit out;
+  // The room each span allows. Both bounds are exact because expert bytes are linear in the split: every
+  // per-expert layer contributes the same stride for each of its experts, and a packed block cannot move.
+  out.fit_high = EXPERTS;
+  if (fit.per_expert_bytes > 0) {
+    const std::uint64_t roomable = fit.room[0] > fit.packed_bytes ? fit.room[0] - fit.packed_bytes : 0;
+    out.fit_high = int(std::min<std::uint64_t>(EXPERTS, roomable / fit.per_expert_bytes));
+    const std::uint64_t second = fit.room[1] / fit.per_expert_bytes;
+    out.fit_low = second >= EXPERTS ? 0 : EXPERTS - int(second);
+  }
+  out.fits = out.fit_low <= out.fit_high;
+
+  const std::uint64_t bw0 = fit.bandwidth[0];
+  const std::uint64_t bw1 = fit.bandwidth[1];
+  // Within a fifth the two cards read alike, and the bandwidth split then moves fewer experts than the
+  // free-memory mismatch it would create; the room proportional split fills both spans instead.
+  out.bandwidth_symmetric = bw0 == 0 || bw1 == 0 || std::max(bw0, bw1) * 5 < std::min(bw0, bw1) * 6;
+  const std::uint64_t weight0 = out.bandwidth_symmetric ? fit.room[0] : bw0;
+  const std::uint64_t weight1 = out.bandwidth_symmetric ? fit.room[1] : bw1;
+  const std::uint64_t total = weight0 + weight1;
+  out.ideal = total == 0 ? 0 : int(std::min<std::uint64_t>(
+                                      EXPERTS, (std::uint64_t(EXPERTS) * weight0 + total / 2) / total));
+
+  out.experts_on_first = out.fits ? std::clamp(out.ideal, out.fit_low, out.fit_high) : out.fit_high;
+  out.bandwidth_balanced = out.fits && !out.bandwidth_symmetric && out.experts_on_first == out.ideal;
+  return out;
+}
+
 }  // namespace ingine::arch::qwen35moe

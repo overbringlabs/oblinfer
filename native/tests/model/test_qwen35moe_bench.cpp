@@ -61,12 +61,27 @@ int main() {
     return 1;
   }
 
-  std::printf("expert split %d/%d\n", arena.experts_on_first, qwen::EXPERTS - arena.experts_on_first);
+  std::printf("expert split %d/%d (bandwidth split %d, fit range %d..%d); spans:", arena.experts_on_first,
+              qwen::EXPERTS - arena.experts_on_first, arena.split_policy.ideal, arena.split_policy.fit_low,
+              arena.split_policy.fit_high);
+  for (const auto& span : arena.spans) std::printf(" dev%d=%.2f GiB", span.cuda_device, span.bytes / 1073741824.0);
+  std::printf("\n");
   qwen::Decoder decoder;
   if (!decoder.init(arena, max_pos, &error)) {
     std::printf("FAIL decoder init: %s\n", error.c_str());
     return 1;
   }
+  // Headroom left on each card once the weights, the cache and the workspace are in: what a wider split would have
+  // had to fit into.
+  for (const auto& span : arena.spans) {
+    std::size_t free_b = 0, total_b = 0;
+    cudaSetDevice(span.cuda_device);
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+      std::printf("  dev%d after init: %.0f MiB free of %.0f\n", span.cuda_device, free_b / 1048576.0,
+                  total_b / 1048576.0);
+    }
+  }
+  cudaSetDevice(arena.spans[0].cuda_device);
 
   // Prompt ids: a fixed rotation of ordinary text tokens, so the timing is representative.
   const std::vector<int> base = {760, 6511, 314, 9338, 369, 11, 264, 3177, 34756, 364, 1141, 8807,

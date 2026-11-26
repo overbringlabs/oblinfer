@@ -55,9 +55,59 @@ bool compare_prefix(const std::string& tag, void* device_ptr, std::uint64_t byte
   return ok;
 }
 
+// The split policy on the numbers the target box produces: 896 GB/s against 448 GB/s, 9517 MiB of span 1 holding
+// 141 experts, the MTP block packed onto span 0. Host only, so it runs without the checkpoint.
+bool split_policy_checks() {
+  constexpr std::uint64_t kMib = 1ull << 20;
+  constexpr std::uint64_t kGiB = 1ull << 30;
+  const std::uint64_t per_expert = 70775162;  // 9517 MiB / 141, measured on supra
+  const std::uint64_t packed = 1536 * kMib;   // MTP experts: one packed tensor per projection, no split
+
+  qwen::ExpertFit fit;
+  fit.per_expert_bytes = per_expert;
+  fit.packed_bytes = packed;
+  fit.bandwidth[0] = 896000000000ull;
+  fit.bandwidth[1] = 448000000000ull;
+
+  bool ok = true;
+  auto report = [&](const char* what, bool pass, const qwen::ExpertSplit& s) {
+    std::printf("%s %s: %d/%d (ideal %d, fit %d..%d)\n", pass ? "PASS" : "FAIL", what, s.experts_on_first,
+                qwen::EXPERTS - s.experts_on_first, s.ideal, s.fit_low, s.fit_high);
+    ok &= pass;
+  };
+
+  // Room for the bandwidth split: two thirds of the experts on the fast card.
+  fit.room[0] = 20 * kGiB;
+  fit.room[1] = 15 * kGiB;
+  qwen::ExpertSplit s = qwen::plan_expert_split(fit);
+  report("bandwidth split", s.bandwidth_balanced && s.experts_on_first == 171 && s.fits, s);
+
+  // The fast card's room caps it at 133 experts: the clamp wins over the bandwidth split.
+  fit.room[0] = packed + 133 * per_expert;
+  s = qwen::plan_expert_split(fit);
+  report("fit clamp", s.fits && !s.bandwidth_balanced && s.fit_high == 133 && s.experts_on_first == 133, s);
+
+  // Alike cards: bandwidth says nothing, so the room proportion decides and it is equal rooms -> half.
+  fit.room[0] = 10 * kGiB;
+  fit.room[1] = 10 * kGiB;
+  fit.bandwidth[1] = fit.bandwidth[0];
+  s = qwen::plan_expert_split(fit);
+  report("symmetric cards", s.bandwidth_symmetric && s.experts_on_first == 128 && !s.bandwidth_balanced, s);
+
+  // Neither card holds a single expert.
+  fit.room[0] = 0;
+  fit.room[1] = 0;
+  s = qwen::plan_expert_split(fit);
+  report("no room", !s.fits, s);
+
+  return ok;
+}
+
 }  // namespace
 
 int main() {
+  if (!split_policy_checks()) return 1;
+
   const char* snapshot = std::getenv("QWEN35MOE_SNAPSHOT");
   if (!snapshot) {
     std::printf("skip: set QWEN35MOE_SNAPSHOT to the snapshot directory\n");
@@ -93,8 +143,10 @@ int main() {
               static_cast<unsigned long long>(arena.uploaded_bytes), static_cast<unsigned long long>(expected));
   ok &= bytes_ok;
 
-  std::printf("split: %d experts on span 0, %d on span 1; spans:", arena.experts_on_first,
-              qwen::EXPERTS - arena.experts_on_first);
+  std::printf("split: %d experts on span 0, %d on span 1 (bandwidth split %d, fit range %d..%d, %s); spans:",
+              arena.experts_on_first, qwen::EXPERTS - arena.experts_on_first, arena.split_policy.ideal,
+              arena.split_policy.fit_low, arena.split_policy.fit_high,
+              arena.split_policy.bandwidth_balanced ? "balanced" : "clamped");
   for (const auto& span : arena.spans) {
     std::printf(" dev%d=%llu MiB", span.cuda_device, static_cast<unsigned long long>(span.bytes >> 20));
   }
