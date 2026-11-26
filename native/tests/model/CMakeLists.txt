@@ -50,13 +50,13 @@ ingine_add_test(NAME model_qwen35moe_upload SOURCES test_qwen35moe_upload.cpp
 # One-token decoder smoke test on the real checkpoint (needs QWEN35MOE_SNAPSHOT)
 # OBJECT libraries do not propagate their objects, so every one the decoder calls is listed here.
 ingine_add_test(NAME model_qwen35moe_decoder SOURCES test_qwen35moe_decoder.cpp
-                LIBS qwen35moe_decoder qwen35moe_uploader qwen35moe_moe qwen35moe_attn
+                LIBS qwen35moe_decoder qwen35moe_uploader qwen35moe_moe qwen35moe_attn qwen35moe_batch
                      qwen35moe_placement qwen35moe_names ingine_kernels_gdn ingine_kernels_quant
                      ingine_kernels_dense_ops ingine_core CUDA::cudart TIMEOUT 1800)
 
 # Depth benchmark: prefill then decode, tok/s only (QWEN35MOE_DEPTH, QWEN35MOE_GEN)
 ingine_add_test(NAME model_qwen35moe_bench SOURCES test_qwen35moe_bench.cpp
-                LIBS qwen35moe_decoder qwen35moe_uploader qwen35moe_moe qwen35moe_attn
+                LIBS qwen35moe_decoder qwen35moe_uploader qwen35moe_moe qwen35moe_attn qwen35moe_batch
                      qwen35moe_placement qwen35moe_names ingine_kernels_gdn ingine_kernels_quant
                      ingine_kernels_dense_ops ingine_core CUDA::cudart TIMEOUT 5400)
 
@@ -65,19 +65,30 @@ ingine_add_test(NAME model_qwen35moe_moe_paths SOURCES test_qwen35moe_moe_paths.
                 LIBS qwen35moe_moe qwen35moe_uploader qwen35moe_placement qwen35moe_names
                      ingine_kernels_quant ingine_core CUDA::cudart TIMEOUT 900)
 
-# MTP draft head: the 19 real tensors, an FP64 reference of the whole block in the test, both cache formats, and
-# the per-stage cost at depth (needs QWEN35MOE_SNAPSHOT; ~3 GB of GPU memory on the first card)
+# MTP draft head: the 19 real tensors, an FP64 reference of the whole block in the test, both cache formats, the
+# per-stage cost at depth, and the batched chain (rows against serial drafts, cost at 1k and 262k)
+# (needs QWEN35MOE_SNAPSHOT; ~3 GB of GPU memory on the first card)
 ingine_add_test(NAME model_qwen35moe_mtp SOURCES test_qwen35moe_mtp.cpp
-                LIBS qwen35moe_mtp qwen35moe_mtp_kernels qwen35moe_attn qwen35moe_moe
+                LIBS qwen35moe_mtp qwen35moe_mtp_kernels qwen35moe_batch qwen35moe_attn qwen35moe_moe
                      ingine_kernels_dense_ops ingine_kernels_quant ingine_core CUDA::cudart
                 GPU MODEL ORACLE TIMEOUT 1800)
 
 # MTP acceptance (K0 of plans/20261126_qwen36-spec-decode.md): the real trunk records its residual per step, the
-# real drafter is replayed along those tokens in the MTP chain, and alpha1/2/3 come out with their counts and the
-# expected tokens per verify step, per prompt and pooled (needs QWEN35MOE_SNAPSHOT; ~23 GB of GPU memory)
+# real drafter is replayed along those tokens in the MTP chain as one draft_chain() per position, and alpha1..alpha8
+# come out with their counts and the expected tokens per verify step, per prompt and pooled, next to the measured
+# cost of a chain that long (needs QWEN35MOE_SNAPSHOT; ~23 GB of GPU memory)
 ingine_add_test(NAME model_qwen35moe_mtp_accept SOURCES test_qwen35moe_mtp_accept.cpp
-                LIBS qwen35moe_decoder qwen35moe_uploader qwen35moe_mtp qwen35moe_mtp_kernels
+                LIBS qwen35moe_decoder qwen35moe_uploader qwen35moe_mtp qwen35moe_mtp_kernels qwen35moe_batch
                      qwen35moe_moe qwen35moe_attn qwen35moe_placement qwen35moe_names
                      ingine_kernels_gdn ingine_kernels_quant ingine_kernels_dense_ops ingine_core
                      CUDA::cudart
+                GPU MODEL TIMEOUT 3600)
+
+# Verify width (K2/K3 of plans/20261126_qwen36-spec-decode.md): step_batch(ids, n) against n single steps on the
+# real checkpoint — n = 1 bit-identical to step(), identical ids for n = 2..4 (the gate) with the logits inside a
+# 5e-2 smoke bound, and the ms-per-step table at 1024 and 258048 (needs QWEN35MOE_SNAPSHOT; ~23 GB)
+ingine_add_test(NAME model_qwen35moe_step_batch SOURCES test_qwen35moe_step_batch.cpp
+                LIBS qwen35moe_decoder qwen35moe_uploader qwen35moe_moe qwen35moe_attn qwen35moe_batch
+                     qwen35moe_placement qwen35moe_names ingine_kernels_gdn ingine_kernels_quant
+                     ingine_kernels_dense_ops ingine_core CUDA::cudart
                 GPU MODEL TIMEOUT 3600)

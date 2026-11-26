@@ -4,10 +4,13 @@
 // ended on: decoder.cu's QWEN35MOE_DUMP_STATE hook appends {int32 pos, int32 token, float32 x[2048]}. The
 // drafter (MtpDrafter) is then replayed along the same token sequence in the MTP chain llama.cpp uses:
 //   draft 1 = MTP(embed(t[p+1]), h[p]) at position p+1, predicting t[p+2];
-//   draft 2 = MTP(embed(draft 1), last_hidden of draft 1) at position p+2, predicting t[p+3];
-//   draft 3 likewise from draft 2.
-// Drafts 2 and 3 only exist where the earlier drafts of that chain were accepted, which is what makes the
-// expected tokens per verify step 1 + a1 + a1*a2 + a1*a2*a3 for n = 2, 3, 4 candidates.
+//   draft 2 = MTP(embed(t[p+2]), h' of draft 1) at position p+2, predicting t[p+3];
+//   draft i likewise from draft i-1, up to eight drafts.
+// Each position runs one draft_chain(): the forwards are per token, the trunk's lm_head once for the whole chain.
+// Drafts 2.. only count where the earlier drafts of that chain were accepted, which is what makes the expected
+// tokens per verify step 1 + a1 + a1*a2 + ... + a1*...*a(n-1) for n = k + 1 candidates. The chain is carried to
+// eight drafts and the table prints n = 2..9, alongside the measured cost of a chain that long, so the draft
+// count is a measured decision and not a guess.
 //
 // Prompt positions are tallied apart from generated ones: the target of a sample belongs to the generated
 // region when its index in the token sequence is at or past the prompt length, and continuations behave
@@ -27,6 +30,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -268,40 +272,43 @@ bool run_trunk(const qwen::TextArena& arena, const std::vector<int>& prompt, con
 
 // ------------------------------------------------------------------------------------------------- the tallies
 
-// s1/s2/s3 are the samples each rate is out of: s2 counts only chains whose draft 1 was accepted (and whose
-// target exists), s3 only those whose drafts 1 and 2 were. That is the denominator the multiplier uses.
+// s[i]/a[i] are the samples and hits of draft i + 1: s[0] counts the chains with a target for draft 1, s[1] only
+// those whose draft 1 was accepted (and whose target exists), and so on. That is the denominator the multiplier
+// uses. The chain is carried to kChainDrafts drafts, so the table reaches alpha8.
+constexpr int kChainDrafts = qwen::kMtpChainMax;
+
 struct Tally {
-  long long s1 = 0, a1 = 0;
-  long long s2 = 0, a2 = 0;
-  long long s3 = 0, a3 = 0;
+  std::array<long long, kChainDrafts> s{};
+  std::array<long long, kChainDrafts> a{};
 
   void add(const Tally& o) {
-    s1 += o.s1;
-    a1 += o.a1;
-    s2 += o.s2;
-    a2 += o.a2;
-    s3 += o.s3;
-    a3 += o.a3;
+    for (int i = 0; i < kChainDrafts; ++i) {
+      s[std::size_t(i)] += o.s[std::size_t(i)];
+      a[std::size_t(i)] += o.a[std::size_t(i)];
+    }
   }
 };
 
 struct Rates {
-  double a1 = 0.0, a2 = 0.0, a3 = 0.0;
+  std::array<double, kChainDrafts> a{};
 };
 
 Rates rates_of(const Tally& t) {
   Rates r;
-  r.a1 = t.s1 ? double(t.a1) / double(t.s1) : 0.0;
-  r.a2 = t.s2 ? double(t.a2) / double(t.s2) : 0.0;
-  r.a3 = t.s3 ? double(t.a3) / double(t.s3) : 0.0;
+  for (int i = 0; i < kChainDrafts; ++i) {
+    r.a[std::size_t(i)] = t.s[std::size_t(i)] ? double(t.a[std::size_t(i)]) / double(t.s[std::size_t(i)]) : 0.0;
+  }
   return r;
 }
 
-// 1 + a1 for n = 2, 1 + a1 + a1*a2 for n = 3, the full chain for n = 4.
+// 1 + a1 + a1*a2 + ... + a1*...*a(n-1): the tokens one verify step of n candidates yields. A rate with no
+// samples is zero here, so the terms past the measured depth drop out instead of being invented.
 double expected_tokens(const Rates& r, int n) {
-  double e = 1.0 + r.a1;
-  if (n >= 3) e += r.a1 * r.a2;
-  if (n >= 4) e += r.a1 * r.a2 * r.a3;
+  double e = 1.0, run = 1.0;
+  for (int i = 0; i < n - 1 && i < kChainDrafts; ++i) {
+    run *= r.a[std::size_t(i)];
+    e += run;
+  }
   return e;
 }
 
@@ -313,8 +320,7 @@ struct ChainResult {
   int steps = 0;
   Tally all;
   Tally generated_only;
-  double draft_ms = 0.0;      // draft() calls only, summed
-  double hidden_ms = 0.0;     // the BF16 row rebuilds between chained drafts
+  double draft_ms = 0.0;      // the draft_chain() calls, summed
   long long drafts = 0;
   // Pairing diagnostics: an off-by-one in the chain (draft 1 pointed at the token it was fed, or at the one
   // before it, instead of the trunk's next token) would show up as hits here rather than as the alpha1 above.
@@ -324,34 +330,34 @@ struct ChainResult {
 
 // ------------------------------------------------------------------------------------------------ the chain
 
-// Replays the MTP chain over `run`'s token sequence. The drafter's cache row p is the K/V of the token fed at
-// position p with the trunk hidden of p-1, which is exactly what draft 1 of the chain at p-1 writes; row 0 has
-// no such hidden, so it is seeded with the only row available (t[0] with h[0]) to give the first positions a
-// cache to attend over, and that seed is not scored.
+// Replays the MTP chain over `run`'s token sequence with the module's batched head. The drafter's cache row p is
+// the K/V of the token fed at position p with the trunk hidden of p-1, which is exactly what draft 1 of the chain
+// at p-1 writes; row 0 has no such hidden, so it is seeded with the only row available (t[0] with h[0]) to give
+// the first positions a cache to attend over, and that seed is not scored.
+//
+// Each position runs one draft_chain() of up to kChainDrafts candidates: the n forwards are per token, the trunk's
+// lm_head runs once over all n rows. Draft i's input does not depend on whether drafts 1..i-1 were accepted (the
+// tokens are the trunk's own), so a full chain computes every row the conditional walk would have reached and the
+// tally applies the acceptance condition to the answers, not to the work.
 bool run_chain(qwen::MtpDrafter& drafter, const TrunkRun& run, int prompt_len, ChainResult* out,
                std::string* error) {
   const int n = int(run.steps.size());
-  if (n < 4) {
-    *error = "a chain needs at least four trunk steps";
+  if (n < kChainDrafts + 2) {
+    *error = "a chain needs at least " + std::to_string(kChainDrafts + 2) + " trunk steps";
     return false;
   }
   std::vector<int> tok(std::size_t(n) + 1);
   for (int i = 0; i < n; ++i) tok[std::size_t(i)] = run.steps[std::size_t(i)].token;
   tok[std::size_t(n)] = run.tail_token;
 
-  DeviceArray<__nv_bfloat16> d_hidden{std::size_t(HIDDEN)};
+  DeviceArray<__nv_bfloat16> d_hidden{static_cast<std::size_t>(HIDDEN)};
   std::vector<__nv_bfloat16> row(static_cast<std::size_t>(HIDDEN));
-  std::vector<float> last(HIDDEN);
 
   // What draft() takes is a BF16 row; the trunk's residual and the drafter's h' are both FP32 on the device.
   auto upload_row = [&](const float* src) {
     for (int i = 0; i < HIDDEN; ++i) row[std::size_t(i)] = float_to_bf16(src[i]);
     INGINE_TEST_CUDA(cudaMemcpy(d_hidden.get(), row.data(), HIDDEN * sizeof(__nv_bfloat16),
                                 cudaMemcpyHostToDevice));
-  };
-  auto read_last_hidden = [&] {
-    INGINE_TEST_CUDA(cudaMemcpy(last.data(), drafter.last_hidden(), HIDDEN * sizeof(float),
-                                cudaMemcpyDeviceToHost));
   };
 
   int seed_token = -1;
@@ -362,56 +368,32 @@ bool run_chain(qwen::MtpDrafter& drafter, const TrunkRun& run, int prompt_len, C
   out->prompt_tokens = prompt_len;
   out->steps = n;
 
-  int d1 = -1, d2 = -1, d3 = -1;
+  std::vector<int> drafted(kChainDrafts);
   for (int p = 0; p + 2 <= n; ++p) {
-    // ---- draft 1: the trunk's token at p+1 seen from the trunk's hidden at p, at position p+1 ----
+    // Draft i consumes tok[p + i] and predicts tok[p + 1 + i]; the last draft with a target caps the chain.
+    const int len = std::min(kChainDrafts, n - p - 1);
     upload_row(run.steps[std::size_t(p)].residual.data());
-    auto t0 = std::chrono::steady_clock::now();
-    if (!drafter.draft(tok[std::size_t(p) + 1], d_hidden.get(), p + 1, &d1, error)) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!drafter.draft_chain(tok.data() + p + 1, d_hidden.get(), len, p + 1, drafted.data(), error)) return false;
     out->draft_ms += ms_since(t0);
-    ++out->drafts;
-    ++out->all.s1;
-    const bool grad1 = (p + 2) >= prompt_len;
-    if (grad1) ++out->generated_only.s1;
-    if (d1 == tok[std::size_t(p) + 1]) ++out->fed_hits;
-    if (d1 == tok[std::size_t(p)]) ++out->prev_hits;
-    if (d1 != tok[std::size_t(p) + 2]) continue;
-    ++out->all.a1;
-    if (grad1) ++out->generated_only.a1;
-    if (p + 3 > n) continue;
-
-    // ---- draft 2: draft 1's own token and its own h', at position p+2 ----
-    t0 = std::chrono::steady_clock::now();
-    read_last_hidden();
-    upload_row(last.data());
-    out->hidden_ms += ms_since(t0);
-    t0 = std::chrono::steady_clock::now();
-    if (!drafter.draft(d1, d_hidden.get(), p + 2, &d2, error)) return false;
-    out->draft_ms += ms_since(t0);
-    ++out->drafts;
-    ++out->all.s2;
-    const bool grad2 = (p + 3) >= prompt_len;
-    if (grad2) ++out->generated_only.s2;
-    if (d2 != tok[std::size_t(p) + 3]) continue;
-    ++out->all.a2;
-    if (grad2) ++out->generated_only.a2;
-    if (p + 4 > n) continue;
-
-    // ---- draft 3: the same from draft 2 ----
-    t0 = std::chrono::steady_clock::now();
-    read_last_hidden();
-    upload_row(last.data());
-    out->hidden_ms += ms_since(t0);
-    t0 = std::chrono::steady_clock::now();
-    if (!drafter.draft(d2, d_hidden.get(), p + 3, &d3, error)) return false;
-    out->draft_ms += ms_since(t0);
-    ++out->drafts;
-    ++out->all.s3;
-    const bool grad3 = (p + 4) >= prompt_len;
-    if (grad3) ++out->generated_only.s3;
-    if (d3 != tok[std::size_t(p) + 4]) continue;
-    ++out->all.a3;
-    if (grad3) ++out->generated_only.a3;
+    out->drafts += len;
+    for (int i = 0; i < len; ++i) {
+      // s[i] needs drafts 1..i accepted and a target at p + 2 + i; both are decided in this loop.
+      const int target = p + 2 + i;
+      if (target > n) break;
+      ++out->all.s[std::size_t(i)];
+      const bool generated = target >= prompt_len;
+      if (generated) ++out->generated_only.s[std::size_t(i)];
+      if (i == 0) {
+        // Pairing diagnostics on draft 1: an off-by-one in the chain (the token it was fed, or the one before it,
+        // instead of the trunk's next token) would show up here rather than as the alpha1 above.
+        if (drafted[0] == tok[std::size_t(p + 1)]) ++out->fed_hits;
+        if (drafted[0] == tok[std::size_t(p)]) ++out->prev_hits;
+      }
+      if (drafted[std::size_t(i)] != tok[std::size_t(target)]) break;
+      ++out->all.a[std::size_t(i)];
+      if (generated) ++out->generated_only.a[std::size_t(i)];
+    }
   }
   return true;
 }
@@ -451,16 +433,27 @@ bool probe_drafter(qwen::MtpDrafter& drafter, int pos, const std::vector<float>&
 
 // ------------------------------------------------------------------------------------------------- the table
 
+// One line of rates with their counts, one of the expected tokens per verify step they imply. n = k + 1
+// candidates for k drafts, so the n column of a rate is the one that rate first contributes to.
 void print_header() {
-  std::printf("  %-14s %4s %4s   %-16s %-16s %-16s %5s %5s %5s\n", "prompt", "ctx", "gen", "alpha1",
-              "alpha2", "alpha3", "n=2", "n=3", "n=4");
+  std::printf("  %-14s %4s %4s", "prompt", "ctx", "gen");
+  for (int i = 1; i <= kChainDrafts; ++i) {
+    char cell[32];
+    std::snprintf(cell, sizeof cell, "alpha%d", i);
+    std::printf(" | %-13s", cell);
+  }
+  std::printf("\n");
 }
 
 void print_row(const std::string& label, int ctx, int gen, const Tally& t) {
   const Rates r = rates_of(t);
-  std::printf("  %-14s %4d %4d   %5.3f %4lld/%-5lld %5.3f %4lld/%-5lld %5.3f %4lld/%-5lld %5.2f %5.2f %5.2f\n",
-              label.c_str(), ctx, gen, r.a1, t.a1, t.s1, r.a2, t.a2, t.s2, r.a3, t.a3, t.s3,
-              expected_tokens(r, 2), expected_tokens(r, 3), expected_tokens(r, 4));
+  std::printf("  %-14s %4d %4d", label.c_str(), ctx, gen);
+  for (int i = 0; i < kChainDrafts; ++i) {
+    std::printf(" | %5.3f %3lld/%-3lld", r.a[std::size_t(i)], t.a[std::size_t(i)], t.s[std::size_t(i)]);
+  }
+  std::printf("\n  %-14s %4s %4s", "  tokens/step", "", "");
+  for (int n = 2; n <= kChainDrafts + 1; ++n) std::printf(" | n=%-2d %5.2f  ", n, expected_tokens(r, n));
+  std::printf("\n");
 }
 
 }  // namespace
@@ -570,30 +563,36 @@ int main() {
       for (const ChainResult& r : v) {
         const Tally& t = generated ? r.generated_only : r.all;
         const Rates q = rates_of(t);
-        const long long samples = which == 1 ? t.s1 : (which == 2 ? t.s2 : t.s3);
-        if (samples == 0) continue;
-        const double a = which == 1 ? q.a1 : (which == 2 ? q.a2 : q.a3);
-        *lo = std::min(*lo, a);
-        *hi = std::max(*hi, a);
+        if (t.s[std::size_t(which)] == 0) continue;
+        *lo = std::min(*lo, q.a[std::size_t(which)]);
+        *hi = std::max(*hi, q.a[std::size_t(which)]);
         ++*rows;
       }
     };
-    std::printf("\nspread over prompts (all positions): ");
-    for (int which = 1; which <= 3; ++which) {
-      double lo = 0, hi = 0;
-      int rows = 0;
-      spread(results, false, which, &lo, &hi, &rows);
-      if (rows) std::printf("alpha%d %.3f..%.3f (%d prompts)  ", which, lo, hi, rows);
+    for (bool generated : {false, true}) {
+      std::printf("\nspread over prompts (%s):\n  ", generated ? "generated positions" : "all positions");
+      for (int which = 0; which < kChainDrafts; ++which) {
+        double lo = 0, hi = 0;
+        int rows = 0;
+        spread(results, generated, which, &lo, &hi, &rows);
+        if (rows) std::printf("alpha%d %.3f..%.3f (%d)  ", which + 1, lo, hi, rows);
+      }
+      if (generated) std::printf("\n");
     }
-    std::printf("\n");
 
-    // The multiplies the plan's arithmetic uses, from these rates.
+    // What each draft is worth in tokens, pooled: the product of the rates up to and including draft i, which is
+    // the marginal gain of carrying the chain one draft further.
     const Rates all = rates_of(pooled);
     const Rates gen = rates_of(pooled_gen);
-    std::printf("multipliers from the pooled rates: a1 %.3f, a1*a2 %.3f, a1*a2*a3 %.3f (all positions); "
-                "%.3f, %.3f, %.3f (generated)\n",
-                all.a1, all.a1 * all.a2, all.a1 * all.a2 * all.a3, gen.a1, gen.a1 * gen.a2,
-                gen.a1 * gen.a2 * gen.a3);
+    for (const Rates* r : {&all, &gen}) {
+      std::printf("marginal tokens per draft, pooled (%s):\n          ", r == &all ? "all positions" : "generated");
+      double run = 1.0;
+      for (int i = 0; i < kChainDrafts; ++i) {
+        run *= r->a[std::size_t(i)];
+        std::printf(" a%-2d %.3f", i + 1, run);
+      }
+      std::printf("\n");
+    }
 
     long long fed = 0, prev = 0;
     for (const ChainResult& r : results) {
@@ -602,15 +601,14 @@ int main() {
     }
     std::printf("pairing check: over %lld draft-1 calls, the draft equalled the token it was fed %lld times and "
                 "the token before it %lld times; a shifted comparison cannot produce the alpha1 above\n",
-                pooled.s1, fed, prev);
+                pooled.s[0], fed, prev);
 
     // Cost side at the depth the chains ran: the drafter's own latency, and what one trunk token costs there.
-    double draft_ms = 0.0, hidden_ms = 0.0;
+    double draft_ms = 0.0;
     long long drafts = 0;
     double prefill_ms = 0.0, decode_ms = 0.0;
     for (std::size_t i = 0; i < results.size(); ++i) {
       draft_ms += results[i].draft_ms;
-      hidden_ms += results[i].hidden_ms;
       drafts += results[i].drafts;
       prefill_ms += runs[i].prefill_ms_per_step;
       decode_ms += runs[i].decode_ms_per_step;
@@ -626,10 +624,9 @@ int main() {
       qwen::free_text_arena(&arena);
       return 1;
     }
-    std::printf("cost: %lld drafts over the chains, %.3f ms/draft (%.3f ms of BF16 row rebuild between chained "
-                "drafts, %.3f ms each)\n",
-                drafts, drafts ? draft_ms / double(drafts) : 0.0, hidden_ms,
-                drafts ? hidden_ms / double(drafts) : 0.0);
+    std::printf("cost: %lld drafts over the chains, %.3f ms/draft, the BF16 row rebuild between drafts on the "
+                "device\n",
+                drafts, drafts ? draft_ms / double(drafts) : 0.0);
     std::printf("cost: probe at pos %d: %.3f ms/draft = dense %.3f + attn %.3f + routed %.3f + shared %.3f + "
                 "head %.3f; one trunk token at that depth is %.2f ms (decode) and %.2f ms (prefill)\n",
                 deepest, probe_ms, stage.dense_ms, stage.attn_ms, stage.routed_ms, stage.shared_ms, stage.head_ms,
@@ -638,7 +635,59 @@ int main() {
                 "this depth, before the verify step itself)\n",
                 3.0 * probe_ms, 100.0 * 3.0 * probe_ms / (decode_ms > 0 ? decode_ms : 1.0));
 
-    if (pooled.s1 == 0 || pooled.s2 == 0) ok = false;
+    // ---- the ms-per-token curve over n ----------------------------------------------------------------
+    // chain_ms is one draft_chain(n - 1) at the depth the chains ran, and the verify step is charged one trunk
+    // token: decode_ms is the floor for it, because the real step also reads the cache for n queries and runs the
+    // hop. Every row of the acceptance table's n column lands in this one.
+    {
+      constexpr int kIters = 10;
+      DeviceArray<__nv_bfloat16> d_hidden{static_cast<std::size_t>(HIDDEN)};
+      std::vector<__nv_bfloat16> hidden_row(static_cast<std::size_t>(HIDDEN));
+      const std::vector<float>& residual = runs.back().steps.back().residual;
+      for (int i = 0; i < HIDDEN; ++i) hidden_row[std::size_t(i)] = float_to_bf16(residual[std::size_t(i)]);
+      d_hidden.upload(hidden_row);
+      std::vector<int> candidates(kChainDrafts);
+      for (int i = 0; i < kChainDrafts; ++i) {
+        candidates[std::size_t(i)] = runs.back().steps[std::size_t(deepest - 1 - i)].token;
+      }
+      std::printf("\ncost curve: a verify step of n candidates at depth %d, %s cache; the trunk side is one token "
+                  "(%.2f ms), the drafter side one draft_chain(n - 1)\n",
+                  deepest, mtpk::mtp_kv_type_name(type), decode_ms);
+      std::printf("   n  drafts   chain ms   ms/draft   forward ms   head ms | E(n) all   ms/token all | E(n) gen   "
+                  "ms/token gen\n");
+      for (int n = 2; n <= kChainDrafts + 1; ++n) {
+        const int k = n - 1;
+        std::vector<int> out_tokens(k);
+        const int base = deepest + 1 - k;
+        auto once = [&](qwen::MtpChainTiming* t) {
+          return drafter.draft_chain(candidates.data(), d_hidden.get(), k, base, out_tokens.data(), &error, t);
+        };
+        bool ran = true;
+        for (int warm = 0; warm < 2 && ran; ++warm) ran = once(nullptr);
+        if (!ran) {
+          std::printf("FAIL chain probe k=%d: %s\n", k, error.c_str());
+          qwen::free_text_arena(&arena);
+          return 1;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int it = 0; it < kIters; ++it) ran = once(nullptr);
+        const double chain_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / kIters;
+        qwen::MtpChainTiming timing;
+        if (!ran || !once(&timing)) {
+          std::printf("FAIL chain probe k=%d: %s\n", k, error.c_str());
+          qwen::free_text_arena(&arena);
+          return 1;
+        }
+        const double e_all = expected_tokens(all, n), e_gen = expected_tokens(gen, n);
+        const double step_ms = decode_ms + chain_ms;
+        std::printf("  %2d  %6d   %8.3f   %8.3f   %10.3f   %7.3f | %6.2f   %10.3f     | %6.2f   %10.3f\n", n, k,
+                    chain_ms, chain_ms / k, timing.forward_ms, timing.head_ms, e_all,
+                    e_all > 0 ? step_ms / e_all : 0.0, e_gen, e_gen > 0 ? step_ms / e_gen : 0.0);
+      }
+    }
+
+    if (pooled.s[0] == 0 || pooled.s[1] == 0) ok = false;
     (void)ok;
   }
 

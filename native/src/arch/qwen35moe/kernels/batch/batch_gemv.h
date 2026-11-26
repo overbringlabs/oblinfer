@@ -75,4 +75,22 @@ void bf16_gemv_batch_cpu(const Bf16GemvBatchArgs& args);
 // h[i] = silu(g[i]) * u[i] over `count` flat elements, g in place.
 cudaError_t silu_mul_batch(float* g, const float* u, int count, cudaStream_t stream);
 
+// ---- row-wise passes ----
+//
+// What surrounds the GEMVs at verify width: every one of them is per position, so a launch per position would
+// put back the per-token overhead the batch step exists to remove. Each takes `rows` = n rows of `width` floats,
+// laid out row-major and contiguous, and runs one block per row. The arithmetic per row is the single-token
+// kernel's, in the same order, so a row of the batched call is bit-identical to the single-row kernel.
+
+// y[t] = x[t] / rms(x[t]) * weight, the pack's RMSNorm over one row. Same 256-thread walk as dense::rms_norm.
+cudaError_t rms_norm_rows(const float* x, const float* weight, float* y, int rows, int width, float eps,
+                          cudaStream_t stream);
+
+// x[t] = float(table[row_ids[t], 0..width)); `row_ids` is a device array of n token ids.
+cudaError_t embedding_rows(const __nv_bfloat16* table, const int* row_ids, float* x, int rows, int width,
+                           cudaStream_t stream);
+
+// index[t] = argmax(x[t, 0..width)), ties to the lower index, as dense::argmax.
+cudaError_t argmax_rows(const float* x, int rows, int width, int* index, cudaStream_t stream);
+
 }  // namespace ingine::arch::qwen35moe::kernels

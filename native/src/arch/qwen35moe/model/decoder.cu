@@ -10,6 +10,7 @@
 
 #include "arch/qwen35moe/kernels/attn/decode_attn.h"
 #include "arch/qwen35moe/kernels/attn/rope_norm.h"
+#include "arch/qwen35moe/kernels/batch/batch_gdn.h"
 #include "arch/qwen35moe/kernels/moe/moe_apply.h"
 #include "arch/qwen35moe/kernels/moe/router.h"
 #include "arch/qwen35moe/kernels/moe/shared_expert.h"
@@ -99,6 +100,57 @@ Decoder::~Decoder() {
   }
   if (peer_ids_) cudaFree(peer_ids_);
   if (peer_weights_) cudaFree(peer_weights_);
+  cudaSetDevice(dev0_);
+  // The verify-width path: its activations, then the per-card MoE scratch, the pinned exchange and its events.
+  // Each event is created on the device whose stream records it, so each is destroyed in the same context.
+  for (float* p : {ba_.x, ba_.h, ba_.h2, ba_.y, ba_.moe, ba_.shared, ba_.sh, ba_.su, ba_.qkv, ba_.qkv2, ba_.z, ba_.a,
+                   ba_.b, ba_.beta, ba_.g, ba_.gout, ba_.q_lin, ba_.k_lin, ba_.v_lin, ba_.qgate, ba_.q, ba_.gate,
+                   ba_.attn, ba_.k, ba_.v, ba_.logits, ba_.router_logits, ba_.weights, gdn_ckpt_, conv_ckpt_}) {
+    if (p) cudaFree(p);
+  }
+  if (ba_.partial) cudaFree(ba_.partial);
+  for (int* p : {ba_.ids, ba_.argmax, ba_.dev_ids}) {
+    if (p) cudaFree(p);
+  }
+  if (ba_.band_states) cudaFree(ba_.band_states);  // dev0 is current here; the loop below switches
+  for (int d = 0; d < 2; ++d) {
+    cudaSetDevice(d == 0 ? dev0_ : dev1_);
+    for (float* p : {batch_[d].gate, batch_[d].up, batch_[d].down, batch_[d].peer_weights}) {
+      if (p) cudaFree(p);
+    }
+    for (int* p : {batch_[d].unique_ids, batch_[d].unique_count, batch_[d].pair_unique, batch_[d].pair_of,
+                   batch_[d].rows, batch_[d].peer_ids}) {
+      if (p) cudaFree(p);
+    }
+    for (void* p : {static_cast<void*>(batch_[d].layers), batch_[d].peer_x, batch_[d].peer_y}) {
+      if (p) cudaFree(p);
+    }
+    for (int i = 0; i < 2; ++i) {
+      cudaEvent_t& own_x = d == 0 ? bev_x_[i] : bev_x_free_[i];
+      cudaEvent_t& own_y = d == 0 ? bev_y_free_[i] : bev_y_[i];
+      if (own_x) {
+        cudaEventDestroy(own_x);
+        own_x = nullptr;
+      }
+      if (own_y) {
+        cudaEventDestroy(own_y);
+        own_y = nullptr;
+      }
+    }
+  }
+  check(cudaSetDevice(dev1_), "batch band device 1");
+  for (float* p : {band1_.q, band1_.k, band1_.v, band1_.out}) {
+    if (p) cudaFree(p);
+  }
+  if (band1_.partial) cudaFree(band1_.partial);
+  if (band1_.band_states) cudaFree(band1_.band_states);
+  if (band1_.q_consumed) cudaEventDestroy(band1_.q_consumed);
+  if (band1_.states_ready) cudaEventDestroy(band1_.states_ready);
+  check(cudaSetDevice(dev0_), "batch band device 0");
+  if (band1_.q_ready) cudaEventDestroy(band1_.q_ready);
+  if (band1_.states_consumed) cudaEventDestroy(band1_.states_consumed);
+  if (band1_.pinned) cudaFreeHost(band1_.pinned);
+  if (bpinned_) cudaFreeHost(bpinned_);
   cudaSetDevice(dev0_);
   for (auto& [name, buffer] : f32_) {
     (void)name;
@@ -813,8 +865,692 @@ void Decoder::moe(int l) {
   check(attn::shared_expert(shared, s_), "shared expert");
 }
 
-int Decoder::splits_at(int pos) const {
-  // One flash-decode split per kSplitPositions positions, capped: the bucket the graph is keyed by.
+// --------------------------------------------------------------------------------- verify width (step_batch)
+//
+// The same 40 layers, one launch per stage for the whole block. Everything that was per position in the
+// single-token path becomes per block: the norm, the routing, the cross-card hop (n rows through one pinned
+// slot) and the attention (one cache pass for n queries). The GDN recurrence stays serial in position by
+// construction, but it runs one launch for the block with the state held in registers.
+
+void Decoder::ensure_batch() {
+  if (batch_ready_) return;
+  const int n = kernels::BATCH_MAX;
+  const std::size_t h4 = std::size_t(n) * HIDDEN * 4;
+  check(cudaSetDevice(dev0_), "batch device 0");
+  ba_.x = static_cast<float*>(alloc(h4));
+  ba_.h = static_cast<float*>(alloc(h4));
+  ba_.h2 = static_cast<float*>(alloc(h4));
+  ba_.y = static_cast<float*>(alloc(h4));
+  ba_.moe = static_cast<float*>(alloc(h4));
+  ba_.shared = static_cast<float*>(alloc(h4));
+  ba_.sh = static_cast<float*>(alloc(std::size_t(n) * SHARED_INTER * 4));
+  ba_.su = static_cast<float*>(alloc(std::size_t(n) * SHARED_INTER * 4));
+  ba_.qkv = static_cast<float*>(alloc(std::size_t(n) * LIN_CONV_DIM * 4));
+  ba_.qkv2 = static_cast<float*>(alloc(std::size_t(n) * LIN_CONV_DIM * 4));
+  ba_.z = static_cast<float*>(alloc(std::size_t(n) * LIN_VALUE_DIM_TOT * 4));
+  ba_.a = static_cast<float*>(alloc(std::size_t(n) * LIN_VALUE_HEADS * 4));
+  ba_.b = static_cast<float*>(alloc(std::size_t(n) * LIN_VALUE_HEADS * 4));
+  ba_.beta = static_cast<float*>(alloc(std::size_t(n) * LIN_VALUE_HEADS * 4));
+  ba_.g = static_cast<float*>(alloc(std::size_t(n) * LIN_VALUE_HEADS * 4));
+  ba_.gout = static_cast<float*>(alloc(std::size_t(n) * LIN_VALUE_DIM_TOT * 4));
+  ba_.q_lin = static_cast<float*>(alloc(std::size_t(n) * LIN_KEY_DIM_TOT * 4));
+  ba_.k_lin = static_cast<float*>(alloc(std::size_t(n) * LIN_KEY_DIM_TOT * 4));
+  ba_.v_lin = static_cast<float*>(alloc(std::size_t(n) * LIN_VALUE_DIM_TOT * 4));
+  ba_.qgate = static_cast<float*>(alloc(std::size_t(n) * Q_PROJ_ROWS * 4));
+  ba_.q = static_cast<float*>(alloc(std::size_t(n) * Q_DIM * 4));
+  ba_.gate = static_cast<float*>(alloc(std::size_t(n) * Q_DIM * 4));
+  ba_.attn = static_cast<float*>(alloc(std::size_t(n) * Q_DIM * 4));
+  ba_.k = static_cast<float*>(alloc(std::size_t(n) * KV_DIM * 4));
+  ba_.v = static_cast<float*>(alloc(std::size_t(n) * KV_DIM * 4));
+  ba_.logits = static_cast<float*>(alloc(std::size_t(n) * VOCAB * 4));
+  ba_.router_logits = static_cast<float*>(alloc(std::size_t(n) * attn::ROUTER_EXPERTS * 4));
+  ba_.ids = static_cast<int*>(alloc(std::size_t(n) * attn::ROUTER_TOP_K * 4));
+  ba_.weights = static_cast<float*>(alloc(std::size_t(n) * attn::ROUTER_TOP_K * 4));
+  ba_.argmax = static_cast<int*>(alloc(std::size_t(n) * 4));
+  ba_.dev_ids = static_cast<int*>(alloc(std::size_t(n) * 4));
+  // One split state per (head, split), each holding n online softmax states.
+  ba_.partial = static_cast<kernels::BatchSplitState*>(
+      alloc(std::size_t(HEADS) * kernels::kMaxSplits * sizeof(kernels::BatchSplitState)));
+  batch_logits_kept_ = std::getenv("QWEN35MOE_BATCH_LOGITS") != nullptr;
+  if (batch_logits_kept_) {
+    batch_logits_host_.resize(std::size_t(n) * VOCAB);
+    batch_residual_host_.resize(std::size_t(n) * HIDDEN);
+  }
+
+  // The routed experts at verify width, per card: the same plan buffers on both, and the expert tables the
+  // fused path already built, widened to batch_moe.h's 64-bit block description.
+  for (int d = 0; d < 2; ++d) {
+    if (d == 1 && dev1_ == dev0_) continue;  // one card: there is no peer to hold a second plan
+    check(cudaSetDevice(d == 0 ? dev0_ : dev1_), "batch scratch device");
+    BatchCard& c = batch_[d];
+    c.gate = static_cast<float*>(alloc(std::size_t(kernels::BATCH_PAIRS) * MOE_INTER * 4));
+    c.up = static_cast<float*>(alloc(std::size_t(kernels::BATCH_PAIRS) * MOE_INTER * 4));
+    c.down = static_cast<float*>(alloc(std::size_t(kernels::BATCH_PAIRS) * HIDDEN * 4));
+    c.unique_ids = static_cast<int*>(alloc(std::size_t(kernels::BATCH_PAIRS) * 4));
+    c.unique_count = static_cast<int*>(alloc(std::size_t(kernels::BATCH_PAIRS) * 4));
+    c.pair_unique = static_cast<int*>(alloc(std::size_t(kernels::BATCH_PAIRS) * 4));
+    c.pair_of = static_cast<int*>(alloc(std::size_t(kernels::BATCH_PAIRS) * kernels::BATCH_MAX * 4));
+    c.rows = static_cast<int*>(alloc(std::size_t(kernels::BATCH_PAIRS) * 4));
+    c.layers = static_cast<kernels::BatchExpertBlock*>(
+        alloc(std::size_t(LAYERS) * EXPERTS * sizeof(kernels::BatchExpertBlock)));
+    std::vector<kernels::BatchExpertBlock> host(std::size_t(LAYERS) * EXPERTS);
+    for (std::size_t i = 0; i < host.size(); ++i) {
+      const kernels::FusedExpertLayer& f = fused_[d].host[i];
+      kernels::BatchExpertBlock& b = host[i];
+      b.w_base = f.w_base;
+      b.s_base = f.s_base;
+      b.stride_bytes = f.stride_bytes;
+      b.scale_stride_bytes = f.scale_stride_bytes;
+      b.gate_w = f.gate_weight_off;
+      b.up_w = f.up_weight_off;
+      b.down_w = f.down_weight_off;
+      b.gate_s = f.gate_scale_off;
+      b.up_s = f.up_scale_off;
+      b.down_s = f.down_scale_off;
+      b.gate_scale2 = f.gate_scale2;
+      b.up_scale2 = f.up_scale2;
+      b.down_scale2 = f.down_scale2;
+    }
+    check(cudaMemcpy(c.layers, host.data(), host.size() * sizeof(kernels::BatchExpertBlock),
+                     cudaMemcpyHostToDevice),
+          "batch expert table");
+    if (dev1_ != dev0_ && d == 1) {
+      c.peer_x = alloc(h4);
+      c.peer_y = alloc(h4);
+      c.peer_ids = static_cast<int*>(alloc(std::size_t(n) * attn::ROUTER_TOP_K * 4));
+      c.peer_weights = static_cast<float*>(alloc(std::size_t(n) * attn::ROUTER_TOP_K * 4));
+    }
+  }
+  // The two-band attention's peer scratch, only when the KV plan actually splits.
+  if (kv_bands_on_ && kv_bands_[0].count == 2) {
+    // The per-card loop above left the peer current; the host card's own buffers are the decoder's.
+    check(cudaSetDevice(dev0_), "batch band device 0");
+    ba_.band_states = static_cast<kernels::BatchSplitState*>(
+        alloc(std::size_t(HEADS) * 2 * sizeof(kernels::BatchSplitState)));
+    check(cudaSetDevice(dev1_), "batch band device 1");
+    const std::size_t qf = std::size_t(kernels::BATCH_MAX) * HEADS * HEAD_DIM;
+    const std::size_t kf = std::size_t(kernels::BATCH_MAX) * KV_HEADS * HEAD_DIM;
+    band1_.q = static_cast<float*>(alloc(qf * 4));
+    band1_.k = static_cast<float*>(alloc(kf * 4));
+    band1_.v = static_cast<float*>(alloc(kf * 4));
+    band1_.out = static_cast<float*>(alloc(qf * 4));
+    band1_.partial = static_cast<kernels::BatchSplitState*>(
+        alloc(std::size_t(HEADS) * kernels::kMaxSplits * sizeof(kernels::BatchSplitState)));
+    band1_.band_states = static_cast<kernels::BatchSplitState*>(
+        alloc(std::size_t(HEADS) * 2 * sizeof(kernels::BatchSplitState)));
+    check(cudaSetDevice(dev0_), "batch band device 0");
+    const std::size_t pinned = (qf + 2 * kf) * 4 +
+                               std::size_t(HEADS) * sizeof(kernels::BatchSplitState);
+    check(cudaHostAlloc(reinterpret_cast<void**>(&band1_.pinned), pinned, cudaHostAllocDefault),
+          "batch band host alloc");
+    check(cudaEventCreateWithFlags(&band1_.q_ready, cudaEventDisableTiming), "batch band event q");
+    check(cudaEventCreateWithFlags(&band1_.states_consumed, cudaEventDisableTiming), "batch band event states");
+    check(cudaSetDevice(dev1_), "batch band device 1");
+    check(cudaEventCreateWithFlags(&band1_.q_consumed, cudaEventDisableTiming), "batch band event q consumed");
+    check(cudaEventCreateWithFlags(&band1_.states_ready, cudaEventDisableTiming), "batch band event states ready");
+    check(cudaSetDevice(dev0_), "batch band device 0");
+  }
+
+  if (dev1_ != dev0_) {
+    check(cudaSetDevice(dev0_), "batch device 0");
+    check(cudaHostAlloc(reinterpret_cast<void**>(&bpinned_), 2 * sizeof(BatchExchange), cudaHostAllocDefault),
+          "batch host alloc");
+    for (int i = 0; i < 2; ++i) {
+      check(cudaEventCreateWithFlags(&bev_x_[i], cudaEventDisableTiming), "batch event x");
+      check(cudaEventCreateWithFlags(&bev_y_free_[i], cudaEventDisableTiming), "batch event y free");
+    }
+    check(cudaSetDevice(dev1_), "batch device 1");
+    for (int i = 0; i < 2; ++i) {
+      check(cudaEventCreateWithFlags(&bev_x_free_[i], cudaEventDisableTiming), "batch event x free");
+      check(cudaEventCreateWithFlags(&bev_y_[i], cudaEventDisableTiming), "batch event y");
+    }
+    check(cudaSetDevice(dev0_), "batch device 0");
+  }
+  batch_ready_ = true;
+}
+
+void Decoder::ensure_gdn_checkpoint() {
+  if (gdn_ckpt_ready_) return;
+  check(cudaSetDevice(dev0_), "checkpoint device 0");
+  const std::size_t state = std::size_t(NUM_LINEAR_LAYERS) * LIN_VALUE_HEADS * LIN_KEY_DIM * LIN_VALUE_DIM * 4;
+  const std::size_t conv = std::size_t(NUM_LINEAR_LAYERS) * (CONV_K - 1) * LIN_CONV_DIM * 4;
+  gdn_ckpt_ = static_cast<float*>(alloc(state));
+  conv_ckpt_ = static_cast<float*>(alloc(conv));
+  gdn_ckpt_ready_ = true;
+}
+
+bool Decoder::checkpoint_gdn(std::string* error) {
+  try {
+    ensure_gdn_checkpoint();
+    const std::size_t state = std::size_t(NUM_LINEAR_LAYERS) * LIN_VALUE_HEADS * LIN_KEY_DIM * LIN_VALUE_DIM * 4;
+    const std::size_t conv = std::size_t(NUM_LINEAR_LAYERS) * (CONV_K - 1) * LIN_CONV_DIM * 4;
+    check(cudaMemcpyAsync(gdn_ckpt_, gdn_state_, state, cudaMemcpyDeviceToDevice, nullptr), "checkpoint gdn");
+    check(cudaMemcpyAsync(conv_ckpt_, conv_state_, conv, cudaMemcpyDeviceToDevice, nullptr), "checkpoint conv");
+    check(cudaStreamSynchronize(nullptr), "checkpoint sync");
+    return true;
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
+
+bool Decoder::restore_gdn(std::string* error) {
+  try {
+    if (!gdn_ckpt_ready_) throw std::runtime_error("restore_gdn: no checkpoint was taken");
+    const std::size_t state = std::size_t(NUM_LINEAR_LAYERS) * LIN_VALUE_HEADS * LIN_KEY_DIM * LIN_VALUE_DIM * 4;
+    const std::size_t conv = std::size_t(NUM_LINEAR_LAYERS) * (CONV_K - 1) * LIN_CONV_DIM * 4;
+    check(cudaMemcpyAsync(gdn_state_, gdn_ckpt_, state, cudaMemcpyDeviceToDevice, nullptr), "restore gdn");
+    check(cudaMemcpyAsync(conv_state_, conv_ckpt_, conv, cudaMemcpyDeviceToDevice, nullptr), "restore conv");
+    check(cudaStreamSynchronize(nullptr), "restore sync");
+    return true;
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
+
+const float* Decoder::batch_logits(int t) const {
+  if (!batch_logits_kept_ || batch_logits_host_.empty()) return nullptr;
+  if (t < 0 || std::size_t(t + 1) * VOCAB > batch_logits_host_.size()) return nullptr;
+  return batch_logits_host_.data() + std::size_t(t) * VOCAB;
+}
+
+bool Decoder::read_residual(std::vector<float>* out, std::string* error) {
+  try {
+    if (!out) throw std::runtime_error("read_residual: null argument");
+    out->resize(HIDDEN);
+    check(cudaSetDevice(dev0_), "set device 0");
+    check(cudaMemcpy(out->data(), x_, std::size_t(HIDDEN) * 4, cudaMemcpyDeviceToHost), "read residual");
+    return true;
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
+
+const float* Decoder::batch_residual(int t) const {
+  if (!batch_logits_kept_ || batch_residual_host_.empty()) return nullptr;
+  if (t < 0 || std::size_t(t + 1) * HIDDEN > batch_residual_host_.size()) return nullptr;
+  return batch_residual_host_.data() + std::size_t(t) * HIDDEN;
+}
+
+void Decoder::batch_linear_layer(int l, int n) {
+  const std::string p = layer_name(l, "linear_attn.");
+  // One weight read serves the whole block. Rows and columns of every projection here are multiples of the
+  // batch GEMV's block shape (eight rows, 256 columns).
+  check(kernels::fp8_gemv_batch({static_cast<const std::uint8_t*>(ptr(p + "in_proj_qkv.weight")),
+                                 scalar(p + "in_proj_qkv.weight_scale", 1.0f), ba_.h, ba_.qkv, LIN_CONV_DIM,
+                                 HIDDEN, n},
+                                s_),
+        "batch in_proj_qkv");
+  check(kernels::fp8_gemv_batch({static_cast<const std::uint8_t*>(ptr(p + "in_proj_z.weight")),
+                                 scalar(p + "in_proj_z.weight_scale", 1.0f), ba_.h, ba_.z, LIN_VALUE_DIM_TOT,
+                                 HIDDEN, n},
+                                s_),
+        "batch in_proj_z");
+  check(kernels::bf16_gemv_batch(
+            {static_cast<const __nv_bfloat16*>(ptr(p + "in_proj_a.weight")), ba_.h, ba_.a, LIN_VALUE_HEADS, HIDDEN, n},
+            s_),
+        "batch in_proj_a");
+  check(kernels::bf16_gemv_batch(
+            {static_cast<const __nv_bfloat16*>(ptr(p + "in_proj_b.weight")), ba_.h, ba_.b, LIN_VALUE_HEADS, HIDDEN, n},
+            s_),
+        "batch in_proj_b");
+
+  int slot = 0;
+  for (int i = 0; i < l; ++i) slot += is_full_layer(i) ? 0 : 1;
+  float* conv_hist = conv_state_ + std::size_t(slot) * (CONV_K - 1) * LIN_CONV_DIM;
+  kernels::ConvStepsArgs conv;
+  conv.x = ba_.qkv;
+  conv.weight = f32(p + "conv1d.weight");
+  conv.history = conv_hist;
+  conv.y = ba_.qkv2;
+  conv.conv_dim = LIN_CONV_DIM;
+  conv.n = n;
+  check(kernels::conv_silu_steps(conv, s_), "batch conv");
+
+  kernels::GdnGatesRowsArgs gates;
+  gates.a = ba_.a;
+  gates.b = ba_.b;
+  gates.dt_bias = f32(p + "dt_bias");
+  gates.a_log = f32(p + "A_log");
+  gates.beta = ba_.beta;
+  gates.g = ba_.g;
+  gates.heads = LIN_VALUE_HEADS;
+  gates.rows = n;
+  check(kernels::gdn_gates_rows(gates, s_), "batch gdn gates");
+
+  kernels::GatherQkvRowsArgs gather;
+  gather.qkv = ba_.qkv2;
+  gather.q = ba_.q_lin;
+  gather.k = ba_.k_lin;
+  gather.v = ba_.v_lin;
+  gather.key_heads = LIN_KEY_HEADS;
+  gather.key_dim = LIN_KEY_DIM;
+  gather.value_heads = LIN_VALUE_HEADS;
+  gather.value_dim = LIN_VALUE_DIM;
+  gather.rows = n;
+  gather.grouped = grouped_qkv_;
+  check(kernels::gather_qkv_rows(gather, s_), "batch gather qkv");
+
+  kernels::GdnStepsArgs step;
+  step.q = ba_.q_lin;
+  step.k = ba_.k_lin;
+  step.v = ba_.v_lin;
+  step.beta = ba_.beta;
+  step.g = ba_.g;
+  step.state = gdn_state_ + std::size_t(slot) * LIN_VALUE_HEADS * LIN_KEY_DIM * LIN_VALUE_DIM;
+  step.out = ba_.gout;
+  step.v_heads = LIN_VALUE_HEADS;
+  step.n = n;
+  check(kernels::gdn_recurrent_steps(step, s_), "batch gdn steps");
+
+  kernels::GatedNormRowsArgs norm;
+  norm.x = ba_.gout;
+  norm.z = ba_.z;
+  norm.weight = f32(p + "norm.weight");
+  norm.heads = LIN_VALUE_HEADS;
+  norm.v_dim = LIN_VALUE_DIM;
+  norm.rows = n;
+  norm.eps = EPS;
+  check(kernels::gated_norm_rows(norm, s_), "batch gdn norm");
+
+  check(kernels::fp8_gemv_batch({static_cast<const std::uint8_t*>(ptr(p + "out_proj.weight")),
+                                 scalar(p + "out_proj.weight_scale", 1.0f), ba_.gout, ba_.y, HIDDEN,
+                                 LIN_VALUE_DIM_TOT, n},
+                                s_),
+        "batch out_proj");
+}
+
+void Decoder::batch_full_layer(int l, int pos, int n) {
+  const std::string p = layer_name(l, "self_attn.");
+  const int slot = l / FULL_ATTENTION_INTERVAL;
+
+  check(kernels::fp8_gemv_batch({static_cast<const std::uint8_t*>(ptr(p + "q_proj.weight")),
+                                 scalar(p + "q_proj.weight_scale", 1.0f), ba_.h, ba_.qgate, Q_PROJ_ROWS, HIDDEN, n},
+                                s_),
+        "batch q_proj");
+  check(kernels::fp8_gemv_batch({static_cast<const std::uint8_t*>(ptr(p + "k_proj.weight")),
+                                 scalar(p + "k_proj.weight_scale", 1.0f), ba_.h, ba_.k, KV_DIM, HIDDEN, n}, s_),
+        "batch k_proj");
+  check(kernels::fp8_gemv_batch({static_cast<const std::uint8_t*>(ptr(p + "v_proj.weight")),
+                                 scalar(p + "v_proj.weight_scale", 1.0f), ba_.h, ba_.v, KV_DIM, HIDDEN, n}, s_),
+        "batch v_proj");
+
+  // The per-head [query | gate] interleave splits the same way for a block: the rows are contiguous, so the
+  // flat split over n * HEADS heads is the per-position split.
+  attn::SplitQGateArgs split;
+  split.qgate = ba_.qgate;
+  split.q = ba_.q;
+  split.gate = ba_.gate;
+  split.heads = n * HEADS;
+  split.head_dim = HEAD_DIM;
+  check(attn::split_q_gate(split, s_), "batch split q gate");
+
+  kernels::QkNormRopeRowsArgs rope;
+  rope.q = ba_.q;
+  rope.k = ba_.k;
+  rope.q_weight = f32(p + "q_norm.weight", true);
+  rope.k_weight = f32(p + "k_norm.weight", true);
+  rope.pos0 = pos;
+  rope.n = n;
+  rope.eps = EPS;
+  check(kernels::qk_norm_rope_rows(rope, s_), "batch qk norm rope");
+
+  const KvBands& bands = kv_bands_[slot];
+  if (bands.count == 2) {
+    batch_attention_bands(slot, pos, n);
+  } else {
+    batch_attention_local(slot, pos, n);
+  }
+
+  attn::OutputGateArgs gate;
+  gate.x = ba_.attn;
+  gate.gate = ba_.gate;
+  gate.count = n * Q_DIM;
+  check(attn::output_gate(gate, s_), "batch output gate");
+
+  check(kernels::fp8_gemv_batch({static_cast<const std::uint8_t*>(ptr(p + "o_proj.weight")),
+                                 scalar(p + "o_proj.weight_scale", 1.0f), ba_.attn, ba_.y, HIDDEN, Q_DIM, n},
+                                s_),
+        "batch o_proj");
+}
+
+void Decoder::batch_attention_local(int slot, int pos, int n) {
+  const KvBands& bands = kv_bands_[slot];
+  kernels::BatchAttnArgs dec;
+  dec.q = ba_.q;
+  dec.k_new = ba_.k;
+  dec.v_new = ba_.v;
+  dec.k_cache = bands.bands[0].k;
+  dec.v_cache = bands.bands[0].v;
+  dec.kv_type_k = kv_type_k_;
+  dec.kv_type_v = kv_type_v_;
+  dec.out = ba_.attn;
+  dec.pos0 = pos;
+  dec.max_pos = max_pos_;
+  dec.pos_begin = 0;
+  dec.cache_rows = max_pos_;
+  dec.partial = ba_.partial;
+  dec.splits = splits_at(pos + n - 1);
+  dec.n = n;
+  check(kernels::batch_attention(dec, s_), "batch attention");
+}
+
+void Decoder::batch_attention_bands(int slot, int pos, int n) {
+  // Each band runs the flash columns it holds whole, merges them into one state per head, and only the peer's
+  // merged states cross the host. That is 66 KB per layer instead of the 1.3 MB the per-column states would
+  // cost, and the host card joins the two bands with one more combine over two splits.
+  const KvBands& bands = kv_bands_[slot];
+  const int splits = splits_at(pos + n - 1);
+  const int c0 = kv_band_columns(bands, pos + n - 1, splits);
+  if (c0 < 0) throw std::runtime_error("batch attention: a flash column straddles the band boundary");
+
+  kernels::BatchAttnArgs dec;
+  dec.kv_type_k = kv_type_k_;
+  dec.kv_type_v = kv_type_v_;
+  dec.pos0 = pos;
+  dec.max_pos = max_pos_;
+  dec.splits = splits;
+  dec.n = n;
+  dec.partial = ba_.partial;
+
+  const std::size_t q_bytes = std::size_t(n) * HEADS * HEAD_DIM * 4;
+  const std::size_t kv_bytes = std::size_t(n) * KV_HEADS * HEAD_DIM * 4;
+  float* pinned_q = band1_.pinned;
+  float* pinned_k = pinned_q + std::size_t(n) * HEADS * HEAD_DIM;
+  float* pinned_v = pinned_k + std::size_t(n) * KV_HEADS * HEAD_DIM;
+  kernels::BatchSplitState* pinned_states = reinterpret_cast<kernels::BatchSplitState*>(
+      pinned_v + std::size_t(n) * KV_HEADS * HEAD_DIM);
+
+  // The peer's previous layer must have consumed the pinned query before it is overwritten.
+  if (band1_.q_pending) check(cudaStreamWaitEvent(s_, band1_.q_consumed, 0), "batch band q free");
+  check(cudaMemcpyAsync(pinned_q, ba_.q, q_bytes, cudaMemcpyDeviceToHost, s_), "batch band q out");
+  check(cudaMemcpyAsync(pinned_k, ba_.k, kv_bytes, cudaMemcpyDeviceToHost, s_), "batch band k out");
+  check(cudaMemcpyAsync(pinned_v, ba_.v, kv_bytes, cudaMemcpyDeviceToHost, s_), "batch band v out");
+  check(cudaEventRecord(band1_.q_ready, s_), "batch band q ready");
+  band1_.q_pending = true;
+
+  // Band 1 on the peer card, beside the host card's own band.
+  check(cudaSetDevice(dev1_), "set device 1");
+  check(cudaStreamWaitEvent(s1_, band1_.q_ready, 0), "batch band wait q");
+  if (band1_.states_pending) check(cudaStreamWaitEvent(s1_, band1_.states_consumed, 0), "batch band states free");
+  check(cudaMemcpyAsync(band1_.q, pinned_q, q_bytes, cudaMemcpyHostToDevice, s1_), "batch band q in");
+  check(cudaMemcpyAsync(band1_.k, pinned_k, kv_bytes, cudaMemcpyHostToDevice, s1_), "batch band k in");
+  check(cudaMemcpyAsync(band1_.v, pinned_v, kv_bytes, cudaMemcpyHostToDevice, s1_), "batch band v in");
+  check(cudaEventRecord(band1_.q_consumed, s1_), "batch band q consumed");
+  band1_.q_pending = false;
+
+  kernels::BatchAttnArgs peer = dec;
+  peer.q = band1_.q;
+  peer.k_new = band1_.k;
+  peer.v_new = band1_.v;
+  peer.k_cache = bands.bands[1].k;
+  peer.v_cache = bands.bands[1].v;
+  peer.pos_begin = bands.bands[1].pos_begin;
+  peer.cache_rows = bands.bands[1].pos_end - bands.bands[1].pos_begin;
+  peer.out = band1_.out;
+  peer.partial = band1_.partial;
+  peer.col_begin = c0;
+  peer.col_end = splits;
+  peer.band_states = band1_.band_states;
+  peer.band_slot = 1;
+  check(kernels::batch_attention_split(peer, s1_), "batch band split dev1");
+  check(kernels::batch_attention_band_states(peer, s1_), "batch band states dev1");
+  // Only the peer's own slot of each head: the array is two states per head and the host card fills the other.
+  check(cudaMemcpy2DAsync(pinned_states, sizeof(kernels::BatchSplitState), band1_.band_states + 1,
+                          2 * sizeof(kernels::BatchSplitState), sizeof(kernels::BatchSplitState), HEADS,
+                          cudaMemcpyDeviceToHost, s1_),
+        "batch band states out");
+  check(cudaEventRecord(band1_.states_ready, s1_), "batch band states ready");
+  band1_.states_pending = true;
+  check(cudaSetDevice(dev0_), "set device 0");
+
+  // The host card's band, concurrently.
+  kernels::BatchAttnArgs host = dec;
+  host.q = ba_.q;
+  host.k_new = ba_.k;
+  host.v_new = ba_.v;
+  host.k_cache = bands.bands[0].k;
+  host.v_cache = bands.bands[0].v;
+  host.pos_begin = bands.bands[0].pos_begin;
+  host.cache_rows = bands.bands[0].pos_end - bands.bands[0].pos_begin;
+  host.out = ba_.attn;
+  host.col_begin = 0;
+  host.col_end = c0;
+  host.band_states = ba_.band_states;
+  host.band_slot = 0;
+  check(kernels::batch_attention_split(host, s_), "batch band split dev0");
+  check(kernels::batch_attention_band_states(host, s_), "batch band states dev0");
+
+  // Join the bands: one combine over the two states each head has, then the normalisation into `out`.
+  check(cudaStreamWaitEvent(s_, band1_.states_ready, 0), "batch band wait states");
+  check(cudaMemcpy2DAsync(ba_.band_states + 1, 2 * sizeof(kernels::BatchSplitState), pinned_states,
+                          sizeof(kernels::BatchSplitState), sizeof(kernels::BatchSplitState), HEADS,
+                          cudaMemcpyHostToDevice, s_),
+        "batch band states in");
+  check(cudaEventRecord(band1_.states_consumed, s_), "batch band states consumed");
+  band1_.states_pending = false;
+
+  // The join over the two band states: the same query block, the same output buffer, two "columns".
+  kernels::BatchAttnArgs join = host;
+  join.partial = ba_.band_states;
+  join.splits = 2;
+  join.col_begin = 0;
+  join.col_end = 2;
+  check(kernels::batch_attention_combine(join, s_), "batch band join");
+
+  if (std::getenv("QWEN35MOE_BATCH_DUMP")) {
+    std::vector<kernels::BatchSplitState> split(HEADS * std::size_t(splits));
+    std::vector<kernels::BatchSplitState> states(HEADS * 2);
+    std::vector<float> out(Q_DIM);
+    check(cudaMemcpy(split.data(), ba_.partial, split.size() * sizeof(kernels::BatchSplitState),
+                     cudaMemcpyDeviceToHost),
+          "dump split states");
+    check(cudaMemcpy(states.data(), ba_.band_states, states.size() * sizeof(kernels::BatchSplitState),
+                     cudaMemcpyDeviceToHost),
+          "dump band states");
+    check(cudaMemcpy(out.data(), ba_.attn, Q_DIM * 4, cudaMemcpyDeviceToHost), "dump attn out");
+    std::printf("[band] pos=%d n=%d splits=%d c0=%d band1=[%d,%d) band0=[%d,%d)\n", pos, n, splits, c0,
+                bands.bands[1].pos_begin, bands.bands[1].pos_end, bands.bands[0].pos_begin, bands.bands[0].pos_end);
+    for (int h = 0; h < HEADS; ++h) {
+      const auto& s0 = split[std::size_t(h) * splits];
+      std::printf("[band] h=%2d split m=%9.3g l=%9.3g acc0=%9.3g | b0 m=%9.3g l=%9.3g acc0=%9.3g | b1 m=%9.3g "
+                  "l=%9.3g acc0=%9.3g | out0=%9.3g\n",
+                  h, s0.m[0], s0.l[0], s0.acc[0], states[std::size_t(h) * 2].m[0], states[std::size_t(h) * 2].l[0],
+                  states[std::size_t(h) * 2].acc[0], states[std::size_t(h) * 2 + 1].m[0],
+                  states[std::size_t(h) * 2 + 1].l[0], states[std::size_t(h) * 2 + 1].acc[0],
+                  out[std::size_t(h) * 256]);
+    }
+    std::fflush(stdout);
+  }
+}
+
+void Decoder::batch_moe(int l, int n) {
+  // One routing pass for the block: the logits are the single-token router's, so the ids and weights are too.
+  kernels::BatchRouterArgs router;
+  router.weight = static_cast<const __nv_bfloat16*>(ptr(layer_name(l, "mlp.gate.weight")));
+  router.x = ba_.h2;
+  router.ids = ba_.ids;
+  router.weights = ba_.weights;
+  router.logits = ba_.router_logits;
+  router.n = n;
+  check(cudaSetDevice(dev0_), "set device 0");
+  check(kernels::route_rows(router, s_), "batch router");
+
+  const bool hop = dev1_ != dev0_;
+  bexch_ = l & 1;
+  BatchExchange* slot = bpinned_ + bexch_;
+  const std::size_t rows = std::size_t(n) * HIDDEN * 4;
+  const std::size_t routing = std::size_t(n) * attn::ROUTER_TOP_K;
+
+  if (hop) {
+    // n rows out in one copy per layer: this is what keeps the per-position overhead off the block.
+    if (l >= 2) check(cudaStreamWaitEvent(s_, bev_x_free_[bexch_], 0), "batch x free");
+    check(cudaMemcpyAsync(slot->x, ba_.h2, rows, cudaMemcpyDeviceToHost, s_), "batch x out");
+    check(cudaMemcpyAsync(slot->ids, ba_.ids, routing * 4, cudaMemcpyDeviceToHost, s_), "batch ids out");
+    check(cudaMemcpyAsync(slot->weights, ba_.weights, routing * 4, cudaMemcpyDeviceToHost, s_),
+          "batch weights out");
+    check(cudaEventRecord(bev_x_[bexch_], s_), "batch x ready");
+    check(cudaSetDevice(dev1_), "set device 1");
+    check(cudaStreamWaitEvent(s1_, bev_x_[bexch_], 0), "batch wait x");
+    BatchCard& c1 = batch_[1];
+    check(cudaMemcpyAsync(c1.peer_x, slot->x, rows, cudaMemcpyHostToDevice, s1_), "batch x in");
+    check(cudaMemcpyAsync(c1.peer_ids, slot->ids, routing * 4, cudaMemcpyHostToDevice, s1_), "batch ids in");
+    check(cudaMemcpyAsync(c1.peer_weights, slot->weights, routing * 4, cudaMemcpyHostToDevice, s1_),
+          "batch weights in");
+    kernels::BatchMoeArgs a1;
+    a1.layers = c1.layers + std::size_t(l) * EXPERTS;
+    a1.x = static_cast<const float*>(c1.peer_x);
+    a1.ids = c1.peer_ids;
+    a1.weights = c1.peer_weights;
+    a1.y = static_cast<float*>(c1.peer_y);
+    a1.scratch_gate = c1.gate;
+    a1.scratch_up = c1.up;
+    a1.scratch_down = c1.down;
+    a1.plan = {c1.unique_ids, c1.unique_count, c1.pair_unique, c1.pair_of, c1.rows};
+    a1.n = n;
+    check(kernels::batch_moe_apply(a1, s1_), "batch moe dev1");
+    check(cudaEventRecord(bev_x_free_[bexch_], s1_), "batch x consumed");
+    if (l >= 2) check(cudaStreamWaitEvent(s1_, bev_y_free_[bexch_], 0), "batch y free");
+    check(cudaMemcpyAsync(slot->y, c1.peer_y, rows, cudaMemcpyDeviceToHost, s1_), "batch y back");
+    check(cudaEventRecord(bev_y_[bexch_], s1_), "batch y ready");
+    check(cudaSetDevice(dev0_), "set device 0");
+  } else {
+    clear(ba_.moe, rows);
+  }
+
+  BatchCard& c0 = batch_[0];
+  kernels::BatchMoeArgs a0;
+  a0.layers = c0.layers + std::size_t(l) * EXPERTS;
+  a0.x = ba_.h2;
+  a0.ids = ba_.ids;
+  a0.weights = ba_.weights;
+  a0.y = ba_.moe;
+  a0.scratch_gate = c0.gate;
+  a0.scratch_up = c0.up;
+  a0.scratch_down = c0.down;
+  a0.plan = {c0.unique_ids, c0.unique_count, c0.pair_unique, c0.pair_of, c0.rows};
+  a0.n = n;
+  check(kernels::batch_moe_apply(a0, s_), "batch moe dev0");
+
+  if (hop) {
+    check(cudaStreamWaitEvent(s_, bev_y_[bexch_], 0), "batch wait y");
+    check(cudaMemcpyAsync(ba_.y, slot->y, rows, cudaMemcpyHostToDevice, s_), "batch y in");
+    check(attn::axpy(ba_.moe, ba_.y, 1.0f, n * HIDDEN, s_), "batch merge expert partials");
+    check(cudaEventRecord(bev_y_free_[bexch_], s_), "batch y consumed");
+  }
+
+  // The shared expert, four launches for the block: gate and up at verify width, the SiLU product, the down
+  // projection, then the bf16 scalar gate over the n rows.
+  auto shared_gemv = [&](const char* proj, float* x, float* y, int r, int c) {
+    const std::string base = layer_name(l, "mlp.shared_expert.") + proj;
+    check(kernels::nvfp4_gemv_batch({static_cast<const std::uint8_t*>(ptr(base + "_proj.weight")),
+                                     static_cast<const std::uint8_t*>(ptr(base + "_proj.weight_scale")),
+                                     scalar(base + "_proj.weight_scale_2", 1.0f), x, y, r, c, n},
+                                    s_),
+          "batch shared gemv");
+  };
+  shared_gemv("gate", ba_.h2, ba_.sh, SHARED_INTER, HIDDEN);
+  shared_gemv("up", ba_.h2, ba_.su, SHARED_INTER, HIDDEN);
+  check(kernels::silu_mul_batch(ba_.sh, ba_.su, n * SHARED_INTER, s_), "batch shared silu");
+  shared_gemv("down", ba_.sh, ba_.shared, HIDDEN, SHARED_INTER);
+  check(kernels::scale_sigmoid_rows(ba_.shared,
+                                    static_cast<const __nv_bfloat16*>(
+                                        ptr(layer_name(l, "mlp.shared_expert_gate.weight"))),
+                                    ba_.h2, n, HIDDEN, s_),
+        "batch shared gate");
+}
+
+void Decoder::batch_body(const int* ids, int n, int pos) {
+  const __nv_bfloat16* embed =
+      static_cast<const __nv_bfloat16*>(ptr("model.language_model.embed_tokens.weight"));
+  check(cudaMemcpyAsync(ba_.dev_ids, ids, std::size_t(n) * 4, cudaMemcpyHostToDevice, s_), "batch ids in");
+  check(kernels::embedding_rows(embed, ba_.dev_ids, ba_.x, n, HIDDEN, s_), "batch embedding");
+
+  for (int l = 0; l < LAYERS; ++l) {
+    check(kernels::rms_norm_rows(ba_.x, f32(layer_name(l, "input_layernorm.weight"), true), ba_.h, n, HIDDEN, EPS,
+                                 s_),
+          "batch input norm");
+    if (is_full_layer(l)) {
+      batch_full_layer(l, pos, n);
+    } else {
+      batch_linear_layer(l, n);
+    }
+    check(attn::axpy(ba_.x, ba_.y, 1.0f, n * HIDDEN, s_), "batch residual");
+    check(kernels::rms_norm_rows(ba_.x, f32(layer_name(l, "post_attention_layernorm.weight"), true), ba_.h2, n,
+                                 HIDDEN, EPS, s_),
+          "batch post norm");
+    batch_moe(l, n);
+    check(attn::axpy(ba_.x, ba_.moe, 1.0f, n * HIDDEN, s_), "batch moe residual");
+    check(attn::axpy(ba_.x, ba_.shared, 1.0f, n * HIDDEN, s_), "batch shared residual");
+    if (std::getenv("QWEN35MOE_BATCH_DUMP")) {
+      // Which stage of which layer first produces a non-finite value, at verify width.
+      std::vector<float> out(Q_DIM), mixer(HIDDEN), res(HIDDEN);
+      check(cudaMemcpy(out.data(), ba_.attn, Q_DIM * 4, cudaMemcpyDeviceToHost), "batch dump attn");
+      check(cudaMemcpy(mixer.data(), ba_.y, HIDDEN * 4, cudaMemcpyDeviceToHost), "batch dump mixer");
+      check(cudaMemcpy(res.data(), ba_.x, HIDDEN * 4, cudaMemcpyDeviceToHost), "batch dump x");
+      auto report = [](const char* what, const std::vector<float>& v) {
+        float amax = 0.0f;
+        int bad = 0;
+        for (float f : v) {
+          if (!std::isfinite(f)) {
+            ++bad;
+            continue;
+          }
+          amax = std::max(amax, std::fabs(f));
+        }
+        std::printf("[batch] %s |max|=%.4g nonfinite=%d\n", what, amax, bad);
+      };
+      std::printf("[batch] layer %d\n", l);
+      report("attn", out);
+      report("mixer", mixer);
+      report("x", res);
+      std::fflush(stdout);
+    }
+  }
+
+  check(kernels::rms_norm_rows(ba_.x, f32("model.language_model.norm.weight", true), ba_.h, n, HIDDEN, EPS, s_),
+        "batch final norm");
+  check(kernels::nvfp4_gemv_batch({static_cast<const std::uint8_t*>(ptr("lm_head.weight")),
+                                   static_cast<const std::uint8_t*>(ptr("lm_head.weight_scale")),
+                                   scalar("lm_head.weight_scale_2", 1.0f), ba_.h, ba_.logits, VOCAB, HIDDEN, n},
+                                  s_),
+        "batch lm_head");
+}
+
+bool Decoder::step_batch(const int* ids, int n, int pos, int* next_tokens, std::string* error) {
+  try {
+    if (!ids || !next_tokens) throw std::runtime_error("step_batch: null argument");
+    if (n < 1 || n > kernels::BATCH_MAX) throw std::runtime_error("step_batch: n must be 1..4");
+    if (pos < 0 || pos + n > max_pos_) {
+      throw std::runtime_error("step_batch: positions " + std::to_string(pos) + ".." + std::to_string(pos + n - 1) +
+                               " leave the cache");
+    }
+    check(cudaSetDevice(dev0_), "set device 0");
+    // One token is the single-token step: exact by construction, and faster than a block of one.
+    if (n == 1 && !std::getenv("QWEN35MOE_BATCH_AT_ONE")) {
+      return step(ids[0], pos, next_tokens, error);
+    }
+    ensure_batch();
+    last_pos_ = pos + n - 1;
+    s_ = nullptr;
+    cap_ = nullptr;  // the batch path is eager: it switches devices inside the layer loop
+    batch_body(ids, n, pos);
+    check(kernels::argmax_rows(ba_.logits, n, VOCAB, ba_.argmax, s_), "batch argmax");
+    read_back(next_tokens, ba_.argmax, std::size_t(n) * 4);
+    if (batch_logits_kept_) {
+      read_back(batch_logits_host_.data(), ba_.logits, std::size_t(n) * VOCAB * 4);
+      read_back(batch_residual_host_.data(), ba_.x, std::size_t(n) * HIDDEN * 4);
+    }
+    return true;
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
+
+int Decoder::splits_at(int pos) const {  // One flash-decode split per kSplitPositions positions, capped: the bucket the graph is keyed by.
   if (!attn_splits_depth_) return std::max(1, std::min(kernels::kMaxSplits, (pos + kSplitPositions) / kSplitPositions));
   // Depth-scaled: one column per kSplitPositionsFine positions, so a shallow cache still spreads over waves
   // of blocks instead of one block per query head. Monotone in pos, and it reaches the cap at

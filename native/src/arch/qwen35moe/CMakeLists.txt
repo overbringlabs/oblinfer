@@ -47,7 +47,8 @@ target_link_libraries(qwen35moe_uploader PUBLIC ingine_core PRIVATE qwen35moe_da
 add_library(qwen35moe_decoder OBJECT model/decoder.cu model/decode_graph.cu)
 ingine_cuda_target(qwen35moe_decoder)
 target_include_directories(qwen35moe_decoder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(qwen35moe_decoder PUBLIC qwen35moe_uploader qwen35moe_moe qwen35moe_attn ingine_kernels_gdn
+target_link_libraries(qwen35moe_decoder PUBLIC qwen35moe_uploader qwen35moe_moe qwen35moe_attn qwen35moe_batch
+                                            ingine_kernels_gdn
                                             ingine_kernels_quant ingine_kernels_dense_ops ingine_core
                       PRIVATE qwen35moe_data CUDA::cudart)
 

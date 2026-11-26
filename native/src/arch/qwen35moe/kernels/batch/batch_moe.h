@@ -94,4 +94,25 @@ inline std::int64_t batch_moe_weight_bytes(const BatchMoePlanHost& host) {
                                             (MOE_INTER * MOE_HIDDEN / 16) * 3);
 }
 
+// ---- router and shared expert at verify width ----
+
+// n tokens, one routing pass. The logits kernel is the single-token kernel's shape — one warp per expert,
+// lane-stride-32 column order — with one accumulator per token, so token t's logits are bit-identical to
+// kernels/moe/router.cu's and its ids and weights come out the same. The selection is the same rank sweep, one
+// block per token, so ties still resolve to the lower expert id and the eight weights are the same softmax.
+struct BatchRouterArgs {
+  const __nv_bfloat16* weight = nullptr;  // [ROUTER_EXPERTS, ROUTER_HIDDEN], mlp.gate.weight
+  const float* x = nullptr;               // [n, ROUTER_HIDDEN]
+  int* ids = nullptr;                     // [n, ROUTER_TOP_K], descending logit
+  float* weights = nullptr;               // [n, ROUTER_TOP_K], softmax over the selected logits
+  float* logits = nullptr;                // [n, ROUTER_EXPERTS] scratch
+  int n = 0;
+};
+cudaError_t route_rows(const BatchRouterArgs& args, cudaStream_t stream);
+
+// y[t] = sigmoid(<gate_weight, x[t]>) * y[t], the shared expert's bf16 scalar gate at verify width. One block
+// per token, same dot order as kernels/moe/shared_expert.cu's scale_sigmoid_dot.
+cudaError_t scale_sigmoid_rows(float* y, const __nv_bfloat16* gate_weight, const float* x, int rows, int width,
+                               cudaStream_t stream);
+
 }  // namespace ingine::arch::qwen35moe::kernels

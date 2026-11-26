@@ -4,6 +4,7 @@
 #include <cstddef>
 
 #include "arch/qwen35moe/kernels/batch/batch_gemv.h"
+#include "kernels/gdn/conv.h"
 
 namespace ingine::arch::qwen35moe::kernels {
 namespace {
@@ -141,6 +142,96 @@ __global__ __launch_bounds__(kThreads) void gdn_steps_kernel(const GdnStepsArgs 
   for (int j = 0; j < kRowsPerThread; ++j) s_head[std::size_t(i0 + j) * kV] = sreg[j];
 }
 
+// ---- the per-position passes around the recurrence ---- verbatim from kernels/gdn/{conv,gates}.cu, one
+// position at a time inside the block, so row t of the batched call is the single-token kernel's output.
+
+constexpr int kConvThreads = 256;
+constexpr int kNormThreads = 128;
+
+__device__ __forceinline__ float silu(float v) { return v / (1.0f + __expf(-v)); }
+
+__global__ __launch_bounds__(kConvThreads) void conv_silu_steps_kernel(const ConvStepsArgs args) {
+  const int c = blockIdx.x * kConvThreads + threadIdx.x;
+  if (c >= args.conv_dim) return;
+  const int d = args.conv_dim;
+  float* h0 = args.history;
+  float* h1 = args.history + d;
+  float* h2 = args.history + 2 * d;
+  float x0 = h0[c], x1 = h1[c], x2 = h2[c];
+  const float* w = args.weight + std::size_t(c) * gdn::CONV_K;
+  for (int p = 0; p < args.n; ++p) {
+    const float xn = args.x[std::size_t(p) * d + c];
+    const float acc = w[0] * x0 + w[1] * x1 + w[2] * x2 + w[3] * xn;
+    args.y[std::size_t(p) * d + c] = silu(acc);
+    x0 = x1;
+    x1 = x2;
+    x2 = xn;
+  }
+  h0[c] = x0;
+  h1[c] = x1;
+  h2[c] = x2;
+}
+
+// Contiguous q/k/v per row: the output layout is the single-token gather's, applied to every row of the block.
+__global__ __launch_bounds__(256) void gather_qkv_rows_kernel(const GatherQkvRowsArgs args) {
+  const int kt = args.key_heads * args.key_dim;
+  const int vt = args.value_heads * args.value_dim;
+  const int per_row = 2 * kt + vt;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= args.rows * per_row) return;
+  const int t = i / per_row;
+  const int j = i - t * per_row;
+  const float* src = args.qkv + std::size_t(t) * per_row;
+  if (j < kt) {
+    const int kh = j / args.key_dim, d = j - kh * args.key_dim;
+    args.q[std::size_t(t) * kt + j] = src[args.grouped ? kh * (2 * args.key_dim + vt / args.key_heads) + d : j];
+  } else if (j < 2 * kt) {
+    const int jj = j - kt;
+    const int kh = jj / args.key_dim, d = jj - kh * args.key_dim;
+    args.k[std::size_t(t) * kt + jj] =
+        src[args.grouped ? kh * (2 * args.key_dim + vt / args.key_heads) + args.key_dim + d : j];
+  } else {
+    const int jj = j - 2 * kt;
+    const int kh = jj / (vt / args.key_heads);
+    const int d = jj - kh * (vt / args.key_heads);
+    args.v[std::size_t(t) * vt + jj] =
+        src[args.grouped ? kh * (2 * args.key_dim + vt / args.key_heads) + 2 * args.key_dim + d : j];
+  }
+}
+
+__global__ void gdn_gates_rows_kernel(const GdnGatesRowsArgs args) {  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= args.rows * args.heads) return;
+  const int h = i % args.heads;
+  const float b = args.b[i];
+  args.beta[i] = 1.0f / (1.0f + __expf(-b));
+  const float x = args.a[i] + args.dt_bias[h];
+  const float softplus = x > 20.0f ? x : __logf(1.0f + __expf(x));
+  args.g[i] = -__expf(args.a_log[h]) * softplus;
+}
+
+__global__ __launch_bounds__(kNormThreads) void gated_norm_rows_kernel(const GatedNormRowsArgs args) {
+  const int row = blockIdx.x;
+  const int d = threadIdx.x;
+  const int base = row * args.v_dim;
+  __shared__ float warp_sums[kNormThreads / 32];
+  __shared__ float inv;
+
+  const float x = args.x[base + d];
+  float sum = warp_sum(x * x);
+  if ((threadIdx.x & 31) == 0) warp_sums[threadIdx.x >> 5] = sum;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kNormThreads / 32; ++w) total += warp_sums[w];
+    inv = rsqrtf(total / float(args.v_dim) + args.eps);
+  }
+  __syncthreads();
+
+  const float z = args.z[base + d];
+  args.x[base + d] = x * inv * args.weight[d] * silu(z);
+}
+
 }  // namespace
 
 cudaError_t gdn_recurrent_steps(const GdnStepsArgs& args, cudaStream_t stream) {
@@ -151,6 +242,42 @@ cudaError_t gdn_recurrent_steps(const GdnStepsArgs& args, cudaStream_t stream) {
   if (args.v_heads != 32) return cudaErrorInvalidValue;  // this pack's linear_value_num_heads
   const dim3 grid(args.v_heads, kColGroups);
   gdn_steps_kernel<32><<<grid, kThreads, 0, stream>>>(args);
+  return cudaGetLastError();
+}
+
+cudaError_t conv_silu_steps(const ConvStepsArgs& args, cudaStream_t stream) {
+  if (!args.x || !args.weight || !args.history || !args.y) return cudaErrorInvalidValue;
+  if (args.conv_dim <= 0 || args.n < 1 || args.n > BATCH_MAX) return cudaErrorInvalidValue;
+  const int blocks = (args.conv_dim + kConvThreads - 1) / kConvThreads;
+  conv_silu_steps_kernel<<<blocks, kConvThreads, 0, stream>>>(args);
+  return cudaGetLastError();
+}
+
+cudaError_t gather_qkv_rows(const GatherQkvRowsArgs& args, cudaStream_t stream) {
+  if (!args.qkv || !args.q || !args.k || !args.v) return cudaErrorInvalidValue;
+  if (args.key_heads <= 0 || args.key_dim <= 0 || args.value_heads <= 0 || args.value_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (args.rows < 1 || args.rows > BATCH_MAX) return cudaErrorInvalidValue;
+  if (args.value_heads % args.key_heads) return cudaErrorInvalidValue;
+  const int total = args.rows * (2 * args.key_heads * args.key_dim + args.value_heads * args.value_dim);
+  gather_qkv_rows_kernel<<<(total + 255) / 256, 256, 0, stream>>>(args);
+  return cudaGetLastError();
+}
+
+cudaError_t gdn_gates_rows(const GdnGatesRowsArgs& args, cudaStream_t stream) {  if (!args.a || !args.b || !args.dt_bias || !args.a_log || !args.beta || !args.g) return cudaErrorInvalidValue;
+  if (args.heads <= 0 || args.rows < 1 || args.rows > BATCH_MAX) return cudaErrorInvalidValue;
+  const int total = args.heads * args.rows;
+  gdn_gates_rows_kernel<<<(total + 127) / 128, 128, 0, stream>>>(args);
+  return cudaGetLastError();
+}
+
+cudaError_t gated_norm_rows(const GatedNormRowsArgs& args, cudaStream_t stream) {
+  if (!args.x || !args.z || !args.weight) return cudaErrorInvalidValue;
+  if (args.heads <= 0 || args.v_dim != kNormThreads || args.rows < 1 || args.rows > BATCH_MAX) {
+    return cudaErrorInvalidValue;
+  }
+  gated_norm_rows_kernel<<<args.rows * args.heads, kNormThreads, 0, stream>>>(args);
   return cudaGetLastError();
 }
 

@@ -8,6 +8,7 @@
 
 #include "arch/qwen35moe/kernels/attn/decode_attn.h"
 #include "arch/qwen35moe/kernels/attn/rope_norm.h"
+#include "arch/qwen35moe/kernels/batch/batch_gemv.h"
 #include "arch/qwen35moe/kernels/moe/moe_apply.h"
 #include "arch/qwen35moe/kernels/moe/router.h"
 #include "arch/qwen35moe/kernels/moe/shared_expert.h"
@@ -91,6 +92,12 @@ __global__ void bf16_row_to_f32_kernel(const __nv_bfloat16* src, float* dst, int
   if (i < n) dst[i] = __bfloat162float(src[i]);
 }
 
+// The reverse, for the row drafts 1.. of a chain consume: draft i's h' as the BF16 row draft i + 1 takes.
+__global__ void f32_row_to_bf16_kernel(const float* src, __nv_bfloat16* dst, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = __float2bfloat16(src[i]);
+}
+
 // One flash-decode column per this many positions, capped like the trunk's Decoder::splits_at: at 262144
 // positions the drafter runs 64 columns over 16 query heads.
 constexpr int kSplitPositions = 2048;
@@ -129,6 +136,14 @@ void MtpDrafter::release() {
   argmax_ = nullptr;
   if (partial_) cudaFree(partial_);
   partial_ = nullptr;
+  if (chain_hidden_) cudaFree(chain_hidden_);
+  chain_hidden_ = nullptr;
+  if (chain_logits_) cudaFree(chain_logits_);
+  chain_logits_ = nullptr;
+  if (chain_bf16_) cudaFree(chain_bf16_);
+  chain_bf16_ = nullptr;
+  if (chain_ids_) cudaFree(chain_ids_);
+  chain_ids_ = nullptr;
   if (k_cache_) cudaFree(k_cache_);
   k_cache_ = nullptr;
   if (v_cache_) cudaFree(v_cache_);
@@ -277,6 +292,11 @@ bool MtpDrafter::allocate(int max_pos, MtpKvType kv_type, std::string* error) {
   partial_ = static_cast<attn::SplitState*>(
       alloc(std::size_t(attn::ATTN_HEADS) * attn::kMaxSplits * sizeof(attn::SplitState)));
   scratch_bytes_ += std::size_t(attn::ATTN_HEADS) * attn::kMaxSplits * sizeof(attn::SplitState);
+  take(&chain_hidden_, std::size_t(kMtpChainMax) * HIDDEN);
+  take(&chain_logits_, std::size_t(kMtpChainMax) * VOCAB);
+  chain_bf16_ = static_cast<__nv_bfloat16*>(alloc(std::size_t(HIDDEN) * sizeof(__nv_bfloat16)));
+  chain_ids_ = static_cast<int*>(alloc(std::size_t(kMtpChainMax) * sizeof(int)));
+  scratch_bytes_ += std::size_t(HIDDEN) * sizeof(__nv_bfloat16) + std::size_t(kMtpChainMax) * sizeof(int);
   return true;
 }
 
@@ -315,30 +335,13 @@ bool MtpDrafter::init(const std::filesystem::path& snapshot_dir, const MtpTrunkH
   }
 }
 
-bool MtpDrafter::draft(int token, const __nv_bfloat16* hidden, int pos, int* next_token, std::string* error,
-                       MtpTiming* timing) {
-  if (!weights_ || !stream_) {
-    *error = "not initialised";
-    return false;
-  }
-  if (!hidden || !next_token) {
-    *error = "hidden state row and token output are required";
-    return false;
-  }
-  if (pos < 0 || pos >= max_pos_) {
-    *error = "pos " + std::to_string(pos) + " outside [0, " + std::to_string(max_pos_) + ")";
-    return false;
-  }
-  if (token < 0 || token >= VOCAB) {
-    *error = "token " + std::to_string(token) + " outside the vocabulary";
-    return false;
-  }
+bool MtpDrafter::forward(int token, const __nv_bfloat16* hidden, int pos, float* out_row, bool timed,
+                         std::string* error) {
   const cudaStream_t s = stream_;
   auto mark = [&](int index) {
-    if (timing) check(cudaEventRecord(events_[index], s), "event record");
+    if (timed) check(cudaEventRecord(events_[index], s), "event record");
   };
   try {
-    check(cudaSetDevice(device_), "set device");
     mark(0);
 
     // ---- dense, up to the cache store: embedding, both pre-fc norms, fc, the attention projections ----
@@ -437,8 +440,41 @@ bool MtpDrafter::draft(int token, const __nv_bfloat16* hidden, int pos, int* nex
     check(attn::axpy(x_, shared_, 1.0f, HIDDEN, s), "shared residual");
     mark(5);
 
-    // ---- mtp.norm and the trunk's NVFP4 head ----
-    check(dense::rms_norm(x_, n_.final, out_, HIDDEN, EPS, s), "mtp norm");
+    // ---- mtp.norm: the row the head is run on ----
+    check(dense::rms_norm(x_, n_.final, out_row, HIDDEN, EPS, s), "mtp norm");
+    mark(6);
+    return true;
+  } catch (const std::exception& e) {
+    *error = e.what();
+    return false;
+  }
+}
+
+bool MtpDrafter::draft(int token, const __nv_bfloat16* hidden, int pos, int* next_token, std::string* error,
+                       MtpTiming* timing) {
+  if (!weights_ || !stream_) {
+    *error = "not initialised";
+    return false;
+  }
+  if (!hidden || !next_token) {
+    *error = "hidden state row and token output are required";
+    return false;
+  }
+  if (pos < 0 || pos >= max_pos_) {
+    *error = "pos " + std::to_string(pos) + " outside [0, " + std::to_string(max_pos_) + ")";
+    return false;
+  }
+  if (token < 0 || token >= VOCAB) {
+    *error = "token " + std::to_string(token) + " outside the vocabulary";
+    return false;
+  }
+  const cudaStream_t s = stream_;
+  float stages[6] = {};
+  try {
+    check(cudaSetDevice(device_), "set device");
+    if (!forward(token, hidden, pos, out_, timing != nullptr, error)) return false;
+
+    // ---- the trunk's NVFP4 head, one row ----
     quant::Nvfp4GemvArgs head;
     head.w = head_w_;
     head.scales = head_scales_;
@@ -449,18 +485,125 @@ bool MtpDrafter::draft(int token, const __nv_bfloat16* hidden, int pos, int* nex
     head.cols = HIDDEN;
     check(quant::nvfp4_gemv(head, s), "lm_head");
     check(dense::argmax(logits_, VOCAB, argmax_, nullptr, s), "argmax");
-    mark(6);
+    if (timing) check(cudaEventRecord(events_[7], s), "event record");
     check(cudaMemcpyAsync(next_token, argmax_, sizeof(int), cudaMemcpyDeviceToHost, s), "argmax readback");
     check(cudaStreamSynchronize(s), "draft");
 
     if (timing) {
-      float t[6] = {};
-      for (int k = 0; k < 6; ++k) check(cudaEventElapsedTime(&t[k], events_[k], events_[k + 1]), "elapsed");
-      timing->dense_ms = t[0] + t[2];  // the projections before the store and the ones after the merge
-      timing->attn_ms = t[1];
-      timing->routed_ms = t[3];
-      timing->shared_ms = t[4];
-      timing->head_ms = t[5];
+      stage_times(stages);
+      float tail_ms = 0.0f;
+      check(cudaEventElapsedTime(&tail_ms, events_[6], events_[7]), "elapsed");
+      timing->dense_ms = stages[0] + stages[2];  // the projections before the store and the ones after the merge
+      timing->attn_ms = stages[1];
+      timing->routed_ms = stages[3];
+      timing->shared_ms = stages[4];
+      timing->head_ms = stages[5] + tail_ms;  // mtp.norm, the head, argmax and the readback
+    }
+    return true;
+  } catch (const std::exception& e) {
+    *error = e.what();
+    return false;
+  }
+}
+
+void MtpDrafter::stage_times(float stages[6]) {
+  for (int k = 0; k < 6; ++k) check(cudaEventElapsedTime(&stages[k], events_[k], events_[k + 1]), "elapsed");
+}
+
+bool MtpDrafter::chain_head(int n, std::string* error) {
+  const cudaStream_t s = stream_;
+  try {
+    // kernels::BATCH_MAX rows per pass over the weights: a seven-draft chain is two passes, not seven.
+    for (int first = 0; first < n; first += kernels::BATCH_MAX) {
+      const int rows = std::min(kernels::BATCH_MAX, n - first);
+      kernels::Nvfp4GemvBatchArgs head;
+      head.w = head_w_;
+      head.scales = head_scales_;
+      head.scale = head_scale_;
+      head.x = chain_hidden_ + std::size_t(first) * HIDDEN;
+      head.y = chain_logits_ + std::size_t(first) * VOCAB;
+      head.rows = VOCAB;
+      head.cols = HIDDEN;
+      head.n = rows;
+      check(kernels::nvfp4_gemv_batch(head, s), "lm_head batch");
+      for (int r = 0; r < rows; ++r) {
+        check(dense::argmax(chain_logits_ + std::size_t(first + r) * VOCAB, VOCAB, chain_ids_ + first + r, nullptr,
+                            s),
+              "argmax row");
+      }
+    }
+    return true;
+  } catch (const std::exception& e) {
+    *error = e.what();
+    return false;
+  }
+}
+
+bool MtpDrafter::draft_chain(const int* tokens, const __nv_bfloat16* hidden, int n, int pos, int* out_tokens,
+                             std::string* error, MtpChainTiming* timing) {
+  if (!weights_ || !stream_) {
+    *error = "not initialised";
+    return false;
+  }
+  if (!tokens || !hidden || !out_tokens) {
+    *error = "candidate tokens, hidden state row and token output are required";
+    return false;
+  }
+  if (n < 1 || n > kMtpChainMax) {
+    *error = "chain length " + std::to_string(n) + " outside [1, " + std::to_string(kMtpChainMax) + "]";
+    return false;
+  }
+  if (pos < 0 || std::int64_t(pos) + n > max_pos_) {
+    *error = "positions " + std::to_string(pos) + ".." + std::to_string(pos + n - 1) + " outside [0, " +
+             std::to_string(max_pos_) + ")";
+    return false;
+  }
+  for (int i = 0; i < n; ++i) {
+    if (tokens[i] < 0 || tokens[i] >= VOCAB) {
+      *error = "token " + std::to_string(tokens[i]) + " at chain index " + std::to_string(i) +
+               " outside the vocabulary";
+      return false;
+    }
+  }
+  const cudaStream_t s = stream_;
+  try {
+    check(cudaSetDevice(device_), "set device");
+    float sums[6] = {};
+    for (int i = 0; i < n; ++i) {
+      if (!forward(tokens[i], i == 0 ? hidden : chain_bf16_, pos + i, chain_hidden_ + std::size_t(i) * HIDDEN,
+                   timing != nullptr, error)) {
+        return false;
+      }
+      if (timing) {
+        // The six phase events are one set per forward, so a timed chain waits for each forward before reading
+        // them. Untimed chains, which is every production call, never record or wait for an event.
+        check(cudaStreamSynchronize(s), "chain stage sync");
+        float stages[6] = {};
+        stage_times(stages);
+        for (int k = 0; k < 6; ++k) sums[k] += stages[k];
+      }
+      if (i + 1 < n) {
+        // h' is FP32 on the device; the next draft takes the BF16 row draft() would have been handed.
+        f32_row_to_bf16_kernel<<<HIDDEN / 256, 256, 0, s>>>(chain_hidden_ + std::size_t(i) * HIDDEN, chain_bf16_,
+                                                            HIDDEN);
+        check(cudaGetLastError(), "hidden row to bf16");
+      }
+    }
+    if (!chain_head(n, error)) return false;
+    if (timing) check(cudaEventRecord(events_[7], s), "event record");
+    check(cudaMemcpyAsync(out_tokens, chain_ids_, std::size_t(n) * sizeof(int), cudaMemcpyDeviceToHost, s),
+          "chain token readback");
+    check(cudaStreamSynchronize(s), "draft chain");
+
+    if (timing) {
+      float head_ms = 0.0f;
+      check(cudaEventElapsedTime(&head_ms, events_[6], events_[7]), "elapsed");
+      timing->dense_ms = sums[0] + sums[2];
+      timing->attn_ms = sums[1];
+      timing->routed_ms = sums[3];
+      timing->shared_ms = sums[4] + sums[5];  // mtp.norm is per position inside a chain
+      timing->head_ms = head_ms;
+      timing->forward_ms = sums[0] + sums[1] + sums[2] + sums[3] + sums[4] + sums[5];
     }
     return true;
   } catch (const std::exception& e) {

@@ -265,6 +265,90 @@ __global__ __launch_bounds__(256) void batch_reduce_kernel(const BatchMoeArgs ar
   args.y[i] = sum;
 }
 
+// Router at verify width: one warp per expert reads its row once and dots every token's hidden state against
+// it, with one accumulator per token. The per-token column walk (lane, lane + 32, ...) and the butterfly are
+// kernels/moe/router.cu's, so logits[t] is the same fp32 value the single-token router produces.
+constexpr int kRouterThreads = 256;
+constexpr int kRouterPerBlock = kRouterThreads / 32;
+
+__global__ __launch_bounds__(kRouterThreads) void router_logits_rows_kernel(const __nv_bfloat16* w, const float* x,
+                                                                           float* logits, int n) {
+  const int expert = blockIdx.x * kRouterPerBlock + (threadIdx.x >> 5);
+  if (expert >= ROUTER_EXPERTS) return;
+  const int lane = threadIdx.x & 31;
+  const __nv_bfloat16* row = w + std::size_t(expert) * ROUTER_HIDDEN;
+
+  float acc[BATCH_MAX];
+#pragma unroll
+  for (int t = 0; t < BATCH_MAX; ++t) acc[t] = 0.0f;
+  for (int i = lane; i < ROUTER_HIDDEN; i += 32) {
+    const float wi = __bfloat162float(row[i]);
+    for (int t = 0; t < n; ++t) acc[t] += wi * x[std::size_t(t) * ROUTER_HIDDEN + i];
+  }
+  for (int t = 0; t < n; ++t) {
+    acc[t] = bd::warp_sum(acc[t]);
+    if (lane == 0) logits[std::size_t(t) * ROUTER_EXPERTS + expert] = acc[t];
+  }
+}
+
+// The rank sweep of kernels/moe/router.cu, one block per token.
+__global__ __launch_bounds__(ROUTER_EXPERTS) void router_select_rows_kernel(const float* logits, int* ids,
+                                                                           float* weights) {
+  const int t = blockIdx.x;
+  __shared__ __align__(16) float s_key[ROUTER_EXPERTS];
+  __shared__ float s_pick[ROUTER_TOP_K];
+  const int e = threadIdx.x;
+  const float v = logits[std::size_t(t) * ROUTER_EXPERTS + e];
+  s_key[e] = v != v ? -INFINITY : v;
+  __syncthreads();
+
+  const float k = s_key[e];
+  int rank = 0;
+#pragma unroll 4
+  for (int b = 0; b < ROUTER_EXPERTS; b += 4) {
+    const float4 q = reinterpret_cast<const float4*>(s_key)[b >> 2];
+    const auto beats = [&](float a, int ia) { return a > k || (a == k && ia < e); };
+    rank += beats(q.x, b + 0) + beats(q.y, b + 1) + beats(q.z, b + 2) + beats(q.w, b + 3);
+  }
+  if (rank < ROUTER_TOP_K) {
+    ids[std::size_t(t) * ROUTER_TOP_K + rank] = e;
+    s_pick[rank] = v;
+  }
+  __syncthreads();
+
+  if (e != 0) return;
+  float m = -INFINITY;
+  for (int r = 0; r < ROUTER_TOP_K; ++r) m = fmaxf(m, s_pick[r]);
+  float sum = 0.0f;
+  for (int r = 0; r < ROUTER_TOP_K; ++r) sum += expf(s_pick[r] - m);
+  for (int r = 0; r < ROUTER_TOP_K; ++r) {
+    weights[std::size_t(t) * ROUTER_TOP_K + r] = expf(s_pick[r] - m) / sum;
+  }
+}
+
+// One block per token: the 2048-wide dot, then the same 2048-wide scale.
+__global__ __launch_bounds__(256) void scale_sigmoid_rows_kernel(float* y, const __nv_bfloat16* w, const float* x,
+                                                                int width) {
+  const int t = blockIdx.x;
+  float* yt = y + std::size_t(t) * width;
+  const float* xt = x + std::size_t(t) * width;
+  __shared__ float warp_sums[8];
+  __shared__ float gate;
+
+  float acc = 0.0f;
+  for (int i = threadIdx.x; i < width; i += blockDim.x) acc += __bfloat162float(w[i]) * xt[i];
+  acc = bd::warp_sum(acc);
+  if ((threadIdx.x & 31) == 0) warp_sums[threadIdx.x >> 5] = acc;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+    for (int k = 0; k < 8; ++k) total += warp_sums[k];
+    gate = 1.0f / (1.0f + __expf(-total));
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < width; i += blockDim.x) yt[i] *= gate;
+}
+
 // One NVFP4 GEMV in FP64 over the checkpoint's bytes: the oracle for every expert projection here.
 template <typename X>
 void expert_row(const std::uint8_t* w, const std::uint8_t* s, double scale, const X* x, double* y, int rows,
@@ -345,6 +429,24 @@ cudaError_t batch_moe_apply(const BatchMoeArgs& args, cudaStream_t stream) {
   if (err != cudaSuccess) return err;
 
   batch_reduce_kernel<<<(args.n * MOE_HIDDEN + 255) / 256, 256, 0, stream>>>(args);
+  return cudaGetLastError();
+}
+
+cudaError_t route_rows(const BatchRouterArgs& args, cudaStream_t stream) {
+  if (!args.weight || !args.x || !args.ids || !args.weights || !args.logits) return cudaErrorInvalidValue;
+  if (args.n < 1 || args.n > BATCH_MAX) return cudaErrorInvalidValue;
+  const int blocks = (ROUTER_EXPERTS + kRouterPerBlock - 1) / kRouterPerBlock;
+  router_logits_rows_kernel<<<blocks, kRouterThreads, 0, stream>>>(args.weight, args.x, args.logits, args.n);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  router_select_rows_kernel<<<args.n, ROUTER_EXPERTS, 0, stream>>>(args.logits, args.ids, args.weights);
+  return cudaGetLastError();
+}
+
+cudaError_t scale_sigmoid_rows(float* y, const __nv_bfloat16* gate_weight, const float* x, int rows, int width,
+                               cudaStream_t stream) {
+  if (!y || !gate_weight || !x || rows < 1 || rows > BATCH_MAX || width <= 0) return cudaErrorInvalidValue;
+  scale_sigmoid_rows_kernel<<<rows, 256, 0, stream>>>(y, gate_weight, x, width);
   return cudaGetLastError();
 }
 

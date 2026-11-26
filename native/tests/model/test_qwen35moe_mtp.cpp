@@ -8,7 +8,10 @@
 //      against BF16 over the same k/v stream;
 //   4. the module on all three cache types, on the same seven positions;
 //   5. the cost: milliseconds per drafted token at 1k / 32k / 256k positions split into its five stages, the
-//      bytes it reads, and what the module allocates at 262144.
+//      bytes it reads, and what the module allocates at 262144;
+//   6. the batched chain: a row of draft_chain() against the serial draft of the same token, hidden and position
+//      (tokens, h' and logits), and the cost of a 1/3/7-draft chain, serial against one batched head, at 1k and
+//      262k positions.
 // Skipped unless QWEN35MOE_SNAPSHOT is set.
 #include "common/test_util.h"
 
@@ -977,6 +980,166 @@ int main() {
                 "layers = 0.54 ms per layer, so one draft (%.3f ms) is %.1fx a quantised trunk layer at the same "
                 "depth\n",
                 deepest_ms, deepest_ms / 0.5415);
+  }
+
+  // ---- 6. the batched chain ------------------------------------------------------------------------------
+  // draft_chain() runs the same forward per draft and the trunk's NVFP4 head once over all n rows, so a row of
+  // a chain has to be the row the serial draft of the same token, hidden and position produces. h' is required at
+  // 1e-6 of its rms (the forwards are the same launches, so the measured difference is zero) and the logits at
+  // 2e-5, which is the batch module's own bar against its FP64 mirror: the batched kernel is a different
+  // reduction from the shipped single-row head, and a chain compares a max over n * VOCAB elements, more samples
+  // than that test's n = 1 check, so its 1e-6 bar would be measuring the sample count (the measured value is
+  // printed either way). The greedy tokens are required to be identical, which is the property the head exists
+  // for.
+  {
+    qwen::MtpDrafter drafter;
+    std::string error;
+    cudaSetDevice(0);
+    if (!drafter.init(dir, trunk.view, qwen::MAX_POS, qwen::kMtpKvDefault, 0, &error)) {
+      fail("chain init: " + error);
+      return 1;
+    }
+    const int chain_tokens[] = {1879, 314, 3377, 13, 271, 71093, 3237, 1043};
+    constexpr int kChainTokens = int(sizeof(chain_tokens) / sizeof(chain_tokens[0]));
+    std::vector<__nv_bfloat16> bf_row(HIDDEN);
+
+    auto row_ratio = [](const float* got, const float* ref, int width) {
+      double worst = 0.0, sq = 0.0;
+      for (int i = 0; i < width; ++i) {
+        worst = std::max(worst, std::fabs(double(got[i]) - double(ref[i])));
+        sq += double(ref[i]) * double(ref[i]);
+      }
+      const double rms = std::sqrt(sq / double(width));
+      return rms > 0.0 ? worst / rms : worst;
+    };
+
+    // One serial chain of k drafts from `base`: draft(), then the BF16 rounding of h' between the drafts, which
+    // is what the decoder path does and what the chain does for itself. h_out / logits_out are optional.
+    auto run_serial = [&](int k, int base, std::vector<int>* tokens_out, std::vector<std::vector<float>>* h_out,
+                          std::vector<std::vector<float>>* logits_out) {
+      upload_hidden(0);
+      std::vector<float> h(HIDDEN);
+      for (int i = 0; i < k; ++i) {
+        if (i > 0) {
+          for (int d = 0; d < HIDDEN; ++d) bf_row[std::size_t(d)] = float_to_bf16(h[std::size_t(d)]);
+          INGINE_TEST_CUDA(cudaMemcpy(d_hidden.get(), bf_row.data(), bf_row.size() * sizeof(__nv_bfloat16),
+                                      cudaMemcpyHostToDevice));
+        }
+        int next = -1;
+        if (!drafter.draft(chain_tokens[i], d_hidden.get(), base + i, &next, &error)) return false;
+        (*tokens_out)[std::size_t(i)] = next;
+        INGINE_TEST_CUDA(cudaMemcpy(h.data(), drafter.last_hidden(), HIDDEN * sizeof(float),
+                                    cudaMemcpyDeviceToHost));
+        if (h_out) {
+          (*h_out)[std::size_t(i)] = h;
+          (*logits_out)[std::size_t(i)].resize(VOCAB);
+          INGINE_TEST_CUDA(cudaMemcpy((*logits_out)[std::size_t(i)].data(), drafter.logits(),
+                                      VOCAB * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+      }
+      return true;
+    };
+
+    // 6a: the rows. Position 0, so the cache is empty on both sides and the comparison is of the kernels alone.
+    upload_hidden(0);
+    for (int k : {1, 3, 7}) {
+      std::vector<int> serial(k), chained(k);
+      std::vector<std::vector<float>> serial_h(k), serial_logits(k);
+      if (!run_serial(k, 0, &serial, &serial_h, &serial_logits)) {
+        fail("serial drafts: " + error);
+        ok = false;
+        continue;
+      }
+      upload_hidden(0);
+      qwen::MtpChainTiming timing;
+      if (!drafter.draft_chain(chain_tokens, d_hidden.get(), k, 0, chained.data(), &error, &timing)) {
+        fail("draft_chain: " + error);
+        ok = false;
+        continue;
+      }
+      std::vector<float> got_h(std::size_t(k) * HIDDEN), got_logits(std::size_t(k) * VOCAB);
+      INGINE_TEST_CUDA(cudaMemcpy(got_h.data(), drafter.chain_hidden(), got_h.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+      INGINE_TEST_CUDA(cudaMemcpy(got_logits.data(), drafter.chain_logits(), got_logits.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+      std::vector<int> ids(k);
+      INGINE_TEST_CUDA(cudaMemcpy(ids.data(), drafter.chain_ids(), std::size_t(k) * sizeof(int),
+                                  cudaMemcpyDeviceToHost));
+
+      bool same_tokens = true;
+      double worst_h = 0.0, worst_logits = 0.0;
+      int worst_logits_row = 0;
+      for (int i = 0; i < k; ++i) {
+        same_tokens = same_tokens && ids[std::size_t(i)] == serial[std::size_t(i)] &&
+                      chained[std::size_t(i)] == serial[std::size_t(i)];
+        worst_h = std::max(worst_h, row_ratio(&got_h[std::size_t(i) * HIDDEN], serial_h[std::size_t(i)].data(),
+                                              HIDDEN));
+        const double logits_ratio =
+            row_ratio(&got_logits[std::size_t(i) * VOCAB], serial_logits[std::size_t(i)].data(), VOCAB);
+        if (logits_ratio > worst_logits) {
+          worst_logits = logits_ratio;
+          worst_logits_row = i;
+        }
+      }
+      const bool row_ok = same_tokens && worst_h <= 1e-6 && worst_logits <= 2e-5;
+      std::printf("%s chain k=%d against %d serial drafts: tokens %s, h' ratio %.3e (tol 1e-6), logits ratio "
+                  "%.3e at row %d (tol 2e-5)\n",
+                  row_ok ? "PASS" : "FAIL", k, k, same_tokens ? "identical" : "differ", worst_h, worst_logits,
+                  worst_logits_row);
+      ok &= row_ok;
+    }
+
+    // 6b: what the one head pass buys. "serial" is k draft() calls with the host hidden rebuild between them,
+    // "chain" is one draft_chain(k); both run the same k candidate tokens at the same positions.
+    const int depths[] = {1023, qwen::MAX_POS - 1};
+    constexpr int kIters = 10;
+    for (int depth : depths) {
+      std::printf("\n     chain cost at depth %d, Q4_0 cache: k candidate tokens, one verify position each\n", depth);
+      std::printf("       k   serial ms   chain ms   chain ms/draft   serial ms/draft   forward ms   head ms   "
+                  "head ms/draft\n");
+      std::vector<int> tokens_buf(32);
+      for (int k = 1; k <= 7; ++k) {
+        const int base = depth + 1 - k;
+        std::vector<int> out_tokens(k);
+        auto chain_once = [&] {
+          return drafter.draft_chain(chain_tokens, d_hidden.get(), k, base, out_tokens.data(), &error);
+        };
+        bool ran = true;
+        for (int warm = 0; warm < 2 && ran; ++warm) {
+          ran = run_serial(k, base, &tokens_buf, nullptr, nullptr) && chain_once();
+        }
+        if (!ran) {
+          fail("chain cost: " + error);
+          ok = false;
+          break;
+        }
+        auto serial_ms = [&] {
+          const auto t0 = std::chrono::steady_clock::now();
+          for (int it = 0; it < kIters; ++it) run_serial(k, base, &tokens_buf, nullptr, nullptr);
+          return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / kIters;
+        }();
+        upload_hidden(0);
+        qwen::MtpChainTiming timing{};
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int it = 0; it < kIters; ++it) {
+          if (!chain_once()) {
+            fail("chain cost: " + error);
+            ok = false;
+            break;
+          }
+        }
+        const double chain_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / kIters;
+        // One more chain with the stage events on, for the split (events cost a few microseconds).
+        if (!drafter.draft_chain(chain_tokens, d_hidden.get(), k, base, out_tokens.data(), &error, &timing)) {
+          fail("chain timing: " + error);
+          ok = false;
+          break;
+        }
+        std::printf("     %2d   %8.3f   %8.3f   %12.3f   %15.3f   %10.3f   %7.3f   %12.3f\n", k, serial_ms, chain_ms,
+                    chain_ms / k, serial_ms / k, timing.forward_ms, timing.head_ms, timing.head_ms / k);
+      }
+    }
   }
 
   if (ok) std::printf("ALL PASS\n");

@@ -216,6 +216,79 @@ __global__ __launch_bounds__(kThreads) void silu_mul_batch_kernel(float* g, cons
   g[i] = (v / (1.0f + __expf(-v))) * u[i];
 }
 
+// ---- row-wise passes ---- one block per row, the single-row kernel's arithmetic verbatim.
+
+__global__ __launch_bounds__(kThreads) void rms_norm_rows_kernel(const float* x, const float* weight, float* y,
+                                                                int width, float eps) {
+  const float* xr = x + std::size_t(blockIdx.x) * width;
+  float* yr = y + std::size_t(blockIdx.x) * width;
+  __shared__ float warp_sums[kThreads / 32];
+  __shared__ float inv;
+  const int lane = threadIdx.x & 31;
+
+  float sum = 0.0f;
+  for (int i = threadIdx.x; i < width; i += kThreads) sum += xr[i] * xr[i];
+  sum = bd::warp_sum(sum);
+  if (lane == 0) warp_sums[threadIdx.x >> 5] = sum;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+    for (int w = 0; w < kThreads / 32; ++w) total += warp_sums[w];
+    inv = rsqrtf(total / float(width) + eps);
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < width; i += kThreads) yr[i] = xr[i] * inv * weight[i];
+}
+
+__global__ __launch_bounds__(kThreads) void embedding_rows_kernel(const __nv_bfloat16* table, const int* row_ids,
+                                                                 float* x, int width) {
+  const int t = blockIdx.y;
+  const int i = blockIdx.x * kThreads + threadIdx.x;
+  if (i >= width) return;
+  x[std::size_t(t) * width + i] = __bfloat162float(table[std::size_t(row_ids[t]) * width + i]);
+}
+
+__global__ __launch_bounds__(kThreads) void argmax_rows_kernel(const float* x, int width, int* index) {
+  const int t = blockIdx.x;
+  const float* xr = x + std::size_t(t) * width;
+  __shared__ float warp_values[kThreads / 32];
+  __shared__ int warp_indices[kThreads / 32];
+  const int lane = threadIdx.x & 31;
+
+  float best = -INFINITY;
+  int best_i = 0;
+  for (int i = threadIdx.x; i < width; i += kThreads) {
+    if (xr[i] > best) {
+      best = xr[i];
+      best_i = i;
+    }
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    const float other = __shfl_down_sync(0xffffffffu, best, off);
+    const int other_i = __shfl_down_sync(0xffffffffu, best_i, off);
+    if (other > best || (other == best && other_i < best_i)) {
+      best = other;
+      best_i = other_i;
+    }
+  }
+  if (lane == 0) {
+    warp_values[threadIdx.x >> 5] = best;
+    warp_indices[threadIdx.x >> 5] = best_i;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float top = warp_values[0];
+    int top_i = warp_indices[0];
+    for (int w = 1; w < kThreads / 32; ++w) {
+      if (warp_values[w] > top || (warp_values[w] == top && warp_indices[w] < top_i)) {
+        top = warp_values[w];
+        top_i = warp_indices[w];
+      }
+    }
+    index[t] = top_i;
+  }
+}
+
 #define INGINE_BATCH_DISPATCH(kernel, n, aligned)                                       \
   if (aligned) {                                                                        \
     switch (n) {                                                                        \
@@ -266,6 +339,27 @@ cudaError_t bf16_gemv_batch(const Bf16GemvBatchArgs& args, cudaStream_t stream) 
 cudaError_t silu_mul_batch(float* g, const float* u, int count, cudaStream_t stream) {
   if (!g || !u || count <= 0) return cudaErrorInvalidValue;
   silu_mul_batch_kernel<<<(count + kThreads - 1) / kThreads, kThreads, 0, stream>>>(g, u, count);
+  return cudaGetLastError();
+}
+
+cudaError_t rms_norm_rows(const float* x, const float* weight, float* y, int rows, int width, float eps,
+                          cudaStream_t stream) {
+  if (!x || !weight || !y || rows < 1 || rows > BATCH_MAX || width <= 0) return cudaErrorInvalidValue;
+  rms_norm_rows_kernel<<<rows, kThreads, 0, stream>>>(x, weight, y, width, eps);
+  return cudaGetLastError();
+}
+
+cudaError_t embedding_rows(const __nv_bfloat16* table, const int* row_ids, float* x, int rows, int width,
+                           cudaStream_t stream) {
+  if (!table || !row_ids || !x || rows < 1 || rows > BATCH_MAX || width <= 0) return cudaErrorInvalidValue;
+  const dim3 grid((width + kThreads - 1) / kThreads, rows);
+  embedding_rows_kernel<<<grid, kThreads, 0, stream>>>(table, row_ids, x, width);
+  return cudaGetLastError();
+}
+
+cudaError_t argmax_rows(const float* x, int rows, int width, int* index, cudaStream_t stream) {
+  if (!x || !index || rows < 1 || rows > BATCH_MAX || width <= 0) return cudaErrorInvalidValue;
+  argmax_rows_kernel<<<rows, kThreads, 0, stream>>>(x, width, index);
   return cudaGetLastError();
 }
 
