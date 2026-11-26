@@ -82,3 +82,25 @@ if(TARGET qwen35moe_attn)
   ingine_add_test(NAME kernels_qwen35moe_attn_wide SOURCES test_qwen35moe_attn_wide.cu
                   LIBS qwen35moe_attn CUDA::cudart ORACLE TIMEOUT 300)
 endif()
+
+# Verify-width batch kernels: n = 1 against the shipped single-token paths, n = 2..4 against FP64 oracles.
+# Synthetic bytes at the checkpoint's shapes, so it needs no model load; runs only on sm_120.
+if(TARGET qwen35moe_batch)
+  ingine_add_test(NAME kernels_qwen35moe_batch SOURCES test_qwen35moe_batch.cpp
+                  LIBS qwen35moe_batch qwen35moe_moe qwen35moe_attn ingine_kernels_quant
+                       ingine_kernels_gdn ingine_kernels_dense_ops CUDA::cudart ORACLE TIMEOUT 600)
+  # The same kernels on the real checkpoint, plus the unique-expert histogram of a real 4-token chain and the
+  # rates the verify cost model uses. One model load carries all of it; skipped without QWEN35MOE_SNAPSHOT.
+  ingine_add_test(NAME kernels_qwen35moe_batch_chain SOURCES test_qwen35moe_batch_chain.cpp
+                  LIBS qwen35moe_batch qwen35moe_moe qwen35moe_attn qwen35moe_uploader qwen35moe_placement
+                       qwen35moe_names ingine_core ingine_kernels_quant ingine_kernels_gdn
+                       ingine_kernels_dense_ops CUDA::cudart ORACLE MODEL TIMEOUT 3600)
+endif()
+
+# Position-band KV across the two cards: the band plan and the argument guards run everywhere, the device
+# halves compare banded attention against the single-cache run (bit for bit) and the FP64 oracle on sm_120.
+# The cross-card cases need two sm_120 devices and skip to the single-device shape otherwise.
+if(TARGET qwen35moe_attn)
+  ingine_add_test(NAME kernels_qwen35moe_attn_bands SOURCES test_qwen35moe_attn_bands.cu
+                  LIBS qwen35moe_attn CUDA::cudart ORACLE TIMEOUT 600)
+endif()

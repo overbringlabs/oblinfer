@@ -31,6 +31,13 @@ bool head_range_valid(const DecodeAttnArgs& args) {
   return args.head_begin >= 0 && args.head_count > 0 && args.head_count <= ATTN_HEADS - args.head_begin;
 }
 
+// A band either is absent (pos_end < 0, whole cache) or is a non-empty window inside the capacity.
+bool band_valid(const DecodeAttnArgs& args) {
+  if (args.pos_begin < 0 || args.max_pos <= 0) return false;
+  if (args.pos_end < 0) return args.pos_begin == 0;
+  return args.pos_begin < args.pos_end && args.pos_end <= args.max_pos;
+}
+
 __device__ __forceinline__ float warp_sum(float v) {
   for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
   return v;
@@ -101,7 +108,7 @@ __global__ void kv_store_bf16_kernel(DecodeAttnArgs args) {
   const int h = blockIdx.x;
   const int d = threadIdx.x;
   if (h >= ATTN_KV_HEADS || d >= kDim) return;
-  const std::size_t at = (std::size_t(args.pos) * ATTN_KV_HEADS + h) * kDim + d;
+  const std::size_t at = (std::size_t(args.pos - args.pos_begin) * ATTN_KV_HEADS + h) * kDim + d;
   static_cast<__nv_bfloat16*>(args.k_cache)[at] = __float2bfloat16(args.k_new[h * kDim + d]);
   static_cast<__nv_bfloat16*>(args.v_cache)[at] = __float2bfloat16(args.v_new[h * kDim + d]);
 }
@@ -114,7 +121,7 @@ __global__ __launch_bounds__(256) void kv_store_q8_kernel(DecodeAttnArgs args) {
   if (h >= ATTN_KV_HEADS || warp >= kDim / KV_BLOCK) return;
   const int base_d = warp * KV_BLOCK;
   const int src = h * kDim + base_d + lane;
-  const std::size_t at = (std::size_t(args.pos) * ATTN_KV_HEADS + h) * kDim + base_d;
+  const std::size_t at = (std::size_t(args.pos - args.pos_begin) * ATTN_KV_HEADS + h) * kDim + base_d;
 
   float k = args.k_new[src];
   float v = args.v_new[src];
@@ -128,7 +135,7 @@ __global__ __launch_bounds__(256) void kv_store_q8_kernel(DecodeAttnArgs args) {
   const float kd = kmax > 0.0f ? kmax / 127.0f : 1.0f;
   const float vd = vmax > 0.0f ? vmax / 127.0f : 1.0f;
 
-  const std::uint64_t values = std::uint64_t(args.max_pos) * ATTN_KV_HEADS * kDim;
+  const std::uint64_t values = std::uint64_t(kv_cache_rows(args)) * ATTN_KV_HEADS * kDim;
   const std::size_t block = at / KV_BLOCK;
   if (lane == 0) {
     const_cast<__half*>(kv_q8_scales(args.k_cache, values))[block] = __float2half(kd);
@@ -144,7 +151,7 @@ __global__ __launch_bounds__(kDim) void decode_kernel(DecodeAttnArgs args) {
   const int kh = h / kGroup;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
-  const std::uint64_t cache_values = std::uint64_t(args.max_pos) * ATTN_KV_HEADS * kDim;
+  const std::uint64_t cache_values = std::uint64_t(kv_cache_rows(args)) * ATTN_KV_HEADS * kDim;
 
   __shared__ float scores[ATTN_CHUNK];
   __shared__ float warp_sums[kWarps];
@@ -163,6 +170,7 @@ __global__ __launch_bounds__(kDim) void decode_kernel(DecodeAttnArgs args) {
 
   const float scale = rsqrtf(float(kDim));
   float acc = 0.0f;
+  // Un-banded only: decode_attention refuses a band on this path, so global positions are rows.
   for (int base = 0; base <= args.pos; base += ATTN_CHUNK) {
     const int len = min(ATTN_CHUNK, args.pos + 1 - base);
 
@@ -234,13 +242,15 @@ __global__ __launch_bounds__(512) void kv_store_mixed_kernel(DecodeAttnArgs args
   const int warp = t >> 5;
   const int lane = t & 31;
   if (h >= ATTN_KV_HEADS) return;
+  // decode_kv_store never launches this for a position outside the band, so the row is always in range.
+  const int row = args.pos - args.pos_begin;
   const float* src = half == 0 ? args.k_new : args.v_new;
   void* dst = half == 0 ? args.k_cache : args.v_cache;
   const KvType type = half == 0 ? args.kv_type_k : args.kv_type_v;
   if (type == KvType::Bf16) {
     const int d = t;
     if (d >= kDim) return;
-    const std::size_t at = (std::size_t(args.pos) * ATTN_KV_HEADS + h) * kDim + d;
+    const std::size_t at = (std::size_t(row) * ATTN_KV_HEADS + h) * kDim + d;
     static_cast<__nv_bfloat16*>(dst)[at] = __float2bfloat16(src[h * kDim + d]);
     return;
   }
@@ -251,9 +261,9 @@ __global__ __launch_bounds__(512) void kv_store_mixed_kernel(DecodeAttnArgs args
   for (int off = 16; off > 0; off >>= 1) vmax = fmaxf(vmax, __shfl_down_sync(0xffffffffu, vmax, off));
   vmax = __shfl_sync(0xffffffffu, vmax, 0);
   const float d = vmax > 0.0f ? vmax / 127.0f : 1.0f;
-  const std::size_t at = (std::size_t(args.pos) * ATTN_KV_HEADS + h) * kDim + base_d;
+  const std::size_t at = (std::size_t(row) * ATTN_KV_HEADS + h) * kDim + base_d;
   const std::size_t block = at / KV_BLOCK;
-  const std::uint64_t values = std::uint64_t(args.max_pos) * ATTN_KV_HEADS * kDim;
+  const std::uint64_t values = std::uint64_t(kv_cache_rows(args)) * ATTN_KV_HEADS * kDim;
   if (lane == 0) const_cast<__half*>(kv_q8_scales(dst, values))[block] = __float2half(d);
   kv_q8_values(dst)[at + lane] = std::int8_t(__float2int_rn(v / d));
 }
@@ -278,17 +288,22 @@ __global__ __launch_bounds__(512) void kv_store_mixed_kernel(DecodeAttnArgs args
 // count at the 64 that holds four blocks per SM.
 template <KvType KTYPE_K, KvType KTYPE_V>
 __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args) {
-  const int split = blockIdx.y;
   const int h = args.head_begin + blockIdx.x;
   const int kh = h / kGroup;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
-  const std::uint64_t cache_values = std::uint64_t(args.max_pos) * ATTN_KV_HEADS * kDim;
+  const std::uint64_t cache_values = std::uint64_t(kv_cache_rows(args)) * ATTN_KV_HEADS * kDim;
+  const int band = args.pos_begin;  // global position of this cache's row 0
 
+  // The column grid is cut from pos and splits alone — ceil((pos + 1) / splits) positions per column — exactly
+  // as a single un-banded launch cuts it, so a launch that owns columns [col_begin, col_begin + gridDim.y)
+  // writes the same states that launch would. A column past the query is empty and writes the empty state the
+  // combine kernel skips, which is what keeps a stale column out of the merge.
+  const int col = args.col_begin + int(blockIdx.y);
   const int per_split = (args.pos + 1 + args.splits - 1) / args.splits;
-  const int begin = split * per_split;
+  const int begin = col * per_split;
   const int end = min(args.pos + 1, begin + per_split);
-  const std::size_t slot = std::size_t(blockIdx.x) * std::size_t(args.splits) + std::size_t(split);
+  const std::size_t slot = std::size_t(blockIdx.x) * std::size_t(args.splits) + std::size_t(col);
   if (begin >= end) {
     if (threadIdx.x == 0) {
       args.partial[slot].m = -INFINITY;
@@ -323,7 +338,7 @@ __global__ __launch_bounds__(kDim) void decode_split_kernel(DecodeAttnArgs args)
   for (int i0 = begin + warp * kPosPerWarp; i0 < end; i0 += kStepPos) {
     const int p = i0 + sub;
     if (p >= end) continue;  // tail step: the second stream runs out first
-    const std::size_t kbase = (std::size_t(p) * ATTN_KV_HEADS + kh) * kDim + d0;
+    const std::size_t kbase = (std::size_t(p - band) * ATTN_KV_HEADS + kh) * kDim + d0;
     const std::size_t vbase = kbase;  // K and V share the layout, so the same index addresses both caches
 
     // Both loads are independent of the score, so they are issued before the reduction. The staging is eight
@@ -443,12 +458,11 @@ __global__ __launch_bounds__(kDim) void combine_splits_kernel(DecodeAttnArgs arg
 
 }  // namespace
 
-cudaError_t decode_attention(const DecodeAttnArgs& args, cudaStream_t stream) {
-  if (!args.q || !args.k_new || !args.v_new || !args.k_cache || !args.v_cache || !args.out) {
-    return cudaErrorInvalidValue;
-  }
-  if (args.pos < 0 || args.pos >= args.max_pos) return cudaErrorInvalidValue;
-  if (!head_range_valid(args)) return cudaErrorInvalidValue;
+cudaError_t decode_kv_store(const DecodeAttnArgs& args, cudaStream_t stream) {
+  if (!args.k_new || !args.v_new || !args.k_cache || !args.v_cache) return cudaErrorInvalidValue;
+  if (!band_valid(args)) return cudaErrorInvalidValue;
+  // A band that does not hold `pos` has no row to write: the owning band's store covers the new token.
+  if (args.pos < args.pos_begin || (args.pos_end >= 0 && args.pos >= args.pos_end)) return cudaSuccess;
   if (args.kv_type_k == KvType::Bf16 && args.kv_type_v == KvType::Bf16) {
     kv_store_bf16_kernel<<<ATTN_KV_HEADS, kDim, 0, stream>>>(args);
   } else if (args.kv_type_k == KvType::Q8_0 && args.kv_type_v == KvType::Q8_0) {
@@ -456,19 +470,54 @@ cudaError_t decode_attention(const DecodeAttnArgs& args, cudaStream_t stream) {
   } else {
     kv_store_mixed_kernel<<<ATTN_KV_HEADS, 2 * 256, 0, stream>>>(args);
   }
-  if (args.partial && args.splits > 1) {
-    const dim3 grid(args.head_count, args.splits);
-    const bool q8_k = args.kv_type_k == KvType::Q8_0, q8_v = args.kv_type_v == KvType::Q8_0;
-    if (q8_k && q8_v) decode_split_kernel<KvType::Q8_0, KvType::Q8_0><<<grid, kDim, 0, stream>>>(args);
-    else if (q8_k) decode_split_kernel<KvType::Q8_0, KvType::Bf16><<<grid, kDim, 0, stream>>>(args);
-    else if (q8_v) decode_split_kernel<KvType::Bf16, KvType::Q8_0><<<grid, kDim, 0, stream>>>(args);
-    else decode_split_kernel<KvType::Bf16, KvType::Bf16><<<grid, kDim, 0, stream>>>(args);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-    combine_splits_kernel<<<args.head_count, kDim, 0, stream>>>(args);
-  } else {
-    decode_kernel<<<args.head_count, kDim, 0, stream>>>(args);
+  return cudaGetLastError();
+}
+
+cudaError_t decode_split(const DecodeAttnArgs& args, int band_splits, cudaStream_t stream) {
+  // `out` is deliberately not required: a band launch never writes it, and the peer band must not be handed
+  // a pointer into another device's memory.
+  if (!args.q || !args.k_cache || !args.v_cache || !args.partial || band_splits < 1) return cudaErrorInvalidValue;
+  if (args.col_begin < 0 || band_splits > args.splits - args.col_begin) return cudaErrorInvalidValue;
+  if (!head_range_valid(args) || !band_valid(args)) return cudaErrorInvalidValue;
+  if (args.pos < 0 || args.pos >= args.max_pos) return cudaErrorInvalidValue;
+  // A column must sit wholly inside the cache the launch is handed: the kernel indexes it band-locally.
+  const int per_split = (args.pos + 1 + args.splits - 1) / args.splits;
+  const int first = args.col_begin * per_split;
+  const int last = std::min(args.pos + 1, first + band_splits * per_split);
+  if (first < args.pos_begin || last > args.pos_begin + kv_cache_rows(args)) return cudaErrorInvalidValue;
+  const dim3 grid(args.head_count, band_splits);
+  const bool q8_k = args.kv_type_k == KvType::Q8_0, q8_v = args.kv_type_v == KvType::Q8_0;
+  if (q8_k && q8_v) decode_split_kernel<KvType::Q8_0, KvType::Q8_0><<<grid, kDim, 0, stream>>>(args);
+  else if (q8_k) decode_split_kernel<KvType::Q8_0, KvType::Bf16><<<grid, kDim, 0, stream>>>(args);
+  else if (q8_v) decode_split_kernel<KvType::Bf16, KvType::Q8_0><<<grid, kDim, 0, stream>>>(args);
+  else decode_split_kernel<KvType::Bf16, KvType::Bf16><<<grid, kDim, 0, stream>>>(args);
+  return cudaGetLastError();
+}
+
+cudaError_t decode_combine(const DecodeAttnArgs& args, cudaStream_t stream) {
+  if (!args.out || !args.partial || args.splits < 1) return cudaErrorInvalidValue;
+  if (!head_range_valid(args)) return cudaErrorInvalidValue;
+  combine_splits_kernel<<<args.head_count, kDim, 0, stream>>>(args);
+  return cudaGetLastError();
+}
+
+cudaError_t decode_attention(const DecodeAttnArgs& args, cudaStream_t stream) {
+  if (!args.q || !args.k_new || !args.v_new || !args.k_cache || !args.v_cache || !args.out) {
+    return cudaErrorInvalidValue;
   }
+  if (args.pos < 0 || args.pos >= args.max_pos) return cudaErrorInvalidValue;
+  if (!head_range_valid(args) || !band_valid(args)) return cudaErrorInvalidValue;
+  // The single-pass kernel reads the cache through kv_at, which needs the rows of the buffer it is given; a
+  // band is only ever walked by the split kernel, whose column window is band-local.
+  if (args.pos_end >= 0 && !(args.partial && args.splits > 1)) return cudaErrorInvalidValue;
+  cudaError_t err = decode_kv_store(args, stream);
+  if (err != cudaSuccess) return err;
+  if (args.partial && args.splits > 1) {
+    err = decode_split(args, args.splits, stream);
+    if (err != cudaSuccess) return err;
+    return decode_combine(args, stream);
+  }
+  decode_kernel<<<args.head_count, kDim, 0, stream>>>(args);
   return cudaGetLastError();
 }
 
@@ -515,6 +564,8 @@ float read_cpu(const void* base, KvType type, std::size_t index, std::uint64_t v
 
 void decode_attention_cpu(const DecodeAttnArgs& args) {
   if (!head_range_valid(args)) return;
+  // The reference models one un-banded cache: a band would need its own row base and its own scale offset.
+  if (args.pos_begin != 0 || args.pos_end >= 0) return;
   store_cpu(args);
 
   const double scale = 1.0 / std::sqrt(double(kDim));

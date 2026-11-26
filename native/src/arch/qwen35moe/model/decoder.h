@@ -18,6 +18,7 @@
 #include <cuda_bf16.h>
 
 #include "arch/qwen35moe/kernels/attn/decode_attn.h"
+#include "arch/qwen35moe/kernels/attn/kv_bands.h"
 
 #include "arch/qwen35moe/kernels/moe/fused_experts.h"
 #include "arch/qwen35moe/model/decode_graph.h"
@@ -109,6 +110,9 @@ class Decoder {
 
   // One flash-decode split per this many positions; `splits` caps it and decides the graph bucket.
   static constexpr int kSplitPositions = 2048;
+  // With QWEN35MOE_ATTN_SPLITS_DEPTH, the column width below the cap: 16 query heads x 16 columns is 256
+  // blocks, four waves of the 5070 Ti's 70 SMs, where the fixed split width leaves a shallow cache on one.
+  static constexpr int kSplitPositionsFine = 128;
 
   const TextArena* arena_ = nullptr;
   std::unordered_map<std::string, const PlacedTensor*> placed_;
@@ -148,8 +152,12 @@ class Decoder {
   float* logits_ = nullptr;
 
   kernels::SplitState* kv_partial_ = nullptr;  // [ATTN_HEADS * kMaxSplits]
-  void* kv_k_[NUM_FULL_LAYERS] = {};
-  void* kv_v_[NUM_FULL_LAYERS] = {};
+  KvBands kv_bands_[NUM_FULL_LAYERS] = {};  // one plan per full-attention layer; count 1 is the plain cache
+  KvBandExchange kv_exchange_ = {};          // peer staging for a two-card plan, shared by every layer
+  bool kv_bands_on_ = false;       // QWEN35MOE_KV_BANDS=1 and a two-card plan that fitted
+  int kv_band_min_pos_ = 0;        // capacity below which the plan is not split (measured break-even)
+  float kv_band_ratio_ = KV_BAND_RATIO;  // card 0 : card 1 share of the positions
+  bool attn_splits_depth_ = false;       // QWEN35MOE_ATTN_SPLITS_DEPTH=1: depth-scaled column width
   kernels::KvType kv_type_k_ = kernels::KvType::Bf16;  // -ctk
   kernels::KvType kv_type_v_ = kernels::KvType::Bf16;  // -ctv
   float* gdn_state_ = nullptr;   // [NUM_LINEAR_LAYERS, LIN_VALUE_HEADS, LIN_KEY_DIM, LIN_VALUE_DIM]

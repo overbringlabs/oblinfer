@@ -64,7 +64,7 @@ struct DecodeAttnArgs {
   const float* q = nullptr;                     // [ATTN_HEADS, ATTN_HEAD_DIM], post q_norm and rotary
   const float* k_new = nullptr;                 // [ATTN_KV_HEADS, ATTN_HEAD_DIM], post k_norm and rotary
   const float* v_new = nullptr;                 // [ATTN_KV_HEADS, ATTN_HEAD_DIM]
-  void* k_cache = nullptr;                      // [max_pos, ATTN_KV_HEADS, ATTN_HEAD_DIM] in `kv_type`
+  void* k_cache = nullptr;                      // [kv_cache_rows, ATTN_KV_HEADS, ATTN_HEAD_DIM] in `kv_type`
   void* v_cache = nullptr;                      // same layout
   KvType kv_type_k = KvType::Bf16;
   KvType kv_type_v = KvType::Bf16;
@@ -73,21 +73,54 @@ struct DecodeAttnArgs {
   int max_pos = 0;                              // cache capacity
   int head_begin = 0;                           // first query head this launch handles
   int head_count = ATTN_HEADS;                  // query heads this launch handles
-  // Flash decoding: when `partial` is set the positions are split into `splits` ranges, each block writes its
-  // SplitState to partial[(head - head_begin) * splits + split], and a combine kernel merges them. Leave null
-  // to run the single-block-per-head path (used by the reference tests).
+  // Position band (see kv_bands.h): the launch reads global positions [pos_begin, min(pos_end, pos + 1)) and
+  // k_cache/v_cache hold exactly the band's rows, band-local, so global position p is row p - pos_begin.
+  // The defaults describe one un-banded cache: pos_end < 0 means "up to and including pos" and sizes the cache
+  // by max_pos, which is what every pre-banding caller passes, so its results stay bit for bit unchanged.
+  int pos_begin = 0;
+  int pos_end = -1;
+  // Flash decoding: when `partial` is set the positions are cut into `splits` columns of equal length, each
+  // block writes its SplitState to partial[(head - head_begin) * splits + col], and a combine kernel merges
+  // them. Leave null to run the single-block-per-head path (used by the reference tests).
+  //
+  // The column grid depends on pos and splits alone, never on which band runs it: `col_begin` is the first
+  // column of that grid this launch covers, and the launch writes columns [col_begin, col_begin + band).
+  // Several bands can therefore share one row per head without moving a boundary, and each column's state is
+  // bit for bit what a single un-banded launch would have written.
   SplitState* partial = nullptr;
   int splits = 0;
+  int col_begin = 0;
 };
+
+// Rows the cache pointers span: the band width when a band is set, otherwise the whole capacity. The q8_0
+// scale array starts after exactly this many values, so every cache read needs it.
+__host__ __device__ inline int kv_cache_rows(const DecodeAttnArgs& args) {
+  return args.pos_end >= 0 ? args.pos_end - args.pos_begin : args.max_pos;
+}
 
 // Stores k_new/v_new at `pos`, then attends over 0..pos for the query heads [head_begin, head_begin +
 // head_count), writing `out` at those absolute head offsets. The store always covers every KV head, so a
-// partial range still leaves the cache consistent. Allocates nothing, synchronises nothing. Returns
-// cudaErrorInvalidValue for a range outside [0, ATTN_HEADS) or an empty range, before launching anything.
+// partial range still leaves the cache consistent. A band window is honoured: the store goes to row
+// `pos - pos_begin` and is skipped when `pos` falls outside the band. Allocates nothing, synchronises
+// nothing. Returns cudaErrorInvalidValue for a range outside [0, ATTN_HEADS) or an empty range, or for a
+// malformed band, before launching anything.
 cudaError_t decode_attention(const DecodeAttnArgs& args, cudaStream_t stream);
 
-// FP64 reference over the same BF16 cache bytes: stores the new rows, then attends the head range. Used by
-// tests; an invalid range is refused the same way, with no write to any buffer.
+// The three passes of the flash path, exposed separately so kv_bands.cu can run one band per device and merge
+// on a single card. Each takes the same args as decode_attention and launches nothing else. `band_splits` is
+// the number of SplitState columns this launch writes, starting at the column args.partial already points at;
+// args.splits stays the row stride of that buffer and must be at least band_splits. The store is a no-op when
+// args.pos lies outside [args.pos_begin, args.pos_end), so a caller can hand the same args to every band.
+// decode_split never touches args.out, which lets a peer band run without a pointer into another device's
+// memory. Allocations and cross-device traffic are the caller's job.
+cudaError_t decode_kv_store(const DecodeAttnArgs& args, cudaStream_t stream);
+cudaError_t decode_split(const DecodeAttnArgs& args, int band_splits, cudaStream_t stream);
+cudaError_t decode_combine(const DecodeAttnArgs& args, cudaStream_t stream);
+
+// FP64 reference over the same cache bytes: stores the new rows, then attends the head range. Used by tests;
+// an invalid range is refused the same way, with no write to any buffer. It models one un-banded cache, so
+// pos_begin/pos_end must stay at their defaults (a band's own bytes are a contiguous slice of the un-banded
+// cache, which is how the banded tests feed it).
 void decode_attention_cpu(const DecodeAttnArgs& args);
 
 }  // namespace ingine::arch::qwen35moe::kernels

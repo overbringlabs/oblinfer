@@ -29,7 +29,7 @@ repo that has not been inspected at all; its rows carry no size or precision cla
 
 | Checkpoint | What | Size | Precision / KV | Spec | Status |
 |---|---|---|---|---|---|
-| `nvidia/Qwen3.6-35B-A3B-NVFP4` | primary target, rev `1355db6a0524`, updated 2026-08-29 | 23.42 GB, 3 shards | modelopt `MIXED_PRECISION`, **KV FP8** | MTP head included, 19 bf16 tensors | **first target** (verified) |
+| `nvidia/Qwen3.6-35B-A3B-NVFP4` | primary target, rev `1355db6a0524`, updated 2026-08-29 | 23.42 GB, 3 shards | modelopt `MIXED_PRECISION`, **KV FP8** | MTP head included, 19 bf16 tensors, **1.689 GB** | **first target** (verified) |
 | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` | derivative, same architecture and shape | — | per-expert experts, no `input_scale` on experts | MTP exported per expert, 785 tensors | scaffold (verified index/config) |
 
 Verified details of the NVIDIA checkpoint:
@@ -37,7 +37,7 @@ Verified details of the NVIDIA checkpoint:
 | Property | Value |
 |---|---|
 | Shape | 40 layers (30 GDN + 10 full), hidden 2048, 16/2 heads, head_dim 256, 256 experts top-8, moe_inter 512, shared 512, vocab 248320, 262144 ctx, conv_k 4, linear 16×128 key / 32×128 value, partial rotary 0.25, mrope `[11,11,10]`, θ=1e7, untied embeddings |
-| Quantized | FP8 e4m3 with one FP32 tensor scale: GDN `in_proj_qkv` / `in_proj_z` / `out_proj` (30 each), attention q/k/v/o (10 each). NVFP4 W4A16: routed experts, shared-expert gate/up/down, and **`lm_head`** (U8 `[248320, 1024]`, e4m3 block scales `[248320, 128]`, no `weight_scale_2`) |
+| Quantized | FP8 e4m3 with one FP32 tensor scale: GDN `in_proj_qkv` / `in_proj_z` / `out_proj` (30 each), attention q/k/v/o (10 each). NVFP4 W4A16: routed experts, shared-expert gate/up/down, and **`lm_head`** (U8 `[248320, 1024]`, e4m3 block scales `[248320, 128]`, per-tensor `weight_scale_2` = 1.1190e-4 and `input_scale` = 0.0277, both F32 scalars) |
 | Scale layout (headers, 2026-11-25) | FP8 tensors: `weight_scale` F32 `[]` and `input_scale` F32 `[]`, both per tensor. NVFP4 experts: `weight` U8 `[rows, cols/2]`, `weight_scale` F8_E4M3 `[rows, cols/16]`, `weight_scale_2` F32 `[]`, `input_scale` F32 `[]` (unused at W4A16) |
 | Unquantized | router `mlp.gate`, `shared_expert_gate`, norms, `conv1d`, `A_log`, `dt_bias`, `in_proj_a/b`, embeddings, MTP head, vision tower |
 | Layout | experts shipped **per expert** (`experts.M.{gate,up,down}_proj`), 122,880 expert tensors of 124,468 total; `model.language_model.*` prefix |

@@ -64,12 +64,16 @@ Decoder::~Decoder() {
                    conv_state_}) {
     if (p) cudaFree(p);
   }
-  for (auto* p : kv_k_) {
-    if (p) cudaFree(p);
+  // A banded step leaves work on the peer stream; the bands and the staging it writes into go next.
+  if (s1_ && dev1_ != dev0_) {
+    cudaSetDevice(dev1_);
+    cudaStreamSynchronize(s1_);
+    cudaSetDevice(dev0_);
   }
-  for (auto* p : kv_v_) {
-    if (p) cudaFree(p);
+  for (auto& bands : kv_bands_) {
+    kv_bands_free(&bands);
   }
+  kv_band_exchange_free(&kv_exchange_);
   if (ids_dev_) cudaFree(ids_dev_);
   if (weights_dev_) cudaFree(weights_dev_);
   for (int d = 0; d < 2; ++d) {
@@ -207,11 +211,66 @@ bool Decoder::init(const TextArena& arena, int max_pos, std::string* error) {
     };
     kv_type_k_ = parse_kv("QWEN35MOE_CTK", kernels::KvType::Bf16);
     kv_type_v_ = parse_kv("QWEN35MOE_CT_V", kernels::KvType::Bf16);
-    const std::size_t k_bytes = kernels::kv_cache_bytes(kv_type_k_, max_pos);
-    const std::size_t v_bytes = kernels::kv_cache_bytes(kv_type_v_, max_pos);
-    for (int i = 0; i < NUM_FULL_LAYERS; ++i) {
-      kv_k_[i] = alloc(k_bytes);
-      kv_v_[i] = alloc(v_bytes);
+    // Position bands: on by default, because the capacity gate below keeps them dormant under 98304 positions
+    // and from there up they are a measured 9% (258048: 20.99 -> 19.28 ms/token). QWEN35MOE_KV_BANDS=0 pins the
+    // single cache; with bands off the plan is one band covering the whole capacity on card 0, same allocation
+    // and same launch as before.
+    const char* bands_env = std::getenv("QWEN35MOE_KV_BANDS");
+    kv_bands_on_ = !bands_env || std::string(bands_env) != "0";
+    if (const char* r = std::getenv("QWEN35MOE_KV_BAND_RATIO")) {
+      kv_band_ratio_ = float(std::atof(r));
+      if (!(kv_band_ratio_ > 0.0f)) throw std::runtime_error(std::string("QWEN35MOE_KV_BAND_RATIO must be > 0, got ") + r);
+    }
+    if (kv_bands_on_ && dev1_ == dev0_) {
+      std::fprintf(stderr, "[qwen35moe] KV bands idle: one device holds both bands\n");
+      std::fflush(stderr);
+      kv_bands_on_ = false;
+    }
+    // Measured break-even (supra, q8_0, gen 8, eager, ms/token): 65536 14.30 -> 14.85 loss, 98304 15.52 ->
+    // 15.39 gain, 114688 16.29 -> 16.01, 131072 16.51 -> 16.22, 258048 20.99 -> 19.28. A banded step costs
+    // roughly 0.5 ms/token of pinned staging whatever the depth and saves a share of the cache read that grows
+    // with it, so the plan only splits from 98304 positions up. QWEN35MOE_KV_BAND_MIN_POS=0 forces the split at
+    // any capacity, which is how the shallow parity and sanitizer runs exercise the banded path.
+    kv_band_min_pos_ = 98304;
+    if (const char* m = std::getenv("QWEN35MOE_KV_BAND_MIN_POS")) kv_band_min_pos_ = std::atoi(m);
+    const bool engage = kv_bands_on_ && max_pos >= kv_band_min_pos_;
+    if (kv_bands_on_ && !engage) {
+      std::fprintf(stderr, "[qwen35moe] QWEN35MOE_KV_BANDS=1 idle: capacity %d below the %d break-even\n", max_pos,
+                   kv_band_min_pos_);
+      std::fflush(stderr);
+    }
+    // One plan per full-attention layer. The decision is all-or-nothing: a mix of two-band and one-band
+    // layers would leave the plain path pointing at a band 0 that does not cover the capacity.
+    auto plan_all = [&](bool split, std::string* why) -> bool {
+      for (int i = 0; i < NUM_FULL_LAYERS; ++i) {
+        if (!kv_bands_init(&kv_bands_[i], max_pos, dev0_, split ? dev1_ : dev0_, kv_type_k_, kv_type_v_, why,
+                           kv_band_ratio_))
+          return false;
+        if (split && kv_bands_[i].count != 2) {
+          *why = "layer " + std::to_string(i) + " collapsed to one band";
+          return false;
+        }
+      }
+      return true;
+    };
+    auto free_all_bands = [&]() {
+      for (int i = 0; i < NUM_FULL_LAYERS; ++i) kv_bands_free(&kv_bands_[i]);
+    };
+    std::string band_error;
+    if (engage && plan_all(true, &band_error)) {
+      kv_bands_on_ = true;
+    } else {
+      if (engage) {
+        std::fprintf(stderr, "[qwen35moe] bands off: %s\n", band_error.c_str());
+        std::fflush(stderr);
+      }
+      free_all_bands();
+      band_error.clear();
+      if (!plan_all(false, &band_error)) {
+        if (error) *error = band_error;
+        return false;
+      }
+      kv_bands_on_ = false;
     }
     // Flash-decoding scratch: one SplitState per (query head, position split).
     kv_partial_ = static_cast<kernels::SplitState*>(
@@ -332,7 +391,47 @@ bool Decoder::init(const TextArena& arena, int max_pos, std::string* error) {
     peer_weights_ = static_cast<float*>(alloc(attn::ROUTER_TOP_K * 4));
     check(cudaSetDevice(dev0_), "set device 0");
 
+    // The peer staging for a banded cache, last: kv_band_exchange_init leaves the host card current, and the
+    // allocations above must stay on device 1.
+    if (kv_bands_on_) {
+      std::string exchange_error;
+      if (!kv_band_exchange_init(&kv_exchange_, dev0_, dev1_, &exchange_error)) {
+        if (error) *error = "kv_band_exchange_init: " + exchange_error;
+        return false;
+      }
+      const KvBands& b = kv_bands_[0];
+      const int top = splits_at(max_pos - 1);
+      const int c1 = kv_band_columns(b, max_pos - 1, top);
+      std::fprintf(stderr,
+                   "[qwen35moe] banded KV on: %d layers, boundary at %d/%d positions (%.4f), mirror %d rows; "
+                   "%.0f MB on card %d plus %.0f MB on card %d; at the top of the cache card 1 runs %d of %d "
+                   "columns and %.0f MB per token, card 0 the rest\n",
+                   NUM_FULL_LAYERS, b.cut, b.max_pos, double(b.cut) / double(b.max_pos), b.overlap,
+                   (kv_band_bytes(b.bands[0].pos_end - b.bands[0].pos_begin, kv_type_k_) +
+                    kv_band_bytes(b.bands[0].pos_end - b.bands[0].pos_begin, kv_type_v_)) * NUM_FULL_LAYERS / 1e6,
+                   b.bands[0].device,
+                   (kv_band_bytes(b.bands[1].pos_end - b.bands[1].pos_begin, kv_type_k_) +
+                    kv_band_bytes(b.bands[1].pos_end - b.bands[1].pos_begin, kv_type_v_)) * NUM_FULL_LAYERS / 1e6,
+                   b.bands[1].device, c1 >= 0 ? top - c1 : 0, top,
+                   double(b.max_pos - b.cut) * kernels::ATTN_KV_HEADS * kernels::ATTN_HEAD_DIM * 2.0625 *
+                       NUM_FULL_LAYERS / 1e6);
+      std::fflush(stderr);
+    }
+
     use_graph_ = std::getenv("QWEN35MOE_GRAPH") && std::string(std::getenv("QWEN35MOE_GRAPH")) == "1";
+    // A banded step switches the current device inside the layer loop, which a capture may not contain, so the
+    // step stays eager while bands are on. The per-device child graphs the MoE hop uses are the way back.
+    if (use_graph_ && kv_bands_on_) {
+      std::fprintf(stderr, "[qwen35moe] QWEN35MOE_GRAPH=1 ignored: banded KV runs eager on two cards\n");
+      std::fflush(stderr);
+      use_graph_ = false;
+    }
+    // Depth-scaled split count: on by default. The fixed rule asked for one split below 2048 positions, which
+    // falls out of the flash path into the old single-pass kernel; measured 68.7 -> 83.6 tok/s at 1k and
+    // 57.3 -> 84.1 at 2k, +3% at 4k, and neutral from 32k up. QWEN35MOE_ATTN_SPLITS_DEPTH=0 restores the fixed
+    // bucket.
+    const char* splits_env = std::getenv("QWEN35MOE_ATTN_SPLITS_DEPTH");
+    attn_splits_depth_ = !splits_env || std::string(splits_env) != "0";
     // Capturing a step cannot coexist with these: SWAP_QG reassigns the query/gate buffers on every call, so a
     // fixed graph would not follow the layer loop, and the dump and debug paths read activations back to the
     // host inside the loop.
@@ -553,8 +652,9 @@ void Decoder::full_layer(int l, int pos) {
   dec.q = q_attn_;
   dec.k_new = k_;
   dec.v_new = v_;
-  dec.k_cache = kv_k_[slot];
-  dec.v_cache = kv_v_[slot];
+  const KvBands& bands = kv_bands_[slot];
+  dec.k_cache = bands.bands[0].k;
+  dec.v_cache = bands.bands[0].v;
   dec.kv_type_k = kv_type_k_;
   dec.kv_type_v = kv_type_v_;
   dec.out = attn_;
@@ -563,7 +663,16 @@ void Decoder::full_layer(int l, int pos) {
   dec.partial = kv_partial_;
   // One split per 2048 positions keeps the SMs busy; the count is also the graph bucket.
   dec.splits = splits_at(pos);
-  at(dec, offsetof(attn::DecodeAttnArgs, pos), [&] { check(attn::decode_attention(dec, s_), "attention"); });
+  if (kv_bands_on_ && bands.count == 2) {
+    // Both cards stream the positions they hold. The call switches the current device, so it stays outside
+    // the graph (see the note on QWEN35MOE_GRAPH in init) and the position needs no node patch.
+    std::string band_error;
+    if (!decode_attention_bands(dec, bands, kv_partial_, dec.splits, s_, s1_, &band_error, &kv_exchange_)) {
+      throw std::runtime_error("banded attention: " + band_error);
+    }
+  } else {
+    at(dec, offsetof(attn::DecodeAttnArgs, pos), [&] { check(attn::decode_attention(dec, s_), "attention"); });
+  }
 
   attn::OutputGateArgs gate;
   gate.x = attn_;
@@ -689,13 +798,20 @@ void Decoder::moe(int l) {
 
 int Decoder::splits_at(int pos) const {
   // One flash-decode split per kSplitPositions positions, capped: the bucket the graph is keyed by.
-  return std::max(1, std::min(kernels::kMaxSplits, (pos + kSplitPositions) / kSplitPositions));
+  if (!attn_splits_depth_) return std::max(1, std::min(kernels::kMaxSplits, (pos + kSplitPositions) / kSplitPositions));
+  // Depth-scaled: one column per kSplitPositionsFine positions, so a shallow cache still spreads over waves
+  // of blocks instead of one block per query head. Monotone in pos, and it reaches the cap at
+  // kMaxSplits * kSplitPositionsFine positions, where the fixed rule is still asking for a tenth of that —
+  // so 32k and deeper run the same capped grid and only the shallow buckets change.
+  const int columns = (pos + 1 + kSplitPositionsFine - 1) / kSplitPositionsFine;
+  return std::max(1, std::min(kernels::kMaxSplits, columns));
 }
 
 int Decoder::capture_pos(int splits) const {
-  // The first position of the bucket. Buckets are [kSplitPositions * (splits - 1), ... ) up to the cap, which
-  // absorbs everything beyond it. Negative when the bucket is out of reach for this context length.
-  const int first = (splits - 1) * kSplitPositions;
+  // The first position of the bucket. Buckets are [width * (splits - 1), ... ) up to the cap, which absorbs
+  // everything beyond it. Negative when the bucket is out of reach for this context length.
+  const int width = attn_splits_depth_ ? kSplitPositionsFine : kSplitPositions;
+  const int first = (splits - 1) * width;
   return first < max_pos_ ? first : -1;
 }
 
