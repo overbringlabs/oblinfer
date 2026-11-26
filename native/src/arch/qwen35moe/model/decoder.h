@@ -127,6 +127,21 @@ class Decoder {
   float* fscratch_down_[2] = {};
   int* peer_ids_ = nullptr;
   float* peer_weights_ = nullptr;
+
+  // Double-buffered pinned exchange: x + ids + weights out, y back. One slot per parity of the layer index.
+  struct Exchange {
+    float x[HIDDEN];
+    int ids[8];
+    float weights[8];
+    float y[HIDDEN];
+  };
+  Exchange* pinned_ = nullptr;             // [2]
+  int exch_ = 0;
+  cudaStream_t s1_ = nullptr;
+  cudaEvent_t ev_x_[2] = {};               // card 0 records, card 1 waits
+  cudaEvent_t ev_x_free_[2] = {};          // card 1 records, card 0 waits
+  cudaEvent_t ev_y_[2] = {};               // card 1 records, card 0 waits
+  cudaEvent_t ev_y_free_[2] = {};          // card 0 records, card 1 waits
   __nv_bfloat16* peer_router_ = nullptr;  // [LAYERS][ROUTER_EXPERTS][HIDDEN]: the router replicated on card 1
 
   float* router_logits_ = nullptr;

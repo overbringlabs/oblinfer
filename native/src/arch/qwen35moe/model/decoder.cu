@@ -66,6 +66,16 @@ Decoder::~Decoder() {
     }
     if (fused_[d].device) cudaFree(fused_[d].device);
   }
+  if (dev1_ != dev0_) {
+    if (pinned_) cudaFreeHost(pinned_);
+    for (int i = 0; i < 2; ++i) {
+      if (ev_x_[i]) cudaEventDestroy(ev_x_[i]);
+      if (ev_x_free_[i]) cudaEventDestroy(ev_x_free_[i]);
+      if (ev_y_[i]) cudaEventDestroy(ev_y_[i]);
+      if (ev_y_free_[i]) cudaEventDestroy(ev_y_free_[i]);
+    }
+    if (s1_) cudaStreamDestroy(s1_);
+  }
   if (peer_ids_) cudaFree(peer_ids_);
   if (peer_weights_) cudaFree(peer_weights_);
   cudaSetDevice(dev0_);
@@ -193,13 +203,22 @@ bool Decoder::init(const TextArena& arena, int max_pos, std::string* error) {
 
     if (dev1_ != dev0_) {
       check(cudaSetDevice(dev1_), "set device 1");
+      check(cudaStreamCreateWithFlags(&s1_, cudaStreamNonBlocking), "stream 1");
+      for (int i = 0; i < 2; ++i) {
+        check(cudaEventCreateWithFlags(&ev_x_free_[i], cudaEventDisableTiming), "event x free");
+        check(cudaEventCreateWithFlags(&ev_y_[i], cudaEventDisableTiming), "event y");
+      }
       peer_x_ = static_cast<float*>(alloc(HIDDEN * 4));
       peer_h_ = static_cast<float*>(alloc(MOE_INTER * 4));
       peer_up_ = static_cast<float*>(alloc(MOE_INTER * 4));
       peer_out_ = static_cast<float*>(alloc(HIDDEN * 4));
       check(cudaSetDevice(dev0_), "set device 0");
-      check(cudaHostAlloc(reinterpret_cast<void**>(&pinned_in_), HIDDEN * 4, cudaHostAllocDefault), "host alloc");
-      check(cudaHostAlloc(reinterpret_cast<void**>(&pinned_out_), HIDDEN * 4, cudaHostAllocDefault), "host alloc");
+      check(cudaHostAlloc(reinterpret_cast<void**>(&pinned_), 2 * sizeof(Exchange), cudaHostAllocDefault),
+            "host alloc");
+      for (int i = 0; i < 2; ++i) {
+        check(cudaEventCreateWithFlags(&ev_x_[i], cudaEventDisableTiming), "event x");
+        check(cudaEventCreateWithFlags(&ev_y_free_[i], cudaEventDisableTiming), "event y free");
+      }
     }
 
     router_logits_ = static_cast<float*>(alloc(attn::ROUTER_EXPERTS * 4));
@@ -497,20 +516,24 @@ void Decoder::moe(int l) {
   check(cudaSetDevice(dev0_), "set device 0");
   check(attn::route(router, nullptr), "router");
 
-  int ids[attn::ROUTER_TOP_K] = {};
-  float weights[attn::ROUTER_TOP_K] = {};
-  check(cudaMemcpy(ids, ids_dev_, sizeof(ids), cudaMemcpyDeviceToHost), "ids copy");
-  check(cudaMemcpy(weights, weights_dev_, sizeof(weights), cudaMemcpyDeviceToHost), "weights copy");
+  exch_ = l & 1;
+  Exchange* slot = pinned_ + exch_;
+  const bool debug = std::getenv("QWEN35MOE_DEBUG") != nullptr;
 
-  const bool skip_experts = std::getenv("QWEN35MOE_SKIP_EXPERTS") != nullptr;
-  if (skip_experts) {
-    check(cudaMemset(moe_out_, 0, HIDDEN * 4), "ablate experts");
-  } else if (dev1_ != dev0_) {
-    check(cudaMemcpy(pinned_in_, h2_, HIDDEN * 4, cudaMemcpyDeviceToHost), "peer x");
+  if (dev1_ != dev0_) {
+    if (l >= 2) check(cudaStreamWaitEvent(nullptr, ev_x_free_[exch_], 0), "x free");
+    check(cudaMemcpyAsync(slot->x, h2_, HIDDEN * 4, cudaMemcpyDeviceToHost, nullptr), "x out");
+    check(cudaMemcpyAsync(slot->ids, ids_dev_, sizeof(slot->ids), cudaMemcpyDeviceToHost, nullptr), "ids out");
+    check(cudaMemcpyAsync(slot->weights, weights_dev_, sizeof(slot->weights), cudaMemcpyDeviceToHost, nullptr),
+          "weights out");
+    check(cudaEventRecord(ev_x_[exch_], nullptr), "x ready");
+
     check(cudaSetDevice(dev1_), "set device 1");
-    check(cudaMemcpy(peer_x_, pinned_in_, HIDDEN * 4, cudaMemcpyHostToDevice), "peer x h2d");
-    check(cudaMemcpy(peer_ids_, ids, sizeof(ids), cudaMemcpyHostToDevice), "peer ids");
-    check(cudaMemcpy(peer_weights_, weights, sizeof(weights), cudaMemcpyHostToDevice), "peer weights");
+    check(cudaStreamWaitEvent(s1_, ev_x_[exch_], 0), "wait x");
+    check(cudaMemcpyAsync(peer_x_, slot->x, HIDDEN * 4, cudaMemcpyHostToDevice, s1_), "x in");
+    check(cudaMemcpyAsync(peer_ids_, slot->ids, sizeof(slot->ids), cudaMemcpyHostToDevice, s1_), "ids in");
+    check(cudaMemcpyAsync(peer_weights_, slot->weights, sizeof(slot->weights), cudaMemcpyHostToDevice, s1_),
+          "weights in");
     kernels::FusedMoeArgs a1;
     a1.layers = fused_[1].device + std::size_t(l) * EXPERTS;
     a1.x = peer_x_;
@@ -520,15 +543,16 @@ void Decoder::moe(int l) {
     a1.scratch_gate = fscratch_gate_[1];
     a1.scratch_up = fscratch_up_[1];
     a1.scratch_down = fscratch_down_[1];
-    check(kernels::fused_moe_apply(a1, nullptr), "fused moe dev1");
-    check(cudaMemcpy(pinned_out_, peer_out_, HIDDEN * 4, cudaMemcpyDeviceToHost), "peer y");
+    check(kernels::fused_moe_apply(a1, s1_), "fused moe dev1");
+    check(cudaEventRecord(ev_x_free_[exch_], s1_), "x consumed");
+    if (l >= 2) check(cudaStreamWaitEvent(s1_, ev_y_free_[exch_], 0), "y free");
+    check(cudaMemcpyAsync(slot->y, peer_out_, HIDDEN * 4, cudaMemcpyDeviceToHost, s1_), "y back");
+    check(cudaEventRecord(ev_y_[exch_], s1_), "y ready");
     check(cudaSetDevice(dev0_), "set device 0");
-    check(cudaMemcpy(y_, pinned_out_, HIDDEN * 4, cudaMemcpyHostToDevice), "peer y h2d");
   } else {
     check(cudaMemset(y_, 0, HIDDEN * 4), "peer y zero");
   }
 
-  if (skip_experts) return;
   kernels::FusedMoeArgs a0;
   a0.layers = fused_[0].device + std::size_t(l) * EXPERTS;
   a0.x = h2_;
@@ -539,8 +563,30 @@ void Decoder::moe(int l) {
   a0.scratch_up = fscratch_up_[0];
   a0.scratch_down = fscratch_down_[0];
   check(kernels::fused_moe_apply(a0, nullptr), "fused moe dev0");
-  check(attn::axpy(moe_out_, y_, 1.0f, HIDDEN, nullptr), "merge expert partials");
 
+  if (dev1_ != dev0_) {
+    check(cudaStreamWaitEvent(nullptr, ev_y_[exch_], 0), "wait y");
+    check(cudaMemcpyAsync(y_, slot->y, HIDDEN * 4, cudaMemcpyHostToDevice, nullptr), "y in");
+    check(attn::axpy(moe_out_, y_, 1.0f, HIDDEN, nullptr), "merge expert partials");
+    check(cudaEventRecord(ev_y_free_[exch_], nullptr), "y consumed");
+  }
+
+  if (debug && l == 0) {
+    int ids[attn::ROUTER_TOP_K] = {};
+    int peer[attn::ROUTER_TOP_K] = {};
+    std::vector<float> dev0_out(HIDDEN), merged(HIDDEN);
+    check(cudaMemcpyAsync(ids, ids_dev_, sizeof(ids), cudaMemcpyDeviceToHost, nullptr), "dbg ids");
+    check(cudaMemcpyAsync(merged.data(), moe_out_, HIDDEN * 4, cudaMemcpyDeviceToHost, nullptr), "dbg merged");
+    check(cudaStreamSynchronize(nullptr), "dbg sync");
+    check(cudaSetDevice(dev1_), "dbg dev1");
+    check(cudaMemcpy(peer, peer_ids_, sizeof(peer), cudaMemcpyDeviceToHost), "dbg peer ids");
+    check(cudaSetDevice(dev0_), "dbg dev0");
+    float amax0 = 0, amaxm = 0;
+    for (float f : dev0_out) amax0 = std::max(amax0, std::fabs(f));
+    for (float f : merged) amaxm = std::max(amaxm, std::fabs(f));
+    std::printf("[moe dbg] id0=%d peer0=%d merged|max|=%.5g\n", ids[0], peer[0], amaxm);
+    std::fflush(stdout);
+  }
   attn::SharedExpertArgs shared;
   shared.gate = {static_cast<const std::uint8_t*>(ptr(layer_name(l, "mlp.shared_expert.gate_proj.weight"))),
                  static_cast<const std::uint8_t*>(ptr(layer_name(l, "mlp.shared_expert.gate_proj.weight_scale"))),
