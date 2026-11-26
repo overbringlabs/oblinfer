@@ -23,7 +23,10 @@ constexpr int kGateUpSteps = MOE_HIDDEN / kWarpCols;
 constexpr int kDownCols = MOE_INTER / 32;  // a down warp crosses the whole row in one step per slot
 
 // Gate and up share a launch: one warp takes the same rows of both projections and interleaves
-// kGateUpRowsPerWarp rows, so each x window is loaded once and feeds every row of the group.
+// kGateUpRowsPerWarp rows, so each x window is loaded once and feeds every row of the group. The epilogue
+// also applies the SiLU and the multiply, because both dot results for a row are already in this warp's
+// registers: scratch_gate comes out holding h, the down step reads it straight away, and the third launch
+// disappears. scratch_up still receives the up projection, which is what the reference path materialises.
 constexpr int kGateUpRowsPerWarp = 2;
 constexpr int kGateUpRowsPerBlock = kWarps * kGateUpRowsPerWarp;
 constexpr int kGateUpGroups = MOE_INTER / kGateUpRowsPerBlock;
@@ -191,21 +194,14 @@ __global__ __launch_bounds__(kThreads, 6) void fused_gate_up_kernel(const FusedM
   }
 #pragma unroll
   for (int r = 0; r < kGateUpRowsPerWarp; ++r) {
-    float ag = warp_sum(part_g[r]);
-    float au = warp_sum(part_u[r]);
+    const float ag = warp_sum(part_g[r]) * L.gate_scale2;
+    const float au = warp_sum(part_u[r]) * L.up_scale2;
     if (lane == 0) {
-      outg[rowg + r] = ag * L.gate_scale2;
-      outu[rowg + r] = au * L.up_scale2;
+      // h = silu(gate) * up: the same expression and the same rounded operands the separate step used.
+      outg[rowg + r] = (ag / (1.0f + __expf(-ag))) * au;
+      outu[rowg + r] = au;
     }
   }
-}
-
-// h_k = silu(gate_k) * up_k for every slot, in place over the gate scratch.
-__global__ __launch_bounds__(kThreads) void fused_silu_mul_kernel(float* h, const float* u, int n) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  const float v = h[i];
-  h[i] = (v / (1.0f + __expf(-v))) * u[i];
 }
 
 __global__ __launch_bounds__(kThreads) void fused_down_kernel(const FusedMoeArgs args) {
@@ -272,11 +268,6 @@ cudaError_t fused_moe_apply(const FusedMoeArgs& args, cudaStream_t stream) {
   }
   fused_gate_up_kernel<<<kGateUpBlocks, kThreads, 0, stream>>>(args);
   cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-
-  fused_silu_mul_kernel<<<(MOE_TOP_K * MOE_INTER + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-      args.scratch_gate, args.scratch_up, MOE_TOP_K * MOE_INTER);
-  err = cudaGetLastError();
   if (err != cudaSuccess) return err;
 
   fused_down_kernel<<<kDownBlocks, kThreads, 0, stream>>>(args);

@@ -39,13 +39,14 @@ struct FusedMoeArgs {
   const int* ids = nullptr;                  // [MOE_TOP_K], read on the device
   const float* weights = nullptr;            // [MOE_TOP_K], read on the device, already normalised
   float* y = nullptr;                        // [MOE_HIDDEN], overwritten (never accumulated into)
-  float* scratch_gate = nullptr;             // [MOE_TOP_K * MOE_INTER], becomes h after the silu step
-  float* scratch_up = nullptr;               // [MOE_TOP_K * MOE_INTER]
+  float* scratch_gate = nullptr;             // [MOE_TOP_K * MOE_INTER], holds h after the gate/up step
+  float* scratch_up = nullptr;               // [MOE_TOP_K * MOE_INTER], holds the up projection
   float* scratch_down = nullptr;             // [MOE_TOP_K * MOE_HIDDEN]; written by the reference only, the
                                              // CUDA down kernel reduces the slots in registers
 };
 
-// Three launches: gate/up for every slot, silu-mul, then down with the weighted reduction.
+// Two launches: gate/up with the SiLU and the multiply folded into the epilogue, then down with the weighted
+// reduction.
 cudaError_t fused_moe_apply(const FusedMoeArgs& args, cudaStream_t stream);
 
 // Same math in FP64 over the same bytes. Reads args.ids and args.weights as host arrays; `y` is overwritten.

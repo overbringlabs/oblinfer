@@ -1,9 +1,16 @@
-// Fused-experts decode bench: the shipped token-major kernels vs the previous launch shapes, side by side
-// at the real routing width (8 experts, gate/up 512x2048, down 2048x512, NVFP4), plus a pure-read ceiling.
-// Prints realised GB/s per token (L layers of routed weights) so the pack machine (sm_120a) can confirm the
-// sm_89 probe ordering. Also times the half-remote routing case where stride_bytes == 0 slots are skipped.
-// Run manually: the binary takes the device index. Needs sm_120a to exercise the hardware e2m1 decode.
+// MoE decode bench: the token-major routed kernels, the router and the shared expert, side by side at the
+// shapes the decoder actually runs. Needs sm_120a to exercise the hardware e2m1 decode.
+//
+//   bench_fused_experts [device] [layers] [experts] [tokens]
+//
+// Defaults are 0, 12, 16, 100 — cheap, and the historical comparison. The production shape is
+// `0 40 256 64` on the fast card; `0 40 128 64` keeps the arena inside one 16 GB card. Id and weight sets
+// rotate per token, so no token re-reads the previous token's experts and the reported GB/s is DRAM, not L2.
+// The routed cases bill the bytes the kernel really reads: half of them when every second expert is remote.
 #include "arch/qwen35moe/kernels/moe/fused_experts.h"
+#include "arch/qwen35moe/kernels/moe/router.h"
+#include "arch/qwen35moe/kernels/moe/shared_expert.h"
+#include "kernels/quant/gemv.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -16,6 +23,7 @@
 #include <vector>
 
 namespace moe = ingine::arch::qwen35moe::kernels;
+namespace quant = ingine::kernels::quant;
 
 namespace {
 
@@ -224,6 +232,11 @@ std::uint64_t splitmix(std::uint64_t& s) {
 
 int main(int argc, char** argv) {
   int dev = argc > 1 ? std::atoi(argv[1]) : 0;
+  // Production shape is 40 layers x 256 experts; the small default keeps the old comparison cheap and lets
+  // the arena sit on one card. argv: <device> [layers] [experts] [tokens] [remote-percentage]
+  int LAYERS = argc > 2 ? std::atoi(argv[2]) : L;
+  int EXP = argc > 3 ? std::atoi(argv[3]) : E;
+  int TOK = argc > 4 ? std::atoi(argv[4]) : 100;
   CK(cudaSetDevice(dev));
   cudaDeviceProp prop{};
   CK(cudaGetDeviceProperties(&prop, dev));
@@ -231,69 +244,73 @@ int main(int argc, char** argv) {
     std::printf("bench_fused_experts: needs sm_120a (got sm_%d%d)\n", prop.major, prop.minor);
     return 77;
   }
-  const int LAYERS = L;
-  std::printf("device %d: %s, %d SMs\n", dev, prop.name, prop.multiProcessorCount);
+  std::printf("device %d: %s, %d SMs, L2 %d MB - %d layers x %d experts x %d tokens\n", dev, prop.name,
+              prop.multiProcessorCount, prop.l2CacheSize >> 20, LAYERS, EXP, TOK);
 
   const int GW = INTER * HID / 2, DW = HID * INTER / 2;
   const int W_STRIDE = 2 * GW + DW, GS = INTER * HID / 16, S_STRIDE = 3 * GS;
   std::uint8_t *dw, *ds;
-  CK(cudaMalloc(&dw, std::size_t(LAYERS) * E * W_STRIDE));
-  CK(cudaMalloc(&ds, std::size_t(LAYERS) * E * S_STRIDE));
+  CK(cudaMalloc(&dw, std::size_t(LAYERS) * EXP * W_STRIDE));
+  CK(cudaMalloc(&ds, std::size_t(LAYERS) * EXP * S_STRIDE));
   {
-    std::vector<std::uint8_t> hw(std::size_t(LAYERS) * E * W_STRIDE), hs(std::size_t(LAYERS) * E * S_STRIDE);
+    std::vector<std::uint8_t> hw(std::size_t(LAYERS) * EXP * W_STRIDE), hs(std::size_t(LAYERS) * EXP * S_STRIDE);
     std::uint64_t s = 41;
     for (auto& b : hw) b = std::uint8_t(splitmix(s) >> 17);
     for (auto& b : hs) b = std::uint8_t(0x30 + splitmix(s) % 15);
     CK(cudaMemcpy(dw, hw.data(), hw.size(), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(ds, hs.data(), hs.size(), cudaMemcpyHostToDevice));
   }
-  std::vector<moe::FusedExpertLayer> hl(std::size_t(LAYERS) * E);
-  std::vector<float> hsc(std::size_t(LAYERS) * E * 3);
+  std::vector<moe::FusedExpertLayer> hl(std::size_t(LAYERS) * EXP);
+  std::vector<float> hsc(std::size_t(LAYERS) * EXP * 3);
   std::uint64_t s2 = 7;
   for (auto& v : hsc) v = 0.001f + float(splitmix(s2) % 1000) / 1e6f;
   for (int l = 0; l < LAYERS; ++l)
-    for (int e = 0; e < E; ++e) {
-      moe::FusedExpertLayer& Lx = hl[std::size_t(l) * E + e];
-      Lx.w_base = dw + std::size_t(l) * E * W_STRIDE;
-      Lx.s_base = ds + std::size_t(l) * E * S_STRIDE;
+    for (int e = 0; e < EXP; ++e) {
+      moe::FusedExpertLayer& Lx = hl[std::size_t(l) * EXP + e];
+      Lx.w_base = dw + std::size_t(l) * EXP * W_STRIDE;
+      Lx.s_base = ds + std::size_t(l) * EXP * S_STRIDE;
       Lx.stride_bytes = W_STRIDE;
       Lx.scale_stride_bytes = S_STRIDE;
       Lx.up_weight_off = GW;
       Lx.down_weight_off = 2 * GW;
       Lx.up_scale_off = GS;
       Lx.down_scale_off = 2 * GS;
-      Lx.gate_scale2 = hsc[std::size_t(l) * E * 3 + e * 3 + 0];
-      Lx.up_scale2 = hsc[std::size_t(l) * E * 3 + e * 3 + 1];
-      Lx.down_scale2 = hsc[std::size_t(l) * E * 3 + e * 3 + 2];
+      Lx.gate_scale2 = hsc[std::size_t(l) * EXP * 3 + e * 3 + 0];
+      Lx.up_scale2 = hsc[std::size_t(l) * EXP * 3 + e * 3 + 1];
+      Lx.down_scale2 = hsc[std::size_t(l) * EXP * 3 + e * 3 + 2];
     }
   moe::FusedExpertLayer* d_layers;
-  CK(cudaMalloc(&d_layers, sizeof(moe::FusedExpertLayer) * LAYERS * E));
-  CK(cudaMemcpy(d_layers, hl.data(), sizeof(moe::FusedExpertLayer) * LAYERS * E, cudaMemcpyHostToDevice));
+  CK(cudaMalloc(&d_layers, sizeof(moe::FusedExpertLayer) * LAYERS * EXP));
+  CK(cudaMemcpy(d_layers, hl.data(), sizeof(moe::FusedExpertLayer) * LAYERS * EXP, cudaMemcpyHostToDevice));
   float *dx, *dwt, *dy, *dsg, *dsu, *dsd;
   int* d_ids;
+  // One id/weight set per token, so a token walks different experts than the previous one: the production
+  // access pattern, where a fixed set would sit in L2 and report a bandwidth the decoder never sees.
+  const int ISETS = TOK > 0 ? TOK : 1;
   CK(cudaMalloc(&dx, sizeof(float) * LAYERS * HID));
-  CK(cudaMalloc(&dwt, sizeof(float) * LAYERS * K));
-  CK(cudaMalloc(&d_ids, sizeof(int) * LAYERS * K));
+  CK(cudaMalloc(&dwt, sizeof(float) * ISETS * LAYERS * K));
+  CK(cudaMalloc(&d_ids, sizeof(int) * ISETS * LAYERS * K));
   {
-    std::vector<float> hx(std::size_t(LAYERS) * HID), hw(std::size_t(LAYERS) * K);
-    std::vector<int> hi(std::size_t(LAYERS) * K);
+    std::vector<float> hx(std::size_t(LAYERS) * HID), hw(std::size_t(ISETS) * LAYERS * K);
+    std::vector<int> hi(std::size_t(ISETS) * LAYERS * K);
     std::uint64_t rs = 123;
-    for (int l = 0; l < LAYERS; ++l) {
-      std::vector<int> pool(E);
-      for (int i = 0; i < E; ++i) pool[i] = i;
-      for (int i = 0; i < K; ++i) std::swap(pool[i], pool[int(splitmix(rs) % E)]);
-      for (int i = 0; i < K; ++i) hi[std::size_t(l) * K + i] = pool[i];
-      float sum = 0;
-      for (int i = 0; i < K; ++i) {
-        hw[std::size_t(l) * K + i] = float(splitmix(rs) % 1000) / 1000.f + 0.01f;
-        sum += hw[std::size_t(l) * K + i];
+    for (int t = 0; t < ISETS; ++t)
+      for (int l = 0; l < LAYERS; ++l) {
+        std::vector<int> pool(EXP);
+        for (int i = 0; i < EXP; ++i) pool[i] = i;
+        for (int i = 0; i < K; ++i) std::swap(pool[i], pool[int(splitmix(rs) % EXP)]);
+        for (int i = 0; i < K; ++i) hi[(std::size_t(t) * LAYERS + l) * K + i] = pool[i];
+        float sum = 0;
+        for (int i = 0; i < K; ++i) {
+          hw[(std::size_t(t) * LAYERS + l) * K + i] = float(splitmix(rs) % 1000) / 1000.f + 0.01f;
+          sum += hw[(std::size_t(t) * LAYERS + l) * K + i];
+        }
+        for (int i = 0; i < K; ++i) hw[(std::size_t(t) * LAYERS + l) * K + i] /= sum;
       }
-      for (int i = 0; i < K; ++i) hw[std::size_t(l) * K + i] /= sum;
-    }
     for (auto& v : hx) v = float(std::sin(double(splitmix(rs) % 100000) * 0.001));
     CK(cudaMemcpy(dx, hx.data(), sizeof(float) * LAYERS * HID, cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dwt, hw.data(), sizeof(float) * LAYERS * K, cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_ids, hi.data(), sizeof(int) * LAYERS * K, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dwt, hw.data(), sizeof(float) * ISETS * LAYERS * K, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_ids, hi.data(), sizeof(int) * ISETS * LAYERS * K, cudaMemcpyHostToDevice));
   }
   CK(cudaMalloc(&dy, sizeof(float) * HID));
   CK(cudaMalloc(&dsg, sizeof(float) * K * INTER));
@@ -303,9 +320,9 @@ int main(int argc, char** argv) {
   std::vector<moe::FusedMoeArgs> args(LAYERS);
   for (int l = 0; l < LAYERS; ++l) {
     moe::FusedMoeArgs& a = args[l];
-    a.layers = d_layers + std::size_t(l) * E;
+    a.layers = d_layers + std::size_t(l) * EXP;
     a.x = dx + std::size_t(l) * HID;
-    a.ids = d_ids + std::size_t(l) * K;
+    a.ids = d_ids + std::size_t(l) * K;  // token 0 set
     a.weights = dwt + std::size_t(l) * K;
     a.y = dy;
     a.scratch_gate = dsg;
@@ -316,29 +333,34 @@ int main(int argc, char** argv) {
   // skip, the production shape when a pack spreads the selected experts over both cards.
   std::vector<moe::FusedExpertLayer> half = hl;
   for (int l = 0; l < LAYERS; ++l)
-    for (int e = 0; e < E; e += 2) half[std::size_t(l) * E + e].stride_bytes = 0;
+    for (int e = 0; e < EXP; e += 2) half[std::size_t(l) * EXP + e].stride_bytes = 0;
   moe::FusedExpertLayer* d_half;
-  CK(cudaMalloc(&d_half, sizeof(moe::FusedExpertLayer) * LAYERS * E));
-  CK(cudaMemcpy(d_half, half.data(), sizeof(moe::FusedExpertLayer) * LAYERS * E, cudaMemcpyHostToDevice));
+  CK(cudaMalloc(&d_half, sizeof(moe::FusedExpertLayer) * LAYERS * EXP));
+  CK(cudaMemcpy(d_half, half.data(), sizeof(moe::FusedExpertLayer) * LAYERS * EXP, cudaMemcpyHostToDevice));
   std::vector<moe::FusedMoeArgs> args_half = args;
-  for (int l = 0; l < LAYERS; ++l) args_half[l].layers = d_half + std::size_t(l) * E;
+  for (int l = 0; l < LAYERS; ++l) args_half[l].layers = d_half + std::size_t(l) * EXP;
 
   cudaEvent_t ev0, ev1;
   cudaEventCreate(&ev0);
   cudaEventCreate(&ev1);
   const double bytes = double(LAYERS) * K * (W_STRIDE + S_STRIDE);
-  const int TOK = 100;
 
   // `read` is the traffic the case actually moves: half of it when every second expert is remote and skipped.
-  auto run = [&](const char* name, auto fn, const std::vector<moe::FusedMoeArgs>& as, double read) {
-    for (int t = 0; t < 10; ++t)
-      for (int l = 0; l < LAYERS; ++l) fn(as[l]);
+  // The id set rotates per token, so no token re-reads the previous token's experts.
+  auto run = [&](const char* name, auto fn, std::vector<moe::FusedMoeArgs> as, double read) {
+    auto pass = [&](int t) {
+      for (int l = 0; l < LAYERS; ++l) {
+        as[l].ids = d_ids + (std::size_t(t) * LAYERS + l) * K;
+        as[l].weights = dwt + (std::size_t(t) * LAYERS + l) * K;
+        fn(as[l]);
+      }
+    };
+    for (int t = 0; t < 10; ++t) pass(t % ISETS);
     CK(cudaDeviceSynchronize());
     float best = 1e30f;
     for (int tr = 0; tr < 9; ++tr) {
       cudaEventRecord(ev0);
-      for (int t = 0; t < TOK; ++t)
-        for (int l = 0; l < LAYERS; ++l) fn(as[l]);
+      for (int t = 0; t < TOK; ++t) pass(t % ISETS);
       cudaEventRecord(ev1);
       CK(cudaEventSynchronize(ev1));
       float ms;
@@ -346,26 +368,31 @@ int main(int argc, char** argv) {
       best = std::min(best, ms * 1000.f / TOK);
     }
     std::printf("%-34s %9.1f us/token  %7.1f GB/s\n", name, best, read / best / 1000.0);
+    return best;
   };
 
   auto legacy_run = [](const moe::FusedMoeArgs& a) { legacy::apply(a, nullptr); };
   run("legacy kernels", legacy_run, args, bytes);
-  run("fused_moe_apply (shipped)",
-      [](const moe::FusedMoeArgs& a) {
-        if (moe::fused_moe_apply(a, nullptr) != cudaSuccess) std::fprintf(stderr, "apply failed\n");
-      },
-      args, bytes);
-  run("legacy, half experts remote", legacy_run, args_half, bytes / 2);
-  run("fused_moe_apply, half remote",
-      [](const moe::FusedMoeArgs& a) {
-        if (moe::fused_moe_apply(a, nullptr) != cudaSuccess) std::fprintf(stderr, "apply failed\n");
-      },
-      args_half, bytes / 2);
+  const float shipped = run("fused_moe_apply (shipped)",
+                            [](const moe::FusedMoeArgs& a) {
+                              if (moe::fused_moe_apply(a, nullptr) != cudaSuccess)
+                                std::fprintf(stderr, "apply failed\n");
+                            },
+                            args, bytes);
+  const float shipped_half = run("fused_moe_apply, half remote",
+                                 [](const moe::FusedMoeArgs& a) {
+                                   if (moe::fused_moe_apply(a, nullptr) != cudaSuccess)
+                                     std::fprintf(stderr, "apply failed\n");
+                                 },
+                                 args_half, bytes / 2);
+  std::printf("fused_moe_apply per layer: %.2f us all-local, %.2f us half-remote\n", shipped / LAYERS,
+              shipped_half / LAYERS);
+
 
   {  // Pure-read ceiling over the same byte count as one token's routed traffic: half of each weight and scale
      // buffer, i.e. the eight selected experts of every layer. Reads once per token, not once per layer.
-    const std::size_t n4w = std::size_t(LAYERS) * E * W_STRIDE / 16 / 2;
-    const std::size_t n4s = std::size_t(LAYERS) * E * S_STRIDE / 16 / 2;
+    const std::size_t n4w = std::size_t(LAYERS) * K * W_STRIDE / 16;
+    const std::size_t n4s = std::size_t(LAYERS) * K * S_STRIDE / 16;
     float* dummy;
     CK(cudaMalloc(&dummy, sizeof(float)));
     auto pass = [&]() {
@@ -386,6 +413,106 @@ int main(int argc, char** argv) {
     }
     std::printf("%-34s %9.1f us/token  %7.1f GB/s\n", "read_only ceiling", best, bytes / best / 1000.0);
     CK(cudaFree(dummy));
+  }
+
+  // ---------------------------------------------------------------- stage attribution
+  // The number that produced "289 us per token" timed fused_moe_apply alone. The decoder's MoE block also
+  // runs the router (two launches), the shared expert (two launches) and, under expert parallelism, a
+  // host-staged exchange per layer. Time each part at the same shape so the production cost is reconstructable.
+  auto timefn = [&](const char* name, auto fn, double read) {
+    for (int t = 0; t < 10; ++t) fn(t % ISETS);
+    CK(cudaDeviceSynchronize());
+    float best = 1e30f;
+    for (int tr = 0; tr < 9; ++tr) {
+      cudaEventRecord(ev0);
+      for (int t = 0; t < TOK; ++t) fn(t % ISETS);
+      cudaEventRecord(ev1);
+      CK(cudaEventSynchronize(ev1));
+      float ms;
+      cudaEventElapsedTime(&ms, ev0, ev1);
+      best = std::min(best, ms * 1000.f / TOK);
+    }
+    std::printf("%-34s %9.1f us/token  %7.1f GB/s\n", name, best, read / best / 1000.0);
+  };
+
+  {
+    std::vector<__nv_bfloat16> hw(std::size_t(moe::ROUTER_EXPERTS) * moe::ROUTER_HIDDEN);
+    std::uint64_t s3 = 99;
+    for (auto& v : hw) v = __float2bfloat16(float(std::sin(double(splitmix(s3) % 10000) * 0.001)));
+    __nv_bfloat16* dw3;
+    CK(cudaMalloc(&dw3, hw.size() * 2));
+    CK(cudaMemcpy(dw3, hw.data(), hw.size() * 2, cudaMemcpyHostToDevice));
+    int* did3;
+    float *dwt3, *dl3;
+    CK(cudaMalloc(&did3, sizeof(int) * moe::ROUTER_TOP_K));
+    CK(cudaMalloc(&dwt3, sizeof(float) * moe::ROUTER_TOP_K));
+    CK(cudaMalloc(&dl3, sizeof(float) * moe::ROUTER_EXPERTS));
+    moe::RouterArgs ra;
+    ra.weight = dw3;
+    ra.x = dx;
+    ra.ids = did3;
+    ra.weights = dwt3;
+    ra.logits = dl3;
+    timefn("router (logits + select)",
+           [&](int) {
+             for (int l = 0; l < LAYERS; ++l)
+               if (moe::route(ra, nullptr) != cudaSuccess) std::fprintf(stderr, "route failed\n");
+           },
+           double(LAYERS) * moe::ROUTER_EXPERTS * moe::ROUTER_HIDDEN * 2);
+    CK(cudaFree(dw3));
+    CK(cudaFree(did3));
+    CK(cudaFree(dwt3));
+    CK(cudaFree(dl3));
+  }
+
+  {  // Shared expert: one routed-expert-sized NVFP4 block, read once per layer.
+    namespace quant = ingine::kernels::quant;
+    std::vector<std::uint8_t> gw(std::size_t(INTER) * HID / 2), gs(std::size_t(INTER) * HID / 16);
+    std::vector<std::uint8_t> uw(gw.size()), us(gs.size()), dwv(std::size_t(HID) * INTER / 2), dsv(gs.size());
+    std::uint64_t s4 = 55;
+    for (auto* v : {&gw, &gs, &uw, &us, &dwv, &dsv})
+      for (auto& b : *v) b = std::uint8_t(splitmix(s4) >> 17);
+    for (auto& b : gs) b = std::uint8_t(0x30 + splitmix(s4) % 15);
+    for (auto& b : us) b = std::uint8_t(0x30 + splitmix(s4) % 15);
+    for (auto& b : dsv) b = std::uint8_t(0x30 + splitmix(s4) % 15);
+    std::vector<__nv_bfloat16> shw(HID);
+    for (auto& v : shw) v = __float2bfloat16(float(std::sin(double(splitmix(s4) % 1000) * 0.01)));
+    std::uint8_t *bgw, *bgs, *buw, *bus, *bdw, *bds;
+    __nv_bfloat16* bg2;
+    float *bsh, *bsu;
+    CK(cudaMalloc(&bgw, gw.size()));
+    CK(cudaMalloc(&bgs, gs.size()));
+    CK(cudaMalloc(&buw, uw.size()));
+    CK(cudaMalloc(&bus, us.size()));
+    CK(cudaMalloc(&bdw, dwv.size()));
+    CK(cudaMalloc(&bds, dsv.size()));
+    CK(cudaMalloc(&bg2, shw.size() * 2));
+    CK(cudaMalloc(&bsh, sizeof(float) * INTER));
+    CK(cudaMalloc(&bsu, sizeof(float) * INTER));
+    CK(cudaMemcpy(bgw, gw.data(), gw.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(bgs, gs.data(), gs.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(buw, uw.data(), uw.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(bus, us.data(), us.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(bdw, dwv.data(), dwv.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(bds, dsv.data(), dsv.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(bg2, shw.data(), shw.size() * 2, cudaMemcpyHostToDevice));
+    moe::SharedExpertArgs sa;
+    sa.gate = quant::Nvfp4GemvArgs{bgw, bgs, 0.001f, dx, bsh, INTER, HID};
+    sa.up = quant::Nvfp4GemvArgs{buw, bus, 0.001f, dx, bsu, INTER, HID};
+    sa.down = quant::Nvfp4GemvArgs{bdw, bds, 0.001f, bsh, dy, HID, INTER};
+    sa.gate_weight = bg2;
+    sa.x = dx;
+    sa.y = dy;
+    sa.scratch_h = bsh;
+    sa.scratch_up = bsu;
+    timefn("shared_expert (gate+up, down)",
+           [&](int) {
+             for (int l = 0; l < LAYERS; ++l)
+               if (moe::shared_expert(sa, nullptr) != cudaSuccess) std::fprintf(stderr, "shared failed\n");
+           },
+           double(LAYERS) * 3 * (W_STRIDE / 2) * (1.0 + 1.0 / 8.0));
+    CK(cudaFree(bgw)); CK(cudaFree(bgs)); CK(cudaFree(buw)); CK(cudaFree(bus)); CK(cudaFree(bdw));
+    CK(cudaFree(bds)); CK(cudaFree(bg2)); CK(cudaFree(bsh)); CK(cudaFree(bsu));
   }
   return 0;
 }

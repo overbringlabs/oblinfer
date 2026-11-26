@@ -1,8 +1,12 @@
 // Shared expert of the Qwen3.6-35B-A3B MoE layers at decode width:
 //   y = sigmoid(shared_expert_gate @ x) * down(silu(gate_expert(x)) * up_expert(x))
-// The three projections are the checkpoint's NVFP4 tensors; the gate is a bf16 vector [hidden]. The scalar
-// sigmoid is computed by one block that then scales the output in place, so the whole path is two launches
-// after the GEMVs.
+// The three projections are the checkpoint's NVFP4 tensors; the gate is a bf16 vector [hidden].
+//
+// The fused path is two launches: gate/up with the SiLU applied in the same warp that holds both dot
+// results, then down with the sigmoid gate folded into the row scale. `scratch_up` is therefore not used
+// for the up projection; slot 0 of it carries the gate scalar between the two launches. Shapes or pointer
+// alignment the fused kernels cannot use (dense arena slots are packed byte-tight) fall back to the generic
+// `quant::nvfp4_gemv` sequence.
 #pragma once
 
 #include <cuda_bf16.h>
