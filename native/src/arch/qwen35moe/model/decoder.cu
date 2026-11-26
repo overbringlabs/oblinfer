@@ -488,7 +488,10 @@ void Decoder::moe(int l) {
   check(cudaMemcpy(ids, ids_dev_, sizeof(ids), cudaMemcpyDeviceToHost), "ids copy");
   check(cudaMemcpy(weights, weights_dev_, sizeof(weights), cudaMemcpyDeviceToHost), "weights copy");
 
-  if (dev1_ != dev0_) {
+  const bool skip_experts = std::getenv("QWEN35MOE_SKIP_EXPERTS") != nullptr;
+  if (skip_experts) {
+    check(cudaMemset(moe_out_, 0, HIDDEN * 4), "ablate experts");
+  } else if (dev1_ != dev0_) {
     check(cudaMemcpy(pinned_in_, h2_, HIDDEN * 4, cudaMemcpyDeviceToHost), "peer x");
     check(cudaSetDevice(dev1_), "set device 1");
     check(cudaMemcpy(peer_x_, pinned_in_, HIDDEN * 4, cudaMemcpyHostToDevice), "peer x h2d");
@@ -511,6 +514,7 @@ void Decoder::moe(int l) {
     check(cudaMemset(y_, 0, HIDDEN * 4), "peer y zero");
   }
 
+  if (skip_experts) return;
   kernels::FusedMoeArgs a0;
   a0.layers = fused_[0].device + std::size_t(l) * EXPERTS;
   a0.x = h2_;
@@ -573,7 +577,10 @@ bool Decoder::step(int token, int pos, int* next_token, std::string* error) {
       }
       check(dense::rms_norm(x_, f32(layer_name(l, "input_layernorm.weight"), true), h_, HIDDEN, EPS, nullptr),
             "input norm");
-      if (is_full_layer(l)) {
+      const bool skip_attn = std::getenv("QWEN35MOE_SKIP_ATTN") != nullptr;
+      if (is_full_layer(l) && skip_attn) {
+        check(cudaMemset(y_, 0, HIDDEN * 4), "ablate attn");
+      } else if (is_full_layer(l)) {
         full_layer(l, pos);
       } else {
         linear_layer(l);
@@ -605,7 +612,12 @@ bool Decoder::step(int token, int pos, int* next_token, std::string* error) {
 
       check(dense::rms_norm(x_, f32(layer_name(l, "post_attention_layernorm.weight"), true), h2_, HIDDEN, EPS, nullptr),
             "post norm");
-      moe(l);
+      if (!std::getenv("QWEN35MOE_SKIP_MOE")) {
+        moe(l);
+      } else {
+        check(cudaMemset(moe_out_, 0, HIDDEN * 4), "ablate moe");
+        check(cudaMemset(shared_out_, 0, HIDDEN * 4), "ablate shared");
+      }
       if (std::getenv("QWEN35MOE_DUMP") && pos == 0 && (l < 4 || l == 39)) {
         std::vector<float> mo(HIDDEN), sh(HIDDEN), hx(HIDDEN);
         check(cudaMemcpy(mo.data(), moe_out_, HIDDEN * 4, cudaMemcpyDeviceToHost), "dump moe");
