@@ -207,16 +207,31 @@ std::optional<TensorName> parse_tensor_name(std::string_view name) {
 }
 
 Dialect detect_dialect(std::span<const std::string> names) {
-  bool per_expert = false;
+  // Both exports number the trunk's routed experts, and both carry `input_scale` somewhere — Ornith's real
+  // 94,393-tensor export has 130 of them on the GDN and attention projections — so neither fact tells the two
+  // apart. What does: the MTP block. NVIDIA packs it (`mtp.layers.0.mlp.experts.gate_up_proj`), Ornith numbers
+  // it like the trunk. Deciding on `input_scale` first labelled Ornith's real export Nvidia.
+  bool numbered_mtp = false, packed_mtp = false, input_scale = false, packed_any = false;
   for (const std::string& name : names) {
-    if (name.ends_with(".input_scale")) return Dialect::Nvidia;
-    if (!per_expert && name.find(".mlp.experts.") != std::string::npos) {
-      // A numeric component right after `.mlp.experts.` marks the per-expert dialect.
-      const size_t pos = name.find(".mlp.experts.") + std::string_view(".mlp.experts.").size();
-      per_expert = pos < name.size() && name[pos] >= '0' && name[pos] <= '9';
+    if (!input_scale && name.ends_with(".input_scale")) input_scale = true;
+    const size_t at = name.find(".mlp.experts.");
+    if (at == std::string::npos) continue;
+    const std::string_view rest(name.c_str() + at + std::string_view(".mlp.experts.").size(),
+                                name.size() - at - std::string_view(".mlp.experts.").size());
+    const bool is_mtp = name.starts_with("mtp.");
+    if (!rest.empty() && rest.front() >= '0' && rest.front() <= '9') {
+      if (is_mtp) numbered_mtp = true;
+      continue;
+    }
+    if (rest.starts_with("gate_up_proj") || rest.starts_with("down_proj")) {
+      packed_any = true;
+      if (is_mtp) packed_mtp = true;
     }
   }
-  return per_expert ? Dialect::Ornith : Dialect::Unknown;
+  if (numbered_mtp && packed_mtp) return Dialect::Unknown;  // contradictory: placement will reject it
+  if (numbered_mtp) return Dialect::Ornith;
+  if (packed_mtp || packed_any || input_scale) return Dialect::Nvidia;
+  return Dialect::Unknown;
 }
 
 }  // namespace ingine::arch::qwen35moe

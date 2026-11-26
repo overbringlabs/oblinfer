@@ -1,7 +1,9 @@
-// The Qwen3.6-35B-A3B tensor-name classifier against both published export dialects: NVIDIA
-// (input_scale present, packed MTP experts) and Ornith (no input_scale, per-expert MTP). The test
-// asserts the two dialects map onto the same typed keys, which is what the loader and packing code
-// rely on. Host only: no GPU, no model files.
+// The Qwen3.6-35B-A3B tensor-name classifier against both published export dialects: NVIDIA (packed
+// gate_up_proj/down_proj experts) and Ornith (numbered per-expert projections). Both exports carry
+// `input_scale` on the dense projections — Ornith's real 94,393-tensor export has 130 of them — so the
+// dialect is decided by the expert layout, not by that tensor. The test asserts both dialects map onto
+// the same typed keys, which is what the loader and packing code rely on. Host only: no GPU, no model
+// files.
 #include "arch/qwen35moe/model/tensor_names.h"
 
 #include <cstdio>
@@ -143,12 +145,62 @@ std::set<Key> expert_weight_keys(const std::vector<std::string>& all) {
 
 }  // namespace
 
-int main() {
+// A file of real tensor names, one per line, classifies every line and reports the ones the loader would not
+// recognise. This is how a new export is checked against the pack before anyone downloads its weights.
+int check_names_file(const char* path) {
+  std::FILE* f = std::fopen(path, "r");
+  if (!f) {
+    std::fprintf(stderr, "cannot open %s\n", path);
+    return 2;
+  }
+  std::vector<std::string> all;
+  char line[512];
+  while (std::fgets(line, sizeof(line), f)) {
+    std::string name(line);
+    while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
+    if (!name.empty()) all.push_back(std::move(name));
+  }
+  std::fclose(f);
+
+  std::set<std::string> unknown_roots;
+  int rejected = 0;
+  for (const std::string& name : all) {
+    if (!qwen::parse_tensor_name(name)) {
+      ++rejected;
+      // Group by prefix so a whole missing family shows as one line.
+      const std::size_t keep = name.find(".layers.");
+      unknown_roots.insert(keep == std::string::npos ? name : name.substr(0, keep));
+    }
+  }
+  std::printf("%zu names, dialect %s, %d rejected\n", all.size(),
+              qwen::detect_dialect(all) == qwen::Dialect::Ornith    ? "ornith"
+              : qwen::detect_dialect(all) == qwen::Dialect::Nvidia  ? "nvidia"
+                                                                    : "unknown",
+              rejected);
+  for (const std::string& root : unknown_roots) std::printf("  unclassified family: %s\n", root.c_str());
+  return rejected == 0 ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+  if (argc > 1) return check_names_file(argv[1]);
   const std::vector<std::string> nvidia = names(false);
   const std::vector<std::string> ornith = names(true);
 
   CHECK(qwen::detect_dialect(nvidia) == qwen::Dialect::Nvidia);
   CHECK(qwen::detect_dialect(ornith) == qwen::Dialect::Ornith);
+
+  // The real Ornith export carries input_scale on its dense projections, unlike the synthetic set above:
+  // deciding the dialect on it labelled the real export Nvidia. The expert layout has to win.
+  std::vector<std::string> ornith_real = ornith;
+  ornith_real.push_back("model.language_model.layers.0.linear_attn.in_proj_qkv.input_scale");
+  ornith_real.push_back("model.language_model.layers.0.self_attn.q_proj.input_scale");
+  CHECK(qwen::detect_dialect(ornith_real) == qwen::Dialect::Ornith);
+
+  // The MTP block is the discriminator, because both exports number the trunk's experts. A set that both
+  // numbers and packs its MTP is contradictory, and the detector must not pick a side.
+  std::vector<std::string> mixed = ornith;
+  mixed.push_back("mtp.layers.0.mlp.experts.gate_up_proj");
+  CHECK(qwen::detect_dialect(mixed) == qwen::Dialect::Unknown);
 
   for (const std::string& name : nvidia) {
     if (!qwen::parse_tensor_name(name)) std::fprintf(stderr, "nvidia name rejected: %s\n", name.c_str());
