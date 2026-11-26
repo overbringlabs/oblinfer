@@ -315,6 +315,35 @@ int main() {
     cudaFree(y);
   }
 
+  // ---- fp8 at DRAM size (the engine streams ~2.2 GB per token, so L2-resident numbers are misleading)
+  {
+    const int rows = 32768, cols = 2048;  // 64 MiB of weights
+    uint8_t* w = nullptr;
+    float *x = nullptr, *y = nullptr;
+    cudaMalloc(&w, std::size_t(rows) * cols);
+    cudaMalloc(&x, cols * 4);
+    cudaMalloc(&y, rows * 4);
+    cudaMemset(w, 0x38, std::size_t(rows) * cols);
+    cudaMemset(x, 0, cols * 4);
+    const double gb = double(std::size_t(rows) * cols) / 1e9;
+    struct V {
+      const char* name;
+      void (*fn)(const uint8_t*, const float*, float*, int, int);
+      int blocks;
+    } variants[] = {
+        {"fp8 DRAM 64MB warp-row scalar", fp8_warp_row_scalar, (rows + 7) / 8},
+        {"fp8 DRAM 64MB block-row", fp8_block_row, rows},
+        {"fp8 DRAM 64MB quad-row", fp8_quad_row, (rows + 3) / 4 / 8},
+    };
+    for (const V& v : variants) {
+      const float ms = measure(10, [&] { v.fn<<<v.blocks, kThreads>>>(w, x, y, rows, cols); }, gb);
+      std::printf("%-32s %7.3f ms  %6.1f GB/s\n", v.name, ms, ms > 0 ? gb / (ms * 1e-3) : 0.0);
+    }
+    cudaFree(w);
+    cudaFree(x);
+    cudaFree(y);
+  }
+
   // ---- nvfp4
   {
     const std::size_t wb = std::size_t(nv_rows) * nv_cols / 2;
